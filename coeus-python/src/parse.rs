@@ -11,6 +11,11 @@ use coeus::coeus_analysis::analysis::{
 use coeus::coeus_models::models::{AndroidManifest, DexFile, Files};
 use coeus::coeus_parse::dex::graph::information_graph::build_information_graph;
 use coeus::coeus_parse::dex::graph::Supergraph;
+use coeus::coeus_parse::dex::{
+    encode::{inject_load_library, prepend_method_code, replace_method_instruction_units},
+    parse_dex_buf,
+    ArrayView,
+};
 use pyo3::exceptions::{PyIOError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -116,6 +121,101 @@ impl AnalyzeObject {
     pub fn get_file_field(&self) -> &Files {
         &self.files
     }
+
+    fn replace_loaded_dex(&mut self, dex_name: &str, bytes: Vec<u8>) -> PyResult<()> {
+        for multi_dex_index in 0..self.files.multi_dex.len() {
+            let primary_matches = {
+                let dex = &self.files.multi_dex[multi_dex_index].primary;
+                dex.get_dex_name() == dex_name || dex.file_name == dex_name
+            };
+            if primary_matches {
+                let file_name = self.files.multi_dex[multi_dex_index].primary.file_name.clone();
+                let archive_name = self.files.multi_dex[multi_dex_index]
+                    .primary
+                    .get_dex_name()
+                    .to_string();
+                let parsed = parse_dex_buf(&file_name, &ArrayView::new(&bytes), false)
+                    .ok_or_else(|| PyRuntimeError::new_err("could not reparse edited DEX"))?;
+                self.files.multi_dex[multi_dex_index].primary = Arc::new(parsed);
+                self.files
+                    .set_file(archive_name, bytes)
+                    .map_err(PyRuntimeError::new_err)?;
+                self.supergraph = None;
+                return Ok(());
+            }
+            if let Some(index) = self.files.multi_dex[multi_dex_index]
+                .secondary
+                .iter()
+                .position(|dex| dex.get_dex_name() == dex_name || dex.file_name == dex_name)
+            {
+                let file_name = self.files.multi_dex[multi_dex_index].secondary[index]
+                    .file_name
+                    .clone();
+                let archive_name = self.files.multi_dex[multi_dex_index].secondary[index]
+                    .get_dex_name()
+                    .to_string();
+                let parsed = parse_dex_buf(&file_name, &ArrayView::new(&bytes), false)
+                    .ok_or_else(|| PyRuntimeError::new_err("could not reparse edited DEX"))?;
+                self.files.multi_dex[multi_dex_index].secondary[index] = Arc::new(parsed);
+                self.files
+                    .set_file(archive_name, bytes)
+                    .map_err(PyRuntimeError::new_err)?;
+                self.supergraph = None;
+                return Ok(());
+            }
+        }
+        Err(PyRuntimeError::new_err(format!(
+            "DEX not found: {dex_name}"
+        )))
+    }
+
+    fn loaded_dex_for_method(
+        &self,
+        method: &Method,
+    ) -> PyResult<(String, u32, Arc<DexFile>)> {
+        let method_idx = method.method.method_idx as u32;
+        let dex = self
+            .files
+            .multi_dex
+            .iter()
+            .flat_map(|multi_dex| {
+                std::iter::once(&multi_dex.primary).chain(multi_dex.secondary.iter())
+            })
+            .find(|dex| {
+                dex.identifier == method.file.identifier
+                    || dex.file_name == method.file.file_name
+            })
+            .cloned()
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!("DEX not found for method {}", method.signature()))
+            })?;
+        Ok((dex.get_dex_name().to_string(), method_idx, dex))
+    }
+
+    fn instruction_index(
+        dex: &DexFile,
+        method_idx: u32,
+        instruction: &crate::analysis::DexInstruction,
+    ) -> PyResult<usize> {
+        let code = dex
+            .classes
+            .iter()
+            .flat_map(|class| class.codes.iter())
+            .find(|method| method.method_idx == method_idx)
+            .and_then(|method| method.code.as_ref())
+            .ok_or_else(|| PyRuntimeError::new_err("method has no code"))?;
+        code.insns
+            .iter()
+            .position(|(size, offset, _)| {
+                offset.0 == instruction.offset && size.0 / 2 == instruction.size
+            })
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "instruction at offset {} is not part of method {}",
+                    instruction.offset, method_idx
+                ))
+            })
+    }
 }
 
 #[pymethods]
@@ -164,6 +264,244 @@ impl AnalyzeObject {
             .collect()
     }
 
+    /// Set an Android manifest attribute in the binary XML. `value` accepts
+    /// `true`/`false`, an integer, or a string.
+    pub fn set_manifest_attribute(
+        &mut self,
+        element: &str,
+        attribute: &str,
+        value: &str,
+    ) -> PyResult<()> {
+        coeus::coeus_parse::apk::set_manifest_attribute(&mut self.files, element, attribute, value)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    pub fn set_debuggable(&mut self, enabled: bool) -> PyResult<()> {
+        self.set_manifest_attribute(
+            "application",
+            "debuggable",
+            if enabled { "true" } else { "false" },
+        )
+    }
+
+    pub fn get_manifest_xml(&self) -> String {
+        self.files.manifest_content.clone()
+    }
+
+    /// Replace AndroidManifest.xml from namespace-aware textual XML.
+    pub fn set_manifest_xml(&mut self, xml: &str) -> PyResult<()> {
+        coeus::coeus_parse::apk::set_manifest_xml(&mut self.files, xml)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Replace an Android binary-XML resource from textual XML.
+    pub fn set_xml_resource(&mut self, path: &str, xml: &str) -> PyResult<()> {
+        coeus::coeus_parse::apk::set_xml_resource(&mut self.files, path, xml)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Add a bundled XML resource and wire it into the manifest with a typed
+    /// resource reference. It permits cleartext traffic and trusts user CAs.
+    pub fn allow_plaintext_and_user_certificates(&mut self) -> PyResult<()> {
+        coeus::coeus_parse::apk::allow_plaintext_and_user_certificates(&mut self.files)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Add or replace a raw APK entry, including shared objects and DEX files.
+    pub fn set_file(&mut self, name: &str, data: Vec<u8>) -> PyResult<()> {
+        self.files
+            .set_file(name.to_string(), data)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    pub fn add_file(&mut self, name: &str, data: Vec<u8>) -> PyResult<()> {
+        self.files
+            .add_file(name.to_string(), data)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    pub fn remove_file(&mut self, name: &str) -> PyResult<()> {
+        self.files
+            .remove_file(name)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    pub fn write_apk(&self, output: &str) -> PyResult<()> {
+        coeus::coeus_parse::apk::repack(&self.files, output)
+            .map_err(|error| PyIOError::new_err(error.to_string()))
+    }
+
+    /// Replace an instruction selected from `method.get_instructions()` with
+    /// another decoded instruction object. The replacement must have the same
+    /// width as the selected instruction.
+    pub fn replace_instruction(
+        &mut self,
+        method: &Method,
+        instruction: &crate::analysis::DexInstruction,
+        replacement: &crate::analysis::DexInstruction,
+    ) -> PyResult<()> {
+        let (dex_name, method_idx, dex) = self.loaded_dex_for_method(method)?;
+        let instruction_index = Self::instruction_index(&dex, method_idx, instruction)?;
+        let replacement_units = replacement
+            .instruction
+            .to_code_units()
+            .map_err(PyRuntimeError::new_err)?;
+        let bytes = replace_method_instruction_units(
+            &dex,
+            method_idx,
+            instruction_index,
+            &replacement_units,
+        )
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        self.replace_loaded_dex(&dex_name, bytes)
+    }
+
+    /// Explicitly named alias for callers that prefer the longer editing API
+    /// name alongside the encoded low-level `replace_method_instruction`.
+    pub fn replace_method_instruction_object(
+        &mut self,
+        method: &Method,
+        instruction: &crate::analysis::DexInstruction,
+        replacement: &crate::analysis::DexInstruction,
+    ) -> PyResult<()> {
+        self.replace_instruction(method, instruction, replacement)
+    }
+
+    /// Prepend decoded instruction objects to a method selected by its method
+    /// object. This is the object-oriented counterpart to the code-unit API.
+    pub fn prepend_instructions(
+        &mut self,
+        method: &Method,
+        instructions: Vec<crate::analysis::DexInstruction>,
+    ) -> PyResult<()> {
+        let (dex_name, method_idx, dex) = self.loaded_dex_for_method(method)?;
+        let mut prefix = Vec::new();
+        for instruction in instructions {
+            prefix.extend(
+                instruction
+                    .instruction
+                    .to_code_units()
+                    .map_err(PyRuntimeError::new_err)?,
+            );
+        }
+        let bytes = prepend_method_code(&dex, method_idx, &prefix)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        self.replace_loaded_dex(&dex_name, bytes)
+    }
+
+    pub fn prepend_method_instructions(
+        &mut self,
+        method: &Method,
+        instructions: Vec<crate::analysis::DexInstruction>,
+    ) -> PyResult<()> {
+        self.prepend_instructions(method, instructions)
+    }
+
+    /// Insert `System.loadLibrary(library_name)` into a method object selected
+    /// during analysis. This also adds the required DEX string/type/proto and
+    /// method references when the target DEX does not already contain them.
+    pub fn inject_load_library_for_method(
+        &mut self,
+        method: &Method,
+        library_name: &str,
+        register: u8,
+    ) -> PyResult<()> {
+        let (dex_name, method_idx, dex) = self.loaded_dex_for_method(method)?;
+        let bytes = inject_load_library(&dex, method_idx, library_name, register)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        self.replace_loaded_dex(&dex_name, bytes)
+    }
+
+    /// Select a method from a class object and inject the loader into it. If
+    /// several overloads exist, pass the full prototype, e.g.
+    /// `(Ljava/lang/String;)V`.
+    #[pyo3(signature = (class, method_name, library_name, register, proto_type=None))]
+    pub fn inject_load_library_for_class(
+        &mut self,
+        class: &crate::analysis::Class,
+        method_name: &str,
+        library_name: &str,
+        register: u8,
+        proto_type: Option<&str>,
+    ) -> PyResult<()> {
+        let method = if let Some(proto_type) = proto_type {
+            class.get_method_by_proto_type(method_name, proto_type)?
+        } else {
+            class.get_method(method_name)?
+        };
+        self.inject_load_library_for_method(&method, library_name, register)
+    }
+
+    /// Replace one decoded instruction with same-width code units and reparse
+    /// the affected DEX. This keeps all unmodelled DEX sections intact.
+    pub fn replace_method_instruction(
+        &mut self,
+        dex_name: &str,
+        method_idx: u32,
+        instruction_index: usize,
+        code_units: Vec<u16>,
+    ) -> PyResult<()> {
+        let dex = self
+            .files
+            .multi_dex
+            .iter()
+            .flat_map(|multi_dex| {
+                std::iter::once(&multi_dex.primary).chain(multi_dex.secondary.iter())
+            })
+            .find(|dex| dex.get_dex_name() == dex_name || dex.file_name == dex_name)
+            .cloned()
+            .ok_or_else(|| PyRuntimeError::new_err(format!("DEX not found: {dex_name}")))?;
+        let bytes =
+            replace_method_instruction_units(&dex, method_idx, instruction_index, &code_units)
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        self.replace_loaded_dex(dex_name, bytes)
+    }
+
+    pub fn prepend_method_code(
+        &mut self,
+        dex_name: &str,
+        method_idx: u32,
+        prefix_code_units: Vec<u16>,
+    ) -> PyResult<()> {
+        let dex = self
+            .files
+            .multi_dex
+            .iter()
+            .flat_map(|multi_dex| {
+                std::iter::once(&multi_dex.primary).chain(multi_dex.secondary.iter())
+            })
+            .find(|dex| dex.get_dex_name() == dex_name || dex.file_name == dex_name)
+            .cloned()
+            .ok_or_else(|| PyRuntimeError::new_err(format!("DEX not found: {dex_name}")))?;
+        let bytes = prepend_method_code(&dex, method_idx, &prefix_code_units)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        self.replace_loaded_dex(dex_name, bytes)
+    }
+
+    /// Add the required DEX references if necessary, then insert
+    /// const-string/invoke-static for System.loadLibrary at method entry.
+    pub fn inject_load_library(
+        &mut self,
+        dex_name: &str,
+        method_idx: u32,
+        library_name: &str,
+        register: u8,
+    ) -> PyResult<()> {
+        let dex = self
+            .files
+            .multi_dex
+            .iter()
+            .flat_map(|multi_dex| {
+                std::iter::once(&multi_dex.primary).chain(multi_dex.secondary.iter())
+            })
+            .find(|dex| dex.get_dex_name() == dex_name || dex.file_name == dex_name)
+            .cloned()
+            .ok_or_else(|| PyRuntimeError::new_err(format!("DEX not found: {dex_name}")))?;
+        let bytes = inject_load_library(&dex, method_idx, library_name, register)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        self.replace_loaded_dex(dex_name, bytes)
+    }
+
     pub fn get_resource_string(&mut self, id: u32) -> Option<(String, HashMap<String, String>)> {
         if self.files.arsc.is_none() {
             let _ = self.files.load_arsc();
@@ -171,19 +509,23 @@ impl AnalyzeObject {
         self.files.get_string_from_resource(id)
     }
 
-    pub fn get_resource_mipmap_file_name(&mut self, id: u32) -> Option<(String, HashMap<String,String>)> {
+    pub fn get_resource_mipmap_file_name(
+        &mut self,
+        id: u32,
+    ) -> Option<(String, HashMap<String, String>)> {
         if self.files.arsc.is_none() {
             let _ = self.files.load_arsc();
         }
-        self.files.get_mipmap_file_name_from_resource(id)       
+        self.files.get_mipmap_file_name_from_resource(id)
     }
 
     pub fn get_file(&self, py: Python, name: &str) -> PyObject {
-        let mut _file_content: String;
-        let bin_object = self.files.binaries.get(name).unwrap();
+        let Some(raw) = self.files.raw_file(name) else {
+            return PyBytes::new(py, &[]).into();
+        };
 
         if name.ends_with(".xml") {
-            let xml = match self.files.decode_resource(bin_object.data()) {
+            let xml = match self.files.decode_resource(raw) {
                 Some(xml) => xml,
                 None => {
                     println!("Could not decode file {}", name);
@@ -193,16 +535,13 @@ impl AnalyzeObject {
             let result = xml.as_bytes();
             PyBytes::new(py, result).into()
         } else {
-            let result = bin_object.data();
-            PyBytes::new(py, result).into()
+            PyBytes::new(py, raw).into()
         }
     }
 
     /// Get file contents but without decoding xml files like AndroidManifest.xml or ARSC files
     pub fn get_raw_file(&self, py: Python, name: &str) -> PyObject {
-        let mut _file_content: String;
-        let bin_object = self.files.binaries.get(name).unwrap();
-        let result = bin_object.data();
+        let result = self.files.raw_file(name).unwrap_or(&[]);
         PyBytes::new(py, result).into()
     }
 
@@ -232,11 +571,7 @@ impl AnalyzeObject {
     }
 
     pub fn get_file_names(&self) -> Vec<String> {
-        let mut results = vec![];
-        for key in self.files.binaries.keys() {
-            results.push(key.clone());
-        }
-        results
+        self.files.file_names()
     }
 
     pub fn get_dex_names(&self) -> Vec<&String> {

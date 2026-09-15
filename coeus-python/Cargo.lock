@@ -341,6 +341,7 @@ name = "coeus_parse"
 version = "0.1.1"
 dependencies = [
  "abxml",
+ "arsc",
  "base64",
  "bitflags 2.6.0",
  "coeus_emulation",
@@ -359,6 +360,7 @@ dependencies = [
  "serde-xml-rs",
  "serde_json",
  "ux",
+ "xml-rs",
  "zip",
 ]
 

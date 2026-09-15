@@ -5,6 +5,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 //! This module provides parsing methods to decode the dex file into a DexFile struct.
+pub mod encode;
 pub mod graph;
 
 use std::{
@@ -455,7 +456,8 @@ pub fn parse_dex_buf(
             class_method_cursor
                 .seek(SeekFrom::Start(method.code_off as u64))
                 .unwrap();
-            let code = CodeItem::from_bytes(&mut class_method_cursor);
+            let mut code = CodeItem::from_bytes(&mut class_method_cursor);
+            code.code_off = method.code_off as u32;
 
             the_class.codes.push(Arc::new(MethodData {
                 method_idx: new_m.method_idx as u32,
@@ -488,7 +490,8 @@ pub fn parse_dex_buf(
             class_method_cursor
                 .seek(SeekFrom::Start(method.code_off as u64))
                 .unwrap();
-            let code = CodeItem::from_bytes(&mut class_method_cursor);
+            let mut code = CodeItem::from_bytes(&mut class_method_cursor);
+            code.code_off = method.code_off as u32;
 
             the_class.codes.push(Arc::new(MethodData {
                 method_idx: new_m.method_idx as u32,
@@ -540,6 +543,7 @@ pub fn parse_dex_buf(
     let s_table = s_table.into_inner().unwrap();
     Some(DexFile {
         identifier: format!("{:02x?}", config.signature),
+        raw_data: buffer.data.to_vec(),
         file_name: file_name.to_string(),
         header: config,
         strings,

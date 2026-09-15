@@ -13,7 +13,7 @@ use std::{
 };
 use ux::{i4, u4};
 
-#[derive( Clone, Hash, Eq, PartialEq)]
+#[derive(Clone, Hash, Eq, PartialEq)]
 pub enum Instruction {
     Nop,
 
@@ -186,85 +186,345 @@ impl Debug for Instruction {
         match self {
             Self::Nop => write!(f, "Nop"),
             Self::Move(arg0, arg1) => f.debug_tuple("Move").field(arg0).field(arg1).finish(),
-            Self::MoveFrom16(arg0, arg1) => f.debug_tuple("MoveFrom16").field(arg0).field(arg1).finish(),
+            Self::MoveFrom16(arg0, arg1) => {
+                f.debug_tuple("MoveFrom16").field(arg0).field(arg1).finish()
+            }
             Self::Move16(arg0, arg1) => f.debug_tuple("Move16").field(arg0).field(arg1).finish(),
-            Self::MoveWide(arg0, arg1) => f.debug_tuple("MoveWide").field(arg0).field(arg1).finish(),
-            Self::MoveWideFrom16(arg0, arg1) => f.debug_tuple("MoveWideFrom16").field(arg0).field(arg1).finish(),
-            Self::MoveWide16(arg0, arg1) => f.debug_tuple("MoveWide16").field(arg0).field(arg1).finish(),
-            Self::MoveObject(arg0, arg1) => f.debug_tuple("MoveObject").field(arg0).field(arg1).finish(),
-            Self::MoveObjectFrom16(arg0, arg1) => f.debug_tuple("MoveObjectFrom16").field(arg0).field(arg1).finish(),
-            Self::MoveObject16(arg0, arg1) => f.debug_tuple("MoveObject16").field(arg0).field(arg1).finish(),
+            Self::MoveWide(arg0, arg1) => {
+                f.debug_tuple("MoveWide").field(arg0).field(arg1).finish()
+            }
+            Self::MoveWideFrom16(arg0, arg1) => f
+                .debug_tuple("MoveWideFrom16")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::MoveWide16(arg0, arg1) => {
+                f.debug_tuple("MoveWide16").field(arg0).field(arg1).finish()
+            }
+            Self::MoveObject(arg0, arg1) => {
+                f.debug_tuple("MoveObject").field(arg0).field(arg1).finish()
+            }
+            Self::MoveObjectFrom16(arg0, arg1) => f
+                .debug_tuple("MoveObjectFrom16")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::MoveObject16(arg0, arg1) => f
+                .debug_tuple("MoveObject16")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
             Self::XorInt(arg0, arg1) => f.debug_tuple("XorInt").field(arg0).field(arg1).finish(),
             Self::XorLong(arg0, arg1) => f.debug_tuple("XorLong").field(arg0).field(arg1).finish(),
-            Self::XorIntDst(arg0, arg1, arg2) => f.debug_tuple("XorIntDst").field(arg0).field(arg1).field(arg2).finish(),
-            Self::XorLongDst(arg0, arg1, arg2) => f.debug_tuple("XorLongDst").field(arg0).field(arg1).field(arg2).finish(),
-            Self::XorIntDstLit8(arg0, arg1, arg2) => f.debug_tuple("XorIntDstLit8").field(arg0).field(arg1).field(arg2).finish(),
-            Self::XorIntDstLit16(arg0, arg1, arg2) => f.debug_tuple("XorIntDstLit16").field(arg0).field(arg1).field(arg2).finish(),
-            Self::RemIntDst(arg0, arg1, arg2) => f.debug_tuple("RemIntDst").field(arg0).field(arg1).field(arg2).finish(),
-            Self::RemLongDst(arg0, arg1, arg2) => f.debug_tuple("RemLongDst").field(arg0).field(arg1).field(arg2).finish(),
+            Self::XorIntDst(arg0, arg1, arg2) => f
+                .debug_tuple("XorIntDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::XorLongDst(arg0, arg1, arg2) => f
+                .debug_tuple("XorLongDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::XorIntDstLit8(arg0, arg1, arg2) => f
+                .debug_tuple("XorIntDstLit8")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::XorIntDstLit16(arg0, arg1, arg2) => f
+                .debug_tuple("XorIntDstLit16")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::RemIntDst(arg0, arg1, arg2) => f
+                .debug_tuple("RemIntDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::RemLongDst(arg0, arg1, arg2) => f
+                .debug_tuple("RemLongDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::RemInt(arg0, arg1) => f.debug_tuple("RemInt").field(arg0).field(arg1).finish(),
             Self::RemLong(arg0, arg1) => f.debug_tuple("RemLong").field(arg0).field(arg1).finish(),
-            Self::RemIntLit16(arg0, arg1, arg2) => f.debug_tuple("RemIntLit16").field(arg0).field(arg1).field(arg2).finish(),
-            Self::RemIntLit8(arg0, arg1, arg2) => f.debug_tuple("RemIntLit8").field(arg0).field(arg1).field(arg2).finish(),
+            Self::RemIntLit16(arg0, arg1, arg2) => f
+                .debug_tuple("RemIntLit16")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::RemIntLit8(arg0, arg1, arg2) => f
+                .debug_tuple("RemIntLit8")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::AddInt(arg0, arg1) => f.debug_tuple("AddInt").field(arg0).field(arg1).finish(),
-            Self::AddIntDst(arg0, arg1, arg2) => f.debug_tuple("AddIntDst").field(arg0).field(arg1).field(arg2).finish(),
-            Self::AddIntLit8(arg0, arg1, arg2) => f.debug_tuple("AddIntLit8").field(arg0).field(arg1).field(arg2).finish(),
-            Self::AddIntLit16(arg0, arg1, arg2) => f.debug_tuple("AddIntLit16").field(arg0).field(arg1).field(arg2).finish(),
+            Self::AddIntDst(arg0, arg1, arg2) => f
+                .debug_tuple("AddIntDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::AddIntLit8(arg0, arg1, arg2) => f
+                .debug_tuple("AddIntLit8")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::AddIntLit16(arg0, arg1, arg2) => f
+                .debug_tuple("AddIntLit16")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::AddLong(arg0, arg1) => f.debug_tuple("AddLong").field(arg0).field(arg1).finish(),
-            Self::AddLongDst(arg0, arg1, arg2) => f.debug_tuple("AddLongDst").field(arg0).field(arg1).field(arg2).finish(),
+            Self::AddLongDst(arg0, arg1, arg2) => f
+                .debug_tuple("AddLongDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::SubInt(arg0, arg1) => f.debug_tuple("SubInt").field(arg0).field(arg1).finish(),
-            Self::SubIntDst(arg0, arg1, arg2) => f.debug_tuple("SubIntDst").field(arg0).field(arg1).field(arg2).finish(),
-            Self::SubIntLit8(arg0, arg1, arg2) => f.debug_tuple("SubIntLit8").field(arg0).field(arg1).field(arg2).finish(),
-            Self::SubIntLit16(arg0, arg1, arg2) => f.debug_tuple("SubIntLit16").field(arg0).field(arg1).field(arg2).finish(),
+            Self::SubIntDst(arg0, arg1, arg2) => f
+                .debug_tuple("SubIntDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::SubIntLit8(arg0, arg1, arg2) => f
+                .debug_tuple("SubIntLit8")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::SubIntLit16(arg0, arg1, arg2) => f
+                .debug_tuple("SubIntLit16")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::SubLong(arg0, arg1) => f.debug_tuple("SubLong").field(arg0).field(arg1).finish(),
-            Self::SubLongDst(arg0, arg1, arg2) => f.debug_tuple("SubLongDst").field(arg0).field(arg1).field(arg2).finish(),
+            Self::SubLongDst(arg0, arg1, arg2) => f
+                .debug_tuple("SubLongDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::MulInt(arg0, arg1) => f.debug_tuple("MulInt").field(arg0).field(arg1).finish(),
-            Self::MulIntDst(arg0, arg1, arg2) => f.debug_tuple("MulIntDst").field(arg0).field(arg1).field(arg2).finish(),
-            Self::MulIntLit8(arg0, arg1, arg2) => f.debug_tuple("MulIntLit8").field(arg0).field(arg1).field(arg2).finish(),
-            Self::MulIntLit16(arg0, arg1, arg2) => f.debug_tuple("MulIntLit16").field(arg0).field(arg1).field(arg2).finish(),
+            Self::MulIntDst(arg0, arg1, arg2) => f
+                .debug_tuple("MulIntDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::MulIntLit8(arg0, arg1, arg2) => f
+                .debug_tuple("MulIntLit8")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::MulIntLit16(arg0, arg1, arg2) => f
+                .debug_tuple("MulIntLit16")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::MulLong(arg0, arg1) => f.debug_tuple("MulLong").field(arg0).field(arg1).finish(),
-            Self::MulLongDst(arg0, arg1, arg2) => f.debug_tuple("MulLongDst").field(arg0).field(arg1).field(arg2).finish(),
+            Self::MulLongDst(arg0, arg1, arg2) => f
+                .debug_tuple("MulLongDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
 
-             Self::DivInt(arg0, arg1) => f.debug_tuple("DivInt").field(arg0).field(arg1).finish(),
-            Self::DivIntDst(arg0, arg1, arg2) => f.debug_tuple("DivIntDst").field(arg0).field(arg1).field(arg2).finish(),
-            Self::DivIntLit8(arg0, arg1, arg2) => f.debug_tuple("DivIntLit8").field(arg0).field(arg1).field(arg2).finish(),
-            Self::DivIntLit16(arg0, arg1, arg2) => f.debug_tuple("DivIntLit16").field(arg0).field(arg1).field(arg2).finish(),
+            Self::DivInt(arg0, arg1) => f.debug_tuple("DivInt").field(arg0).field(arg1).finish(),
+            Self::DivIntDst(arg0, arg1, arg2) => f
+                .debug_tuple("DivIntDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::DivIntLit8(arg0, arg1, arg2) => f
+                .debug_tuple("DivIntLit8")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::DivIntLit16(arg0, arg1, arg2) => f
+                .debug_tuple("DivIntLit16")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::DivLong(arg0, arg1) => f.debug_tuple("DivLong").field(arg0).field(arg1).finish(),
-            Self::DivLongDst(arg0, arg1, arg2) => f.debug_tuple("DivLongDst").field(arg0).field(arg1).field(arg2).finish(),
-
+            Self::DivLongDst(arg0, arg1, arg2) => f
+                .debug_tuple("DivLongDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
 
             Self::AndInt(arg0, arg1) => f.debug_tuple("AndInt").field(arg0).field(arg1).finish(),
-            Self::AndIntDst(arg0, arg1, arg2) => f.debug_tuple("AndIntDst").field(arg0).field(arg1).field(arg2).finish(),
-            Self::AndIntLit8(arg0, arg1, arg2) => f.debug_tuple("AndIntLit8").field(arg0).field(arg1).field(arg2).finish(),
-            Self::AndIntLit16(arg0, arg1, arg2) => f.debug_tuple("AndIntLit16").field(arg0).field(arg1).field(arg2).finish(),
+            Self::AndIntDst(arg0, arg1, arg2) => f
+                .debug_tuple("AndIntDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::AndIntLit8(arg0, arg1, arg2) => f
+                .debug_tuple("AndIntLit8")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::AndIntLit16(arg0, arg1, arg2) => f
+                .debug_tuple("AndIntLit16")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::AndLong(arg0, arg1) => f.debug_tuple("AndLong").field(arg0).field(arg1).finish(),
-            Self::AndLongDst(arg0, arg1, arg2) => f.debug_tuple("AndLongDst").field(arg0).field(arg1).field(arg2).finish(),
+            Self::AndLongDst(arg0, arg1, arg2) => f
+                .debug_tuple("AndLongDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::OrInt(arg0, arg1) => f.debug_tuple("OrInt").field(arg0).field(arg1).finish(),
-            Self::OrIntDst(arg0, arg1, arg2) => f.debug_tuple("OrIntDst").field(arg0).field(arg1).field(arg2).finish(),
-            Self::OrIntLit8(arg0, arg1, arg2) => f.debug_tuple("OrIntLit8").field(arg0).field(arg1).field(arg2).finish(),
-            Self::OrIntLit16(arg0, arg1, arg2) => f.debug_tuple("OrIntLit16").field(arg0).field(arg1).field(arg2).finish(),
+            Self::OrIntDst(arg0, arg1, arg2) => f
+                .debug_tuple("OrIntDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::OrIntLit8(arg0, arg1, arg2) => f
+                .debug_tuple("OrIntLit8")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::OrIntLit16(arg0, arg1, arg2) => f
+                .debug_tuple("OrIntLit16")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::OrLong(arg0, arg1) => f.debug_tuple("OrLong").field(arg0).field(arg1).finish(),
-            Self::OrLongDst(arg0, arg1, arg2) => f.debug_tuple("OrLongDst").field(arg0).field(arg1).field(arg2).finish(),
-            Self::Test(arg0, arg1, arg2, arg3) => f.debug_tuple("Test").field(arg0).field(arg1).field(arg2).field(arg3).finish(),
-            Self::TestZero(arg0, arg1, arg2) => f.debug_tuple("TestZero").field(arg0).field(arg1).field(arg2).finish(),
+            Self::OrLongDst(arg0, arg1, arg2) => f
+                .debug_tuple("OrLongDst")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::Test(arg0, arg1, arg2, arg3) => f
+                .debug_tuple("Test")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .field(arg3)
+                .finish(),
+            Self::TestZero(arg0, arg1, arg2) => f
+                .debug_tuple("TestZero")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::Goto8(arg0) => f.debug_tuple("Goto8").field(arg0).finish(),
             Self::Goto16(arg0) => f.debug_tuple("Goto16").field(arg0).finish(),
             Self::Goto32(arg0) => f.debug_tuple("Goto32").field(arg0).finish(),
-            Self::ArrayGetByte(arg0, arg1, arg2) => f.debug_tuple("ArrayGetByte").field(arg0).field(arg1).field(arg2).finish(),
-            Self::ArrayPutByte(arg0, arg1, arg2) => f.debug_tuple("ArrayPutByte").field(arg0).field(arg1).field(arg2).finish(),
-            Self::ArrayGetChar(arg0, arg1, arg2) => f.debug_tuple("ArrayGetChar").field(arg0).field(arg1).field(arg2).finish(),
-            Self::ArrayPutChar(arg0, arg1, arg2) => f.debug_tuple("ArrayPutChar").field(arg0).field(arg1).field(arg2).finish(),
+            Self::ArrayGetByte(arg0, arg1, arg2) => f
+                .debug_tuple("ArrayGetByte")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::ArrayPutByte(arg0, arg1, arg2) => f
+                .debug_tuple("ArrayPutByte")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::ArrayGetChar(arg0, arg1, arg2) => f
+                .debug_tuple("ArrayGetChar")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::ArrayPutChar(arg0, arg1, arg2) => f
+                .debug_tuple("ArrayPutChar")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::Invoke(arg0) => f.debug_tuple("Invoke").field(arg0).finish(),
-            Self::InvokeVirtual(arg0, arg1, arg2) => f.debug_tuple("InvokeVirtual").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InvokeSuper(arg0, arg1, arg2) => f.debug_tuple("InvokeSuper").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InvokeDirect(arg0, arg1, arg2) => f.debug_tuple("InvokeDirect").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InvokeStatic(arg0, arg1, arg2) => f.debug_tuple("InvokeStatic").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InvokeInterface(arg0, arg1, arg2) => f.debug_tuple("InvokeInterface").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InvokeVirtualRange(arg0, arg1, arg2) => f.debug_tuple("InvokeVirtualRange").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InvokeSuperRange(arg0, arg1, arg2) => f.debug_tuple("InvokeSuperRange").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InvokeDirectRange(arg0, arg1, arg2) => f.debug_tuple("InvokeDirectRange").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InvokeStaticRange(arg0, arg1, arg2) => f.debug_tuple("InvokeStaticRange").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InvokeInterfaceRange(arg0, arg1, arg2) => f.debug_tuple("InvokeInterfaceRange").field(arg0).field(arg1).field(arg2).finish(),
+            Self::InvokeVirtual(arg0, arg1, arg2) => f
+                .debug_tuple("InvokeVirtual")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InvokeSuper(arg0, arg1, arg2) => f
+                .debug_tuple("InvokeSuper")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InvokeDirect(arg0, arg1, arg2) => f
+                .debug_tuple("InvokeDirect")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InvokeStatic(arg0, arg1, arg2) => f
+                .debug_tuple("InvokeStatic")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InvokeInterface(arg0, arg1, arg2) => f
+                .debug_tuple("InvokeInterface")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InvokeVirtualRange(arg0, arg1, arg2) => f
+                .debug_tuple("InvokeVirtualRange")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InvokeSuperRange(arg0, arg1, arg2) => f
+                .debug_tuple("InvokeSuperRange")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InvokeDirectRange(arg0, arg1, arg2) => f
+                .debug_tuple("InvokeDirectRange")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InvokeStaticRange(arg0, arg1, arg2) => f
+                .debug_tuple("InvokeStaticRange")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InvokeInterfaceRange(arg0, arg1, arg2) => f
+                .debug_tuple("InvokeInterfaceRange")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::InvokeType(arg0) => f.debug_tuple("InvokeType").field(arg0).finish(),
             Self::MoveResult(arg0) => f.debug_tuple("MoveResult").field(arg0).finish(),
             Self::MoveResultWide(arg0) => f.debug_tuple("MoveResultWide").field(arg0).finish(),
@@ -272,59 +532,242 @@ impl Debug for Instruction {
             Self::ReturnVoid => write!(f, "ReturnVoid"),
             Self::Return(arg0) => f.debug_tuple("Return").field(arg0).finish(),
             Self::Const => write!(f, "Const"),
-            Self::ConstLit4(arg0, arg1) => f.debug_tuple("ConstLit4").field(arg0).field(arg1).finish(),
-            Self::ConstLit16(arg0, arg1) => f.debug_tuple("ConstLit16").field(arg0).field(arg1).finish(),
-            Self::ConstLit32(arg0, arg1) => f.debug_tuple("ConstLit32").field(arg0).field(arg1).finish(),
+            Self::ConstLit4(arg0, arg1) => {
+                f.debug_tuple("ConstLit4").field(arg0).field(arg1).finish()
+            }
+            Self::ConstLit16(arg0, arg1) => {
+                f.debug_tuple("ConstLit16").field(arg0).field(arg1).finish()
+            }
+            Self::ConstLit32(arg0, arg1) => {
+                f.debug_tuple("ConstLit32").field(arg0).field(arg1).finish()
+            }
             Self::ConstWide => write!(f, "ConstWide"),
-            Self::ConstString(arg0, arg1) => f.debug_tuple("ConstString").field(arg0).field(arg1).finish(),
-            Self::ConstStringJumbo(arg0, arg1) => f.debug_tuple("ConstStringJumbo").field(arg0).field(arg1).finish(),
-            Self::ConstClass(arg0, arg1) => f.debug_tuple("ConstClass").field(arg0).field(arg1).finish(),
-            Self::CheckCast(arg0, arg1) => f.debug_tuple("CheckCast").field(arg0).field(arg1).finish(),
-            Self::IntToByte(arg0, arg1) => f.debug_tuple("IntToByte").field(arg0).field(arg1).finish(),
-            Self::IntToChar(arg0, arg1) => f.debug_tuple("IntToChar").field(arg0).field(arg1).finish(),
-            Self::ArrayLength(arg0, arg1) => f.debug_tuple("ArrayLength").field(arg0).field(arg1).finish(),
-            Self::NewInstance(arg0, arg1) => f.debug_tuple("NewInstance").field(arg0).field(arg1).finish(),
+            Self::ConstString(arg0, arg1) => f
+                .debug_tuple("ConstString")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::ConstStringJumbo(arg0, arg1) => f
+                .debug_tuple("ConstStringJumbo")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::ConstClass(arg0, arg1) => {
+                f.debug_tuple("ConstClass").field(arg0).field(arg1).finish()
+            }
+            Self::CheckCast(arg0, arg1) => {
+                f.debug_tuple("CheckCast").field(arg0).field(arg1).finish()
+            }
+            Self::IntToByte(arg0, arg1) => {
+                f.debug_tuple("IntToByte").field(arg0).field(arg1).finish()
+            }
+            Self::IntToChar(arg0, arg1) => {
+                f.debug_tuple("IntToChar").field(arg0).field(arg1).finish()
+            }
+            Self::ArrayLength(arg0, arg1) => f
+                .debug_tuple("ArrayLength")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::NewInstance(arg0, arg1) => f
+                .debug_tuple("NewInstance")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
             Self::NewInstanceType(arg0) => f.debug_tuple("NewInstanceType").field(arg0).finish(),
-            Self::NewArray(arg0, arg1, arg2) => f.debug_tuple("NewArray").field(arg0).field(arg1).field(arg2).finish(),
-            Self::FilledNewArray(arg0, arg1, arg2) => f.debug_tuple("FilledNewArray").field(arg0).field(arg1).field(arg2).finish(),
-            Self::FilledNewArrayRange(arg0, arg1, arg2) => f.debug_tuple("FilledNewArrayRange").field(arg0).field(arg1).field(arg2).finish(),
-            Self::FillArrayData(arg0, arg1) => f.debug_tuple("FillArrayData").field(arg0).field(arg1).finish(),
-            Self::StaticGet(arg0, arg1) => f.debug_tuple("StaticGet").field(arg0).field(arg1).finish(),
-            Self::StaticGetWide(arg0, arg1) => f.debug_tuple("StaticGetWide").field(arg0).field(arg1).finish(),
-            Self::StaticGetObject(arg0, arg1) => f.debug_tuple("StaticGetObject").field(arg0).field(arg1).finish(),
-            Self::StaticGetBoolean(arg0, arg1) => f.debug_tuple("StaticGetBoolean").field(arg0).field(arg1).finish(),
-            Self::StaticGetByte(arg0, arg1) => f.debug_tuple("StaticGetByte").field(arg0).field(arg1).finish(),
-            Self::StaticGetChar(arg0, arg1) => f.debug_tuple("StaticGetChar").field(arg0).field(arg1).finish(),
-            Self::StaticGetShort(arg0, arg1) => f.debug_tuple("StaticGetShort").field(arg0).field(arg1).finish(),
-            Self::StaticPut(arg0, arg1) => f.debug_tuple("StaticPut").field(arg0).field(arg1).finish(),
-            Self::StaticPutWide(arg0, arg1) => f.debug_tuple("StaticPutWide").field(arg0).field(arg1).finish(),
-            Self::StaticPutObject(arg0, arg1) => f.debug_tuple("StaticPutObject").field(arg0).field(arg1).finish(),
-            Self::StaticPutBoolean(arg0, arg1) => f.debug_tuple("StaticPutBoolean").field(arg0).field(arg1).finish(),
-            Self::StaticPutByte(arg0, arg1) => f.debug_tuple("StaticPutByte").field(arg0).field(arg1).finish(),
-            Self::StaticPutChar(arg0, arg1) => f.debug_tuple("StaticPutChar").field(arg0).field(arg1).finish(),
-            Self::StaticPutShort(arg0, arg1) => f.debug_tuple("StaticPutShort").field(arg0).field(arg1).finish(),
+            Self::NewArray(arg0, arg1, arg2) => f
+                .debug_tuple("NewArray")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::FilledNewArray(arg0, arg1, arg2) => f
+                .debug_tuple("FilledNewArray")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::FilledNewArrayRange(arg0, arg1, arg2) => f
+                .debug_tuple("FilledNewArrayRange")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::FillArrayData(arg0, arg1) => f
+                .debug_tuple("FillArrayData")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::StaticGet(arg0, arg1) => {
+                f.debug_tuple("StaticGet").field(arg0).field(arg1).finish()
+            }
+            Self::StaticGetWide(arg0, arg1) => f
+                .debug_tuple("StaticGetWide")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::StaticGetObject(arg0, arg1) => f
+                .debug_tuple("StaticGetObject")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::StaticGetBoolean(arg0, arg1) => f
+                .debug_tuple("StaticGetBoolean")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::StaticGetByte(arg0, arg1) => f
+                .debug_tuple("StaticGetByte")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::StaticGetChar(arg0, arg1) => f
+                .debug_tuple("StaticGetChar")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::StaticGetShort(arg0, arg1) => f
+                .debug_tuple("StaticGetShort")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::StaticPut(arg0, arg1) => {
+                f.debug_tuple("StaticPut").field(arg0).field(arg1).finish()
+            }
+            Self::StaticPutWide(arg0, arg1) => f
+                .debug_tuple("StaticPutWide")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::StaticPutObject(arg0, arg1) => f
+                .debug_tuple("StaticPutObject")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::StaticPutBoolean(arg0, arg1) => f
+                .debug_tuple("StaticPutBoolean")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::StaticPutByte(arg0, arg1) => f
+                .debug_tuple("StaticPutByte")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::StaticPutChar(arg0, arg1) => f
+                .debug_tuple("StaticPutChar")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::StaticPutShort(arg0, arg1) => f
+                .debug_tuple("StaticPutShort")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
             Self::Switch(arg0, arg1) => f.debug_tuple("Switch").field(arg0).field(arg1).finish(),
-            Self::InstanceGet(arg0, arg1, arg2) => f.debug_tuple("InstanceGet").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InstanceGetWide(arg0, arg1, arg2) => f.debug_tuple("InstanceGetWide").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InstanceGetObject(arg0, arg1, arg2) => f.debug_tuple("InstanceGetObject").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InstanceGetBoolean(arg0, arg1, arg2) => f.debug_tuple("InstanceGetBoolean").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InstanceGetByte(arg0, arg1, arg2) => f.debug_tuple("InstanceGetByte").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InstanceGetChar(arg0, arg1, arg2) => f.debug_tuple("InstanceGetChar").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InstanceGetShort(arg0, arg1, arg2) => f.debug_tuple("InstanceGetShort").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InstancePut(arg0, arg1, arg2) => f.debug_tuple("InstancePut").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InstancePutWide(arg0, arg1, arg2) => f.debug_tuple("InstancePutWide").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InstancePutObject(arg0, arg1, arg2) => f.debug_tuple("InstancePutObject").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InstancePutBoolean(arg0, arg1, arg2) => f.debug_tuple("InstancePutBoolean").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InstancePutByte(arg0, arg1, arg2) => f.debug_tuple("InstancePutByte").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InstancePutChar(arg0, arg1, arg2) => f.debug_tuple("InstancePutChar").field(arg0).field(arg1).field(arg2).finish(),
-            Self::InstancePutShort(arg0, arg1, arg2) => f.debug_tuple("InstancePutShort").field(arg0).field(arg1).field(arg2).finish(),
+            Self::InstanceGet(arg0, arg1, arg2) => f
+                .debug_tuple("InstanceGet")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InstanceGetWide(arg0, arg1, arg2) => f
+                .debug_tuple("InstanceGetWide")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InstanceGetObject(arg0, arg1, arg2) => f
+                .debug_tuple("InstanceGetObject")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InstanceGetBoolean(arg0, arg1, arg2) => f
+                .debug_tuple("InstanceGetBoolean")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InstanceGetByte(arg0, arg1, arg2) => f
+                .debug_tuple("InstanceGetByte")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InstanceGetChar(arg0, arg1, arg2) => f
+                .debug_tuple("InstanceGetChar")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InstanceGetShort(arg0, arg1, arg2) => f
+                .debug_tuple("InstanceGetShort")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InstancePut(arg0, arg1, arg2) => f
+                .debug_tuple("InstancePut")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InstancePutWide(arg0, arg1, arg2) => f
+                .debug_tuple("InstancePutWide")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InstancePutObject(arg0, arg1, arg2) => f
+                .debug_tuple("InstancePutObject")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InstancePutBoolean(arg0, arg1, arg2) => f
+                .debug_tuple("InstancePutBoolean")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InstancePutByte(arg0, arg1, arg2) => f
+                .debug_tuple("InstancePutByte")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InstancePutChar(arg0, arg1, arg2) => f
+                .debug_tuple("InstancePutChar")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::InstancePutShort(arg0, arg1, arg2) => f
+                .debug_tuple("InstancePutShort")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
             Self::Throw(arg0) => f.debug_tuple("Throw").field(arg0).finish(),
             Self::NotImpl(arg0, arg1) => f.debug_tuple("NotImpl").field(arg0).field(arg1).finish(),
-            Self::ArrayData(arg0, arg1) => f.debug_tuple("ArrayData").field(arg0).field(arg1).finish(),
+            Self::ArrayData(arg0, arg1) => {
+                f.debug_tuple("ArrayData").field(arg0).field(arg1).finish()
+            }
             Self::SwitchData(arg0) => f.debug_tuple("SwitchData").field(arg0).finish(),
             Self::ArbitraryData(arg0) => f.write_str(&arg0),
-            Self::ShrIntLit8(arg0, arg1, arg2) => f.debug_tuple("ShrIntLit8").field(arg0).field(arg1).field(arg2).finish(),
-            Self::UShrIntLit8(arg0, arg1, arg2) => f.debug_tuple("ShrIntLit8").field(arg0).field(arg1).field(arg2).finish(),
+            Self::ShrIntLit8(arg0, arg1, arg2) => f
+                .debug_tuple("ShrIntLit8")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
+            Self::UShrIntLit8(arg0, arg1, arg2) => f
+                .debug_tuple("ShrIntLit8")
+                .field(arg0)
+                .field(arg1)
+                .field(arg2)
+                .finish(),
         }
     }
 }
@@ -414,7 +857,294 @@ static MNEMONICS: [&str; 82] = [
     "ushr-int/lit8",
 ];
 
+fn test_function_code(function: &TestFunction) -> u8 {
+    match function {
+        TestFunction::Equal => 0,
+        TestFunction::NotEqual => 1,
+        TestFunction::LessThan => 2,
+        TestFunction::LessEqual => 3,
+        TestFunction::GreaterThan => 4,
+        TestFunction::GreaterEqual => 5,
+    }
+}
+
 impl Instruction {
+    /// Encode this decoded instruction as DEX code units.
+    ///
+    /// The parser intentionally exposes a compact instruction model.  This
+    /// encoder covers every concrete instruction currently produced by the
+    /// decoder and rejects the few context-dependent display placeholders
+    /// rather than emitting invalid DEX.
+    pub fn to_code_units(&self) -> Result<Vec<u16>, String> {
+        use Instruction::*;
+        let u4 = |value: &u4| u8::from(*value);
+        let i4 = |value: &i4| i8::from(*value);
+        let one = |opcode: u8, high: u8| vec![u16::from_le_bytes([opcode, high])];
+        let fmt12 = |opcode: u8, dst: &u4, src: &u4| one(opcode, u4(src) << 4 | u4(dst));
+        let fmt22 = |opcode: u8, dst: u8, idx: u16| vec![u16::from_le_bytes([opcode, dst]), idx];
+        let fmt22s = |opcode: u8, dst: u8, src: u8, value: i16| {
+            vec![
+                u16::from_le_bytes([opcode, dst]),
+                value as u16 | ((src as u16) << 8),
+            ]
+        };
+        let fmt22s4 = |opcode: u8, dst: &u4, src: &u4, value: i16| {
+            vec![
+                u16::from_le_bytes([opcode, u4(src) << 4 | u4(dst)]),
+                value as u16,
+            ]
+        };
+        let fmt23 = |opcode: u8, dst: u8, a: u8, b: u8| {
+            vec![
+                u16::from_le_bytes([opcode, dst]),
+                a as u16 | ((b as u16) << 8),
+            ]
+        };
+        let fmt22c = |opcode: u8, dst: &u4, object: &u4, field: u16| {
+            vec![
+                u16::from_le_bytes([opcode, u4(object) << 4 | u4(dst)]),
+                field,
+            ]
+        };
+        let fmt31 = |opcode: u8, dst: u8, value: i32| {
+            vec![
+                u16::from_le_bytes([opcode, dst]),
+                value as u32 as u16,
+                (value as u32 >> 16) as u16,
+            ]
+        };
+        let fmt35 =
+            |opcode: u8, count: &u4, method: u16, regs: &[u8]| -> Result<Vec<u16>, String> {
+                if regs.len() > 5 || regs.len() != u4(count) as usize {
+                    return Err("invoke register count does not match the instruction".to_string());
+                }
+                let mut register_words = [0u8; 5];
+                for (index, register) in regs.iter().enumerate() {
+                    if *register > 0x0f {
+                        return Err("35c invoke registers must fit in four bits".to_string());
+                    }
+                    register_words[index] = *register;
+                }
+                Ok(vec![
+                    u16::from_le_bytes([opcode, u4(count) << 4 | register_words[4]]),
+                    method,
+                    register_words[0] as u16
+                        | ((register_words[1] as u16) << 4)
+                        | ((register_words[2] as u16) << 8)
+                        | ((register_words[3] as u16) << 12),
+                ])
+            };
+
+        let result = match self {
+            Nop => one(0x00, 0),
+            Move(dst, src) => fmt12(0x01, dst, src),
+            MoveFrom16(dst, src) => fmt22(0x02, *dst, *src),
+            Move16(dst, src) => vec![0x0003, *dst, *src],
+            MoveWide(dst, src) => fmt12(0x04, dst, src),
+            MoveWideFrom16(dst, src) => fmt22(0x05, *dst, *src),
+            MoveWide16(dst, src) => vec![0x0006, *dst, *src],
+            MoveObject(dst, src) => fmt12(0x07, dst, src),
+            MoveObjectFrom16(dst, src) => fmt22(0x08, *dst, *src),
+            MoveObject16(dst, src) => vec![0x0009, *dst, *src],
+
+            MoveResult(dst) => one(0x0a, *dst),
+            MoveResultWide(dst) => one(0x0b, *dst),
+            MoveResultObject(dst) => one(0x0c, *dst),
+            ReturnVoid => one(0x0e, 0),
+            Return(dst) => one(0x0f, *dst),
+            Throw(dst) => one(0x27, *dst),
+
+            ConstLit4(dst, value) => {
+                let literal = (i4(value) as u8) & 0x0f;
+                one(0x12, u4(dst) | (literal << 4))
+            }
+            ConstLit16(dst, value) => fmt22s(0x13, *dst, 0, *value),
+            ConstLit32(dst, value) => fmt31(0x14, *dst, *value),
+            ConstString(dst, string_idx) => fmt22(0x1a, *dst, *string_idx),
+            ConstStringJumbo(dst, string_idx) => {
+                vec![
+                    u16::from_le_bytes([0x1b, *dst]),
+                    *string_idx as u16,
+                    (*string_idx >> 16) as u16,
+                ]
+            }
+            ConstClass(dst, type_idx) => fmt22(0x1c, *dst, *type_idx),
+            CheckCast(dst, type_idx) => fmt22(0x1f, *dst, *type_idx),
+
+            Goto8(offset) => one(0x28, *offset as u8),
+            Goto16(offset) => vec![0x0029, *offset as u16],
+            Goto32(offset) => vec![0x002a, *offset as u32 as u16, (*offset as u32 >> 16) as u16],
+            Test(function, a, b, offset) => {
+                one(0x32 + test_function_code(function), u4(a) | (u4(b) << 4))
+                    .into_iter()
+                    .chain(std::iter::once(*offset as u16))
+                    .collect()
+            }
+            TestZero(function, a, offset) => vec![
+                u16::from_le_bytes([0x38 + test_function_code(function), *a]),
+                *offset as u16,
+            ],
+
+            ArrayGetByte(dst, array, index) => fmt23(0x48, *dst, *array, *index),
+            ArrayGetChar(dst, array, index) => fmt23(0x49, *dst, *array, *index),
+            ArrayPutByte(src, array, index) => fmt23(0x4f, *src, *array, *index),
+            ArrayPutChar(src, array, index) => fmt23(0x50, *src, *array, *index),
+            ArrayLength(dst, array) => fmt12(0x21, dst, array),
+
+            XorInt(dst, src) => fmt12(0xb7, dst, src),
+            XorLong(dst, src) => fmt12(0xc2, dst, src),
+            XorIntDst(dst, a, b) => fmt23(0x97, *dst, *a, *b),
+            XorLongDst(dst, a, b) => fmt23(0xa2, *dst, *a, *b),
+            XorIntDstLit8(dst, src, value) => fmt22s(0xdf, *dst, *src, *value as i16),
+            XorIntDstLit16(dst, src, value) => fmt22s4(0xd7, dst, src, *value as i16),
+            RemInt(dst, src) => fmt12(0xb4, dst, src),
+            RemLong(dst, src) => fmt12(0xbf, dst, src),
+            RemIntDst(dst, a, b) => fmt23(0x94, *dst, *a, *b),
+            RemLongDst(dst, a, b) => fmt23(0x9f, *dst, *a, *b),
+            RemIntLit8(dst, src, value) => fmt22s(0xdc, *dst, *src, *value as i16),
+            RemIntLit16(dst, src, value) => fmt22s4(0xd4, dst, src, *value as i16),
+            AddInt(dst, src) => fmt12(0xb0, dst, src),
+            AddLong(dst, src) => fmt12(0xbb, dst, src),
+            AddIntDst(dst, a, b) => fmt23(0x90, *dst, *a, *b),
+            AddLongDst(dst, a, b) => fmt23(0x9b, *dst, *a, *b),
+            AddIntLit8(dst, src, value) => fmt22s(0xd8, *dst, *src, *value as i16),
+            AddIntLit16(dst, src, value) => fmt22s4(0xd0, dst, src, *value as i16),
+            SubInt(dst, src) => fmt12(0xb1, dst, src),
+            SubLong(dst, src) => fmt12(0xbc, dst, src),
+            SubIntDst(dst, a, b) => fmt23(0x91, *dst, *a, *b),
+            SubLongDst(dst, a, b) => fmt23(0x9c, *dst, *a, *b),
+            SubIntLit8(dst, src, value) => fmt22s(0xd9, *dst, *src, *value as i16),
+            SubIntLit16(dst, src, value) => fmt22s4(0xd1, dst, src, *value as i16),
+            MulInt(dst, src) => fmt12(0xb2, dst, src),
+            MulLong(dst, src) => fmt12(0xbd, dst, src),
+            MulIntDst(dst, a, b) => fmt23(0x92, *dst, *a, *b),
+            MulLongDst(dst, a, b) => fmt23(0x9d, *dst, *a, *b),
+            MulIntLit8(dst, src, value) => fmt22s(0xda, *dst, *src, *value as i16),
+            MulIntLit16(dst, src, value) => fmt22s4(0xd2, dst, src, *value as i16),
+            DivInt(dst, src) => fmt12(0xb3, dst, src),
+            DivLong(dst, src) => fmt12(0xbe, dst, src),
+            DivIntDst(dst, a, b) => fmt23(0x93, *dst, *a, *b),
+            DivLongDst(dst, a, b) => fmt23(0x9e, *dst, *a, *b),
+            DivIntLit8(dst, src, value) => fmt22s(0xdb, *dst, *src, *value as i16),
+            DivIntLit16(dst, src, value) => fmt22s4(0xd3, dst, src, *value as i16),
+            AndInt(dst, src) => fmt12(0xb5, dst, src),
+            AndLong(dst, src) => fmt12(0xc0, dst, src),
+            AndIntDst(dst, a, b) => fmt23(0x95, *dst, *a, *b),
+            AndLongDst(dst, a, b) => fmt23(0xa0, *dst, *a, *b),
+            AndIntLit8(dst, src, value) => fmt22s(0xdd, *dst, *src, *value as i16),
+            AndIntLit16(dst, src, value) => fmt22s4(0xd5, dst, src, *value as i16),
+            OrInt(dst, src) => fmt12(0xb6, dst, src),
+            OrLong(dst, src) => fmt12(0xc1, dst, src),
+            OrIntDst(dst, a, b) => fmt23(0x96, *dst, *a, *b),
+            OrLongDst(dst, a, b) => fmt23(0xa1, *dst, *a, *b),
+            OrIntLit8(dst, src, value) => fmt22s(0xde, *dst, *src, *value as i16),
+            OrIntLit16(dst, src, value) => fmt22s4(0xd6, dst, src, *value as i16),
+            ShrIntLit8(dst, src, value) => fmt22s(0xe1, *dst, *src, *value as i16),
+            UShrIntLit8(dst, src, value) => fmt22s(0xe2, *dst, *src, *value as i16),
+
+            IntToByte(dst, src) => fmt12(0x8d, dst, src),
+            IntToChar(dst, src) => fmt12(0x82, dst, src),
+            NewInstance(dst, type_idx) => fmt22(0x22, *dst, *type_idx),
+            NewArray(dst, size, type_idx) => one(0x23, u4(dst) | (u4(size) << 4))
+                .into_iter()
+                .chain(std::iter::once(*type_idx))
+                .collect(),
+            FilledNewArray(count, type_idx, regs) => fmt35(0x24, count, *type_idx, regs)?,
+            FilledNewArrayRange(count, first, type_idx) => {
+                vec![u16::from_le_bytes([0x25, *count]), *type_idx, *first]
+            }
+            FillArrayData(array, offset) => vec![
+                u16::from_le_bytes([0x26, *array]),
+                *offset as u16,
+                (*offset >> 16) as u16,
+            ],
+
+            InvokeVirtual(count, method, regs) => fmt35(0x6e, count, *method, regs)?,
+            InvokeSuper(count, method, regs) => fmt35(0x6f, count, *method, regs)?,
+            InvokeDirect(count, method, regs) => fmt35(0x70, count, *method, regs)?,
+            InvokeStatic(count, method, regs) => fmt35(0x71, count, *method, regs)?,
+            InvokeInterface(count, method, regs) => fmt35(0x72, count, *method, regs)?,
+            InvokeVirtualRange(count, method, first) => {
+                vec![u16::from_le_bytes([0x74, *count]), *method, *first]
+            }
+            InvokeSuperRange(count, method, first) => {
+                vec![u16::from_le_bytes([0x75, *count]), *method, *first]
+            }
+            InvokeDirectRange(count, method, first) => {
+                vec![u16::from_le_bytes([0x76, *count]), *method, *first]
+            }
+            InvokeStaticRange(count, method, first) => {
+                vec![u16::from_le_bytes([0x77, *count]), *method, *first]
+            }
+            InvokeInterfaceRange(count, method, first) => {
+                vec![u16::from_le_bytes([0x78, *count]), *method, *first]
+            }
+            Invoke(method) => vec![u16::from_le_bytes([0xfa, 0]), *method],
+
+            InstanceGet(dst, object, field) => fmt22c(0x52, dst, object, *field),
+            InstanceGetWide(dst, object, field) => fmt22c(0x53, dst, object, *field),
+            InstanceGetObject(dst, object, field) => fmt22c(0x54, dst, object, *field),
+            InstanceGetBoolean(dst, object, field) => fmt22c(0x55, dst, object, *field),
+            InstanceGetByte(dst, object, field) => fmt22c(0x56, dst, object, *field),
+            InstanceGetChar(dst, object, field) => fmt22c(0x57, dst, object, *field),
+            InstanceGetShort(dst, object, field) => fmt22c(0x58, dst, object, *field),
+            InstancePut(src, object, field) => fmt22c(0x59, src, object, *field),
+            InstancePutWide(src, object, field) => fmt22c(0x5a, src, object, *field),
+            InstancePutObject(src, object, field) => fmt22c(0x5b, src, object, *field),
+            InstancePutBoolean(src, object, field) => fmt22c(0x5c, src, object, *field),
+            InstancePutByte(src, object, field) => fmt22c(0x5d, src, object, *field),
+            InstancePutChar(src, object, field) => fmt22c(0x5e, src, object, *field),
+            InstancePutShort(src, object, field) => fmt22c(0x5f, src, object, *field),
+            StaticGet(dst, field) => fmt22(0x60, *dst, *field),
+            StaticGetWide(dst, field) => fmt22(0x61, *dst, *field),
+            StaticGetObject(dst, field) => fmt22(0x62, *dst, *field),
+            StaticGetBoolean(dst, field) => fmt22(0x63, *dst, *field),
+            StaticGetByte(dst, field) => fmt22(0x64, *dst, *field),
+            StaticGetChar(dst, field) => fmt22(0x65, *dst, *field),
+            StaticGetShort(dst, field) => fmt22(0x66, *dst, *field),
+            StaticPut(src, field) => fmt22(0x67, *src, *field),
+            StaticPutWide(src, field) => fmt22(0x68, *src, *field),
+            StaticPutObject(src, field) => fmt22(0x69, *src, *field),
+            StaticPutBoolean(src, field) => fmt22(0x6a, *src, *field),
+            StaticPutByte(src, field) => fmt22(0x6b, *src, *field),
+            StaticPutChar(src, field) => fmt22(0x6c, *src, *field),
+            StaticPutShort(src, field) => fmt22(0x6d, *src, *field),
+
+            Switch(register, offset) => vec![
+                u16::from_le_bytes([0x2b, *register]),
+                *offset as u32 as u16,
+                (*offset as u32 >> 16) as u16,
+            ],
+            NotImpl(opcode, high) => one(*opcode, *high),
+            ArrayData(width, data) => {
+                if *width == 0 || data.len() % *width as usize != 0 {
+                    return Err(
+                        "array-data requires a non-zero width and complete elements".to_string()
+                    );
+                }
+                let element_count = data.len() / *width as usize;
+                let mut result = vec![
+                    u16::from_le_bytes([0x00, 0x03]),
+                    *width,
+                    element_count as u16,
+                    (element_count >> 16) as u16,
+                ];
+                for bytes in data.chunks(2) {
+                    result.push(u16::from_le_bytes([bytes[0], *bytes.get(1).unwrap_or(&0)]));
+                }
+                result
+            }
+            Const | ConstWide | InvokeType(_) | NewInstanceType(_) | SwitchData(_)
+            | ArbitraryData(_) => {
+                return Err(format!(
+                    "instruction is a display placeholder and cannot be encoded: {:?}",
+                    self
+                ));
+            }
+        };
+        Ok(result)
+    }
+
     pub fn mnemonic_from_opcode(&self) -> &'static str {
         match self {
             Instruction::ConstString(..) => MNEMONICS[1],
@@ -1147,7 +1877,10 @@ impl Instruction {
             Instruction::ArrayLength(dst, array) => {
                 format!("{} v{}, v{}", MNEMONICS[48], dst, array)
             }
-            Instruction::AddIntLit8(dst, src, lit) | Instruction::SubIntLit8(dst, src, lit) | Instruction::ShrIntLit8(dst, src, lit) | Instruction::UShrIntLit8( dst, src, lit) => {
+            Instruction::AddIntLit8(dst, src, lit)
+            | Instruction::SubIntLit8(dst, src, lit)
+            | Instruction::ShrIntLit8(dst, src, lit)
+            | Instruction::UShrIntLit8(dst, src, lit) => {
                 format!(
                     "{} v{}, v{}, {:#x}",
                     self.mnemonic_from_opcode(),

@@ -63,6 +63,10 @@ pub struct AndroidApplication {
     pub allow_backup: bool,
     #[serde(default = "default_as_false")]
     pub debuggable: bool,
+    #[serde(rename = "usesCleartextTraffic", default = "default_as_false")]
+    pub uses_cleartext_traffic: bool,
+    #[serde(rename = "networkSecurityConfig")]
+    pub network_security_config: Option<String>,
     #[serde(rename = "$value")]
     pub activities: Vec<ContentType>,
 }

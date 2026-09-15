@@ -1,5 +1,5 @@
 // Copyright (c) 2022 Ubique Innovation AG <https://www.ubique.ch>
-// 
+//
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
@@ -19,7 +19,9 @@ use std::{
 use zip::ZipArchive;
 
 use crate::dex::{parse_dex, parse_dex_buf, ArrayView};
-use coeus_models::models::{AndroidManifest, BinaryObject, DexFile, Files, MultiDexFile};
+use coeus_models::models::{
+    AndroidManifest, ArchiveEntry, BinaryObject, DexFile, Files, MultiDexFile,
+};
 
 pub fn extract_single_threaded(
     archive_name: &str,
@@ -29,19 +31,30 @@ pub fn extract_single_threaded(
     depth: u32,
     max_depth: u32,
 ) -> Files {
-    let mut archive = ZipArchive::new(f.get_cursor()).expect("Expected a zip file");
+    let mut zip_archive = ZipArchive::new(f.get_cursor()).expect("Expected a zip file");
     let mut dex_files = vec![];
     let mut other_files = HashMap::new();
     let mut multi_dex = vec![];
     let mut bin_manifest = vec![];
     let mut bin_res_file = vec![];
+    let mut archive_entries = vec![];
 
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).expect("Error Accessing file");
+    for i in 0..zip_archive.len() {
+        let mut file = zip_archive.by_index(i).expect("Error Accessing file");
         let mut zip_bytes: Vec<u8> = vec![];
 
         std::io::copy(&mut file, &mut zip_bytes).expect("oops");
         let ptr = zip_bytes.as_slice();
+        archive_entries.push(ArchiveEntry::new(
+            file.name().to_string(),
+            zip_bytes.clone(),
+            if file.compression() == zip::CompressionMethod::Stored {
+                0
+            } else {
+                8
+            },
+            file.is_dir(),
+        ));
         let file_name = format!("{}/{}", archive_name, file.name());
         if file.name().contains("AndroidManifest.xml") {
             bin_manifest = zip_bytes;
@@ -52,6 +65,10 @@ pub fn extract_single_threaded(
             continue;
         } else if file.name().contains("resources.arsc") {
             bin_res_file = zip_bytes;
+            other_files.insert(
+                file.name().to_string(),
+                Arc::new(BinaryObject::new(bin_res_file.clone())),
+            );
             continue;
         }
 
@@ -82,26 +99,12 @@ pub fn extract_single_threaded(
             );
         }
     }
+    let (manifest_content, android_manifest) = decode_manifest(&bin_manifest, &bin_res_file);
     if !dex_files.is_empty() {
-        let mut visitor = ModelVisitor::default();
-        Executor::arsc(STR_ARSC, &mut visitor).unwrap();
-        if !bin_res_file.is_empty() {
-            Executor::arsc(&bin_res_file, &mut visitor).unwrap();
-        }
-        let mut visitor = XmlVisitor::new(visitor.get_resources());
-        let _ = Executor::xml(Cursor::new(&bin_manifest), &mut visitor);
-        let (manifest_content, android_manifest) = {
-            let content = visitor.into_string().unwrap_or_else(|_| "".to_string());
-            (
-                content.clone(),
-                serde_xml_rs::from_str(&content).unwrap_or_default(),
-            )
-        };
-
         let secondary = dex_files.split_off(1);
         multi_dex.push(MultiDexFile::new(
-            android_manifest,
-            manifest_content,
+            android_manifest.clone(),
+            manifest_content.clone(),
             dex_files.remove(0),
             secondary,
         ));
@@ -111,7 +114,10 @@ pub fn extract_single_threaded(
         multi_dex,
         binaries: other_files,
         binary_resource_file: bin_res_file,
-        arsc: None
+        archive: archive_entries,
+        manifest_content,
+        android_manifest,
+        arsc: None,
     }
 }
 
@@ -129,6 +135,7 @@ pub fn extract_zip(
     let mut dex_jobs = vec![];
     let mut bin_manifest = vec![];
     let mut bin_res_file = vec![];
+    let mut archive_entries = vec![];
 
     let mut archive = if let Ok(archive) = ZipArchive::new(f.get_cursor()) {
         archive
@@ -137,7 +144,10 @@ pub fn extract_zip(
             multi_dex,
             binaries: other_files,
             binary_resource_file: vec![],
-            arsc: None
+            archive: vec![],
+            manifest_content: String::new(),
+            android_manifest: AndroidManifest::default(),
+            arsc: None,
         };
     };
 
@@ -147,6 +157,16 @@ pub fn extract_zip(
 
         std::io::copy(&mut file, &mut zip_bytes).expect("oops");
         let ptr = zip_bytes.as_slice();
+        archive_entries.push(ArchiveEntry::new(
+            file.name().to_string(),
+            zip_bytes.clone(),
+            if file.compression() == zip::CompressionMethod::Stored {
+                0
+            } else {
+                8
+            },
+            file.is_dir(),
+        ));
         let file_name = format!("{}/{}", archive_name, file.name());
         if file.name().contains("AndroidManifest.xml") {
             log::info!("Found AndroidManifest.xml in {}", archive_name);
@@ -159,6 +179,10 @@ pub fn extract_zip(
         } else if file.name().contains("resources.arsc") {
             log::info!("Found resources.arsc in {}", archive_name);
             bin_res_file = zip_bytes;
+            other_files.insert(
+                file.name().to_string(),
+                Arc::new(BinaryObject::new(bin_res_file.clone())),
+            );
             continue;
         }
 
@@ -197,31 +221,12 @@ pub fn extract_zip(
             dex_files.push(dex_file);
         }
     }
+    let (manifest_content, android_manifest) = decode_manifest(&bin_manifest, &bin_res_file);
     if !dex_files.is_empty() {
-        let mut visitor = ModelVisitor::default();
-        Executor::arsc(STR_ARSC, &mut visitor).unwrap();
-        if !bin_res_file.is_empty() {
-            Executor::arsc(&bin_res_file, &mut visitor).unwrap();
-        }
-        let mut visitor = XmlVisitor::new(visitor.get_resources());
-        let _ = Executor::xml(Cursor::new(&bin_manifest), &mut visitor);
-        let (manifest_content, android_manifest) = {
-            let content = visitor.into_string().unwrap_or_else(|_| "".to_string());
-            (
-                content.clone(),
-                serde_xml_rs::from_str(&content)
-                    .or_else::<AndroidManifest, _>(|err| {
-                        log::warn!("{:?}", err);
-                        Ok(AndroidManifest::default())
-                    })
-                    .unwrap(),
-            )
-        };
-
         let secondary = dex_files.split_off(1);
         multi_dex.push(MultiDexFile::new(
-            android_manifest,
-            manifest_content,
+            android_manifest.clone(),
+            manifest_content.clone(),
             dex_files.remove(0),
             secondary,
         ));
@@ -231,7 +236,10 @@ pub fn extract_zip(
         multi_dex,
         binaries: other_files,
         binary_resource_file: bin_res_file,
-        arsc: None
+        archive: archive_entries,
+        manifest_content,
+        android_manifest,
+        arsc: None,
     }
 }
 
@@ -289,4 +297,25 @@ pub fn check_for_zip_signature<T: Read>(mut ptr: T) -> bool {
             a == b'P' && b == b'K'
         }
     }
+}
+
+fn decode_manifest(binary_manifest: &[u8], binary_resources: &[u8]) -> (String, AndroidManifest) {
+    if binary_manifest.is_empty() {
+        return (String::new(), AndroidManifest::default());
+    }
+    let mut visitor = ModelVisitor::default();
+    if Executor::arsc(STR_ARSC, &mut visitor).is_err() {
+        return (String::new(), AndroidManifest::default());
+    }
+    if !binary_resources.is_empty() {
+        let _ = Executor::arsc(binary_resources, &mut visitor);
+    }
+    let mut visitor = XmlVisitor::new(visitor.get_resources());
+    let _ = Executor::xml(Cursor::new(binary_manifest), &mut visitor);
+    let content = visitor.into_string().unwrap_or_default();
+    let manifest = serde_xml_rs::from_str(&content).unwrap_or_else(|err| {
+        log::warn!("Could not parse decoded manifest: {:?}", err);
+        AndroidManifest::default()
+    });
+    (content, manifest)
 }

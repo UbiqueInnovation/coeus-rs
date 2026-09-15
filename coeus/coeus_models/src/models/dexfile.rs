@@ -17,6 +17,10 @@ use super::{Class, DexHeader, Field, Method, MethodData, Proto, StringEntry};
 pub struct DexFile {
     #[serde(skip_serializing)]
     pub identifier: String,
+    /// Original DEX bytes.  The parsed tables are an analysis view; keeping
+    /// these bytes lets the encoder preserve sections it does not model yet.
+    #[serde(skip_serializing, skip_deserializing)]
+    pub raw_data: Vec<u8>,
     pub file_name: String,
     pub header: DexHeader,
     #[serde(skip_serializing)]
@@ -42,6 +46,10 @@ impl PartialEq for DexFile {
 }
 
 impl DexFile {
+    pub fn raw_data(&self) -> &[u8] {
+        &self.raw_data
+    }
+
     pub fn get_identifier(&self) -> &str {
         &self.identifier
     }
@@ -74,6 +82,30 @@ impl DexFile {
             .get(string_idx.into())
             .map(|se| se.to_str().ok())
             .flatten()
+    }
+
+    pub fn find_string_index(&self, value: &str) -> Option<u32> {
+        self.strings
+            .iter()
+            .position(|entry| entry.to_str().ok() == Some(value))
+            .map(|index| index as u32)
+    }
+
+    pub fn find_method_index(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        proto_type: &str,
+    ) -> Option<u32> {
+        self.methods.iter().position(|method| {
+            self.get_type_name(method.class_idx as usize) == Some(class_name)
+                && method.method_name == method_name
+                && self
+                    .protos
+                    .get(method.proto_idx as usize)
+                    .map(|proto| proto.to_string(self) == proto_type)
+                    .unwrap_or(false)
+        }).map(|index| index as u32)
     }
 
     pub fn get_dex_name(&self) -> &str {

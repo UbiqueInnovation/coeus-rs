@@ -1487,6 +1487,8 @@ impl From<InstructionSize> for usize {
 
 //we ignore try handlers for know
 pub struct CodeItem {
+    /// Absolute offset of this code_item in the containing DEX file.
+    pub code_off: u32,
     pub register_size: u16,
     pub ins_size: u16,
     pub outs_size: u16,
@@ -1620,6 +1622,7 @@ impl Decode for CodeItem {
             i += 1 + bytes as u32;
         }
         CodeItem {
+            code_off: 0,
             register_size,
             ins_size,
             outs_size,

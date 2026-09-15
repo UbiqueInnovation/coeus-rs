@@ -27,11 +27,56 @@ Coeus offers the following features:
 - Extract APKs and other zip-like archives
 - Parse all Dex files found
 - Parse all Native-Object-Files (thanks to [goblin](https://docs.rs/goblin/0.5.1/goblin/))
+- Round-trip APK contents, including binary XML/resources, DEX files, and added native libraries
+- Edit manifest XML, add intent filters/resources, and create a network-security config trusting user CAs
+- Patch DEX instructions or inject `System.loadLibrary(...)` calls
 - Provide methods to search for objects within the dex-file
 - Provide a Dex-Emulator for simple Code execution
 - Build a Graph of an Application and provide Callgraphs and such (thanks to [petgraph](https://docs.rs/petgraph/latest/petgraph/))
 - Provide Information-Flow-Analysis for static function evaluation
 - Minimal implementation of the JDWP protocol to allow "smali"-debugging
+
+## Editing and repackaging APKs
+
+The Python interface keeps the original APK entries available and writes an
+unsigned edited APK. It can modify the manifest as text, add or replace files
+(including `lib/<abi>/*.so`), patch DEX code, and repackage the result:
+
+```python
+from pathlib import Path
+from coeus_python import AnalyzeObject, DexInstruction
+
+apk = AnalyzeObject("input.apk", False, -1)
+apk.set_debuggable(True)
+apk.allow_plaintext_and_user_certificates()
+apk.add_file("lib/arm64-v8a/libfrida-gadget.so",
+             Path("libfrida-gadget.so").read_bytes())
+
+# Prefer analysis objects when selecting code to edit. Evidence can be
+# downcast to a Method, and the concrete instruction objects retain offsets
+# and widths for safe same-size replacements.
+method = apk.find_methods("load|onCreate")[0].as_method()
+instructions = method.get_instructions()
+apk.replace_instruction(method, instructions[0], DexInstruction.nop())
+method.inject_load_library(apk, "frida-gadget", register)
+# Or select the overload directly from a Class object:
+# clazz.inject_load_library(apk, "onCreate", "frida-gadget", register,
+#                           "(Landroid/os/Bundle;)V")
+apk.write_apk("edited-unsigned.apk")
+```
+
+`allow_plaintext_and_user_certificates()` creates
+`res/xml/coeus_network_security_config.xml` and its `resources.arsc` entry if
+the input APK does not have one, then wires the typed reference into the
+application manifest. `set_manifest_xml()` supports complete textual edits,
+including intent filters and other manifest elements; `set_xml_resource()` is
+available for existing binary-XML resources.
+
+The output has invalidated `META-INF` signature files removed. Run
+`zipalign` and sign it with a test key before installing it; Android will not
+install an unsigned APK. DEX insertion currently requires a method without
+try/catch handlers or packed/sparse-switch/fill-array payloads, and native
+code recompilation is not included—native libraries can be added or replaced.
 
 ## Contributions
 

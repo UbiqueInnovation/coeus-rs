@@ -152,6 +152,8 @@ class Dex:
 class DexString:
     def content(self) -> str:
         """Return the content of this String"""
+    def get_index(self) -> int:
+        """Return the string-id used by DEX instructions"""
 
 class NativeSymbol:
     def symbol(self) -> str:
@@ -220,6 +222,45 @@ class Instruction:
     def get_function_name(self) -> str:
         """Return the name of the executing function, or throw a `RuntimeException` if this instruction is not a function call"""
 
+class DexInstruction:
+    """A concrete decoded DEX instruction used by the editing API."""
+    def get_offset(self) -> int:
+        """Return the instruction offset in 16-bit code units."""
+    def get_size(self) -> int:
+        """Return the instruction width in 16-bit code units."""
+    def mnemonic(self) -> str:
+        """Return the DEX mnemonic."""
+    def to_code_units(self) -> list[int]:
+        """Encode this object when a low-level representation is needed."""
+    @staticmethod
+    def nop() -> DexInstruction: ...
+    @staticmethod
+    def return_void() -> DexInstruction: ...
+    @staticmethod
+    def return_value(register: int) -> DexInstruction: ...
+    @staticmethod
+    def throw(register: int) -> DexInstruction: ...
+    @staticmethod
+    def const_string(register: int, string_index: int) -> DexInstruction: ...
+    @staticmethod
+    def const_string_from_string(register: int, string: DexString) -> DexInstruction: ...
+    @staticmethod
+    def const_string_jumbo(register: int, string_index: int) -> DexInstruction: ...
+    @staticmethod
+    def const_lit32(register: int, value: int) -> DexInstruction: ...
+    @staticmethod
+    def move_from16(register: int, source_register: int) -> DexInstruction: ...
+    @staticmethod
+    def move_object_from16(register: int, source_register: int) -> DexInstruction: ...
+    @staticmethod
+    def new_instance(register: int, type_index: int) -> DexInstruction: ...
+    @staticmethod
+    def check_cast(register: int, type_index: int) -> DexInstruction: ...
+    @staticmethod
+    def invoke_static_range(
+        register_count: int, method_index: int, first_register: int
+    ) -> DexInstruction: ...
+
 class Graph:
     def to_dot(self) -> str:
         """Get dotfile of the graph"""
@@ -242,6 +283,20 @@ class Method:
         """Return a best effort disassembly of this method."""
     def get_class(self) -> Class:
         """Get the class this method is defined on."""
+    def get_method_idx(self) -> int:
+        """Return the method-id used by the DEX encoder."""
+    def get_dex_name(self) -> str:
+        """Return the archive-facing DEX name."""
+    def get_instructions(self) -> list[DexInstruction]:
+        """Return concrete decoded instructions for object-based editing."""
+    def replace_instruction(
+        self, ao: AnalyzeObject, instruction: DexInstruction, replacement: DexInstruction
+    ):
+        """Replace an instruction object with a same-width instruction object."""
+    def prepend_instructions(self, ao: AnalyzeObject, instructions: list[DexInstruction]):
+        """Prepend decoded instruction objects to this method."""
+    def inject_load_library(self, ao: AnalyzeObject, library_name: str, register: int):
+        """Insert System.loadLibrary into this method."""
     def __call__(self, *args: Any, **kwds: Any) -> VmResult:
         """Prepare a virtual machine and run the function, returning the result the function returned."""
     def cross_references(self, ao: AnalyzeObject) -> list[Evidence]:
@@ -277,6 +332,34 @@ class Class:
         """Get a method of this class by name"""
     def get_method_by_proto_type(self, name: str, signature: str) -> Method:
         """Get a method of this class by name, input arguments and return value"""
+    def get_dex_name(self) -> str:
+        """Return the archive-facing DEX name."""
+    def inject_load_library(
+        self,
+        ao: AnalyzeObject,
+        method_name: str,
+        library_name: str,
+        register: int,
+        proto_type: Optional[str] = None,
+    ):
+        """Select a method on this class and insert System.loadLibrary."""
+    def replace_instruction(
+        self,
+        ao: AnalyzeObject,
+        method_name: str,
+        instruction: DexInstruction,
+        replacement: DexInstruction,
+        proto_type: Optional[str] = None,
+    ):
+        """Select a method on this class and replace a decoded instruction."""
+    def prepend_instructions(
+        self,
+        ao: AnalyzeObject,
+        method_name: str,
+        instructions: list[DexInstruction],
+        proto_type: Optional[str] = None,
+    ):
+        """Select a method on this class and prepend decoded instructions."""
     def __getitem__(self, name: str) -> Method:
         """Get a method of this class by name"""
     def get_field(self, name: str) -> DexField:
@@ -397,6 +480,59 @@ class AnalyzeObject:
         """Get the primary dex files"""
     def get_file(self, name: str) -> bytes:
         """Get file bytes"""
+    def get_raw_file(self, name: str) -> bytes:
+        """Get an APK entry without XML decoding"""
+    def set_manifest_attribute(self, element: str, attribute: str, value: str):
+        """Edit a typed attribute in AndroidManifest.xml"""
+    def set_debuggable(self, enabled: bool):
+        """Set application debuggable in AndroidManifest.xml"""
+    def get_manifest_xml(self) -> str:
+        """Return the editable textual AndroidManifest.xml"""
+    def set_manifest_xml(self, xml: str):
+        """Replace AndroidManifest.xml from textual XML"""
+    def set_xml_resource(self, path: str, xml: str):
+        """Replace an Android binary-XML resource from textual XML"""
+    def allow_plaintext_and_user_certificates(self):
+        """Add a bundled network-security-config and trust system/user CAs"""
+    def set_file(self, name: str, data: bytes):
+        """Add or replace an APK entry"""
+    def add_file(self, name: str, data: bytes):
+        """Add a new APK entry"""
+    def remove_file(self, name: str):
+        """Remove a non-DEX APK entry"""
+    def write_apk(self, output: str):
+        """Write the edited APK and remove invalidated signature entries"""
+    def replace_instruction(
+        self, method: Method, instruction: DexInstruction, replacement: DexInstruction
+    ):
+        """Replace a selected decoded instruction object."""
+    def replace_method_instruction_object(
+        self, method: Method, instruction: DexInstruction, replacement: DexInstruction
+    ):
+        """Object-based alias for replace_instruction."""
+    def prepend_instructions(self, method: Method, instructions: list[DexInstruction]):
+        """Prepend decoded instruction objects to a method."""
+    def prepend_method_instructions(self, method: Method, instructions: list[DexInstruction]):
+        """Object-based alias for prepend_instructions."""
+    def inject_load_library_for_method(self, method: Method, library_name: str, register: int):
+        """Insert System.loadLibrary into an analyzed method object."""
+    def inject_load_library_for_class(
+        self,
+        class_: Class,
+        method_name: str,
+        library_name: str,
+        register: int,
+        proto_type: Optional[str] = None,
+    ):
+        """Select a class method and insert System.loadLibrary."""
+    def replace_method_instruction(
+        self, dex_name: str, method_idx: int, instruction_index: int, code_units: list[int]
+    ):
+        """Replace an instruction with same-width DEX code units"""
+    def prepend_method_code(self, dex_name: str, method_idx: int, prefix_code_units: list[int]):
+        """Prepend encoded DEX code units to a method"""
+    def inject_load_library(self, dex_name: str, method_idx: int, library_name: str, register: int):
+        """Insert const-string/invoke-static for System.loadLibrary"""
     def get_resource_string(self, id: int) -> tuple[str, dict[str, str]]:
         """Lookup the string table"""
     def get_resource_mipmap_file_name(self, id: int) -> tuple[str, dict[str, str]]:

@@ -25,6 +25,42 @@ This object provides functions to load and parse an APK, as well as search throu
 
 See the [examples](../examples) directory for a code example.
 
+## APK editing and repackaging
+
+`AnalyzeObject` preserves APK entries and exposes a small editing API. The
+writer produces an unsigned APK, so align and sign it before installation:
+
+```python
+from pathlib import Path
+from coeus_python import AnalyzeObject, DexInstruction
+
+apk = AnalyzeObject("input.apk", False, -1)
+apk.set_debuggable(True)
+apk.allow_plaintext_and_user_certificates()
+apk.add_file("lib/arm64-v8a/libfrida-gadget.so",
+             Path("libfrida-gadget.so").read_bytes())
+# Prefer analysis objects when selecting code to edit. Evidence can be
+# downcast to a Method, and concrete instruction objects retain offsets and
+# widths for safe same-size replacements.
+method = apk.find_methods("load|onCreate")[0].as_method()
+instructions = method.get_instructions()
+apk.replace_instruction(method, instructions[0], DexInstruction.nop())
+method.inject_load_library(apk, "frida-gadget", register)
+# Or select the overload directly from a Class object:
+# clazz.inject_load_library(apk, "onCreate", "frida-gadget", register,
+#                           "(Landroid/os/Bundle;)V")
+apk.write_apk("edited-unsigned.apk")
+```
+
+`set_manifest_xml()` replaces the manifest from text, so intent filters and
+other elements can be edited directly. `set_xml_resource()` does the same for
+existing binary-XML resources. The network shortcut bundles a minimal
+network-security XML resource, creates the missing `resources.arsc` entry when
+necessary, enables cleartext traffic, and trusts both the system and user CA
+stores. DEX injection emits `const-string` followed by
+`System.loadLibrary(String)`; choose an available local register. Methods
+with try/catch or switch/array payloads are rejected for safe insertion.
+
 ## Native Support
 
 Currently, most of the analysis is done on the dex part of the APK (aka. Java).

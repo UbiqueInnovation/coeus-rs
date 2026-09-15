@@ -19,8 +19,8 @@ use coeus::{
     },
     coeus_emulation::vm::{runtime::StringClass, Register, Value, VM},
     coeus_models::models::{
-        self, AccessFlags, BinaryObject, DexFile, EncodedItem, InstructionOffset, InstructionSize,
-        TestFunction,
+        self, AccessFlags, BinaryObject, DexFile, EncodedItem, Instruction as DexInstructionModel,
+        InstructionOffset, InstructionSize, TestFunction,
     },
     coeus_parse::dex::graph::{callgraph::callgraph_for_method, Subgraph, Supergraph},
 };
@@ -490,6 +490,173 @@ impl Instruction {
         }
     }
 }
+
+/// A decoded DEX instruction that can be passed back to the editing API.
+///
+/// `Instruction` above is the higher-level result produced by the data-flow
+/// analyser.  This type deliberately represents the parser's concrete DEX
+/// instruction instead, so callers can inspect a method, choose one of its
+/// instruction objects, and use it as a same-width replacement without
+/// having to hand-encode code units.
+#[pyclass]
+#[derive(Clone)]
+pub struct DexInstruction {
+    pub(crate) instruction: DexInstructionModel,
+    pub(crate) offset: u32,
+    pub(crate) size: u32,
+    pub(crate) file: Option<Arc<DexFile>>,
+}
+
+impl DexInstruction {
+    fn from_instruction(
+        instruction: DexInstructionModel,
+        offset: u32,
+        size: u32,
+        file: Option<Arc<DexFile>>,
+    ) -> Self {
+        Self {
+            instruction,
+            offset,
+            size,
+            file,
+        }
+    }
+
+    fn from_factory(instruction: DexInstructionModel) -> PyResult<Self> {
+        let size = instruction
+            .to_code_units()
+            .map_err(PyRuntimeError::new_err)?
+            .len() as u32;
+        Ok(Self::from_instruction(instruction, 0, size, None))
+    }
+}
+
+#[pymethods]
+impl DexInstruction {
+    pub fn __str__(&self) -> String {
+        if let Some(file) = &self.file {
+            self.instruction.disassembly_from_opcode(
+                self.offset as i32,
+                &mut HashMap::new(),
+                file.clone(),
+            )
+        } else {
+            format!("{:?}", self.instruction)
+        }
+    }
+
+    pub fn __repr__(&self) -> String {
+        self.__str__()
+    }
+
+    pub fn get_offset(&self) -> u32 {
+        self.offset
+    }
+
+    pub fn get_size(&self) -> u32 {
+        self.size
+    }
+
+    pub fn mnemonic(&self) -> String {
+        self.instruction.mnemonic_from_opcode().to_string()
+    }
+
+    /// Encode this instruction when a caller needs to inspect or serialize it.
+    /// Editing methods accept this object directly and do not require callers
+    /// to use this low-level representation.
+    pub fn to_code_units(&self) -> PyResult<Vec<u16>> {
+        self.instruction
+            .to_code_units()
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    #[staticmethod]
+    pub fn nop() -> Self {
+        Self::from_instruction(DexInstructionModel::Nop, 0, 1, None)
+    }
+
+    #[staticmethod]
+    pub fn return_void() -> Self {
+        Self::from_instruction(DexInstructionModel::ReturnVoid, 0, 1, None)
+    }
+
+    #[staticmethod]
+    pub fn return_value(register: u8) -> Self {
+        Self::from_instruction(DexInstructionModel::Return(register), 0, 1, None)
+    }
+
+    #[staticmethod]
+    pub fn throw(register: u8) -> Self {
+        Self::from_instruction(DexInstructionModel::Throw(register), 0, 1, None)
+    }
+
+    #[staticmethod]
+    pub fn const_string(register: u8, string_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::ConstString(register, string_index))
+    }
+
+    #[staticmethod]
+    pub fn const_string_from_string(register: u8, string: &DexString) -> PyResult<Self> {
+        let string_index = string.get_index()?;
+        let string_index = u16::try_from(string_index)
+            .map_err(|_| PyRuntimeError::new_err("string index requires const-string/jumbo"))?;
+        Self::const_string(register, string_index)
+    }
+
+    #[staticmethod]
+    pub fn const_string_jumbo(register: u8, string_index: u32) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::ConstStringJumbo(
+            register,
+            string_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn const_lit32(register: u8, value: i32) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::ConstLit32(register, value))
+    }
+
+    #[staticmethod]
+    pub fn move_from16(register: u8, source_register: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::MoveFrom16(
+            register,
+            source_register,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn move_object_from16(register: u8, source_register: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::MoveObjectFrom16(
+            register,
+            source_register,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn new_instance(register: u8, type_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::NewInstance(register, type_index))
+    }
+
+    #[staticmethod]
+    pub fn check_cast(register: u8, type_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::CheckCast(register, type_index))
+    }
+
+    /// Construct the range form of an invoke-static instruction.
+    #[staticmethod]
+    pub fn invoke_static_range(
+        register_count: u8,
+        method_index: u16,
+        first_register: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InvokeStaticRange(
+            register_count,
+            method_index,
+            first_register,
+        ))
+    }
+}
+
 #[pyclass]
 #[derive(Clone)]
 pub struct InstructionValue {
@@ -1110,6 +1277,13 @@ impl DexString {
     pub fn content(&self) -> String {
         self.string.clone()
     }
+
+    pub fn get_index(&self) -> PyResult<u32> {
+        match &self._place {
+            analysis::Location::DexString(index, _) => Ok(*index),
+            _ => Err(PyRuntimeError::new_err("string has no DEX index")),
+        }
+    }
 }
 
 #[pymethods]
@@ -1229,6 +1403,69 @@ const {function_name} = {class_without_pkg}.{function_name}.overload({arguments}
         let proto = &self.file.protos[self.method.proto_idx as usize];
         proto.get_return_type(&self.file)
     }
+
+    /// Return the stable DEX method-id used by the encoder.
+    pub fn get_method_idx(&self) -> u32 {
+        self.method.method_idx as u32
+    }
+
+    /// Return the archive-facing DEX name, e.g. `classes.dex`.
+    pub fn get_dex_name(&self) -> String {
+        self.file.get_dex_name().to_string()
+    }
+
+    /// Return concrete decoded instructions suitable for object-based edits.
+    pub fn get_instructions(&self) -> Vec<DexInstruction> {
+        let Some(code) = self.method_data.as_ref().and_then(|data| data.code.as_ref()) else {
+            return vec![];
+        };
+        code.insns
+            .iter()
+            .map(|(size, offset, instruction)| {
+                let size_in_code_units = instruction
+                    .to_code_units()
+                    .map(|units| units.len() as u32)
+                    .unwrap_or(size.0 / 2);
+                DexInstruction::from_instruction(
+                    instruction.clone(),
+                    offset.0,
+                    size_in_code_units,
+                    Some(self.file.clone()),
+                )
+            })
+            .collect()
+    }
+
+    /// Replace an instruction selected from `get_instructions()` with another
+    /// instruction object of the same width.
+    pub fn replace_instruction(
+        &self,
+        ao: &mut AnalyzeObject,
+        instruction: &DexInstruction,
+        replacement: &DexInstruction,
+    ) -> PyResult<()> {
+        ao.replace_instruction(self, instruction, replacement)
+    }
+
+    /// Insert decoded instruction objects at method entry.
+    pub fn prepend_instructions(
+        &self,
+        ao: &mut AnalyzeObject,
+        instructions: Vec<DexInstruction>,
+    ) -> PyResult<()> {
+        ao.prepend_instructions(self, instructions)
+    }
+
+    /// Insert the common `System.loadLibrary(name)` loader at method entry.
+    pub fn inject_load_library(
+        &self,
+        ao: &mut AnalyzeObject,
+        library_name: &str,
+        register: u8,
+    ) -> PyResult<()> {
+        ao.inject_load_library_for_method(self, library_name, register)
+    }
+
     #[staticmethod]
     pub fn find_all_branch_decisions_array(
         methods: Bound<PyList>,
@@ -1784,6 +2021,62 @@ impl Class {
             .ok_or_else(|| PyRuntimeError::new_err("method not found"))
     }
 
+    pub fn get_dex_name(&self) -> String {
+        self.file.get_dex_name().to_string()
+    }
+
+    /// Select a method on this class and inject the common
+    /// `System.loadLibrary(name)` loader into it.
+    #[pyo3(signature = (ao, method_name, library_name, register, proto_type=None))]
+    pub fn inject_load_library(
+        &self,
+        ao: &mut AnalyzeObject,
+        method_name: &str,
+        library_name: &str,
+        register: u8,
+        proto_type: Option<&str>,
+    ) -> PyResult<()> {
+        let method = if let Some(proto_type) = proto_type {
+            self.get_method_by_proto_type(method_name, proto_type)?
+        } else {
+            self.get_method(method_name)?
+        };
+        ao.inject_load_library_for_method(&method, library_name, register)
+    }
+
+    #[pyo3(signature = (ao, method_name, instruction, replacement, proto_type=None))]
+    pub fn replace_instruction(
+        &self,
+        ao: &mut AnalyzeObject,
+        method_name: &str,
+        instruction: &DexInstruction,
+        replacement: &DexInstruction,
+        proto_type: Option<&str>,
+    ) -> PyResult<()> {
+        let method = if let Some(proto_type) = proto_type {
+            self.get_method_by_proto_type(method_name, proto_type)?
+        } else {
+            self.get_method(method_name)?
+        };
+        ao.replace_instruction(&method, instruction, replacement)
+    }
+
+    #[pyo3(signature = (ao, method_name, instructions, proto_type=None))]
+    pub fn prepend_instructions(
+        &self,
+        ao: &mut AnalyzeObject,
+        method_name: &str,
+        instructions: Vec<DexInstruction>,
+        proto_type: Option<&str>,
+    ) -> PyResult<()> {
+        let method = if let Some(proto_type) = proto_type {
+            self.get_method_by_proto_type(method_name, proto_type)?
+        } else {
+            self.get_method(method_name)?
+        };
+        ao.prepend_instructions(&method, instructions)
+    }
+
     pub fn get_field(&self, name: &str) -> PyResult<DexField> {
         let class_data = if let Some(c_d) = self.class.class_data.as_ref() {
             c_d
@@ -1941,9 +2234,12 @@ impl Class {
 
 pub(crate) fn register(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<Evidence>()?;
+    m.add_class::<Graph>()?;
     m.add_class::<Method>()?;
     m.add_class::<Class>()?;
     m.add_class::<Instruction>()?;
+    m.add_class::<DexInstruction>()?;
+    m.add_class::<InstructionValue>()?;
     m.add_class::<Branching>()?;
     m.add_class::<NativeSymbol>()?;
     m.add_class::<FieldAccess>()?;
@@ -1954,5 +2250,7 @@ pub(crate) fn register(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<AnnotationElement>()?;
     m.add_class::<AnnotationMethod>()?;
     m.add_class::<AnnotationField>()?;
+    m.add_class::<DexString>()?;
+    m.add_class::<DexField>()?;
     Ok(())
 }

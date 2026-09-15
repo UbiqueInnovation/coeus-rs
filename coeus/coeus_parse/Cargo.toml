@@ -16,7 +16,9 @@ rayon = "1.5"
 goblin = "0.9"
 bitflags = "2.6"
 abxml = {version = "0.8.2", default-features = false}
+arsc = "0.1.5"
 serde-xml-rs = "0.6"
+xml-rs = "0.8"
 serde = {version = "1.0.123", features = ["derive"]}
 log = "0.4"
 regex = "1.4"
