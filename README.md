@@ -48,6 +48,7 @@ from coeus_python import AnalyzeObject, DexInstruction
 
 apk = AnalyzeObject("input.apk", False, -1)
 apk.set_debuggable(True)
+apk.set_package_name("com.example.modified")
 apk.allow_plaintext_and_user_certificates()
 apk.add_file("lib/arm64-v8a/libfrida-gadget.so",
              Path("libfrida-gadget.so").read_bytes())
@@ -72,11 +73,72 @@ application manifest. `set_manifest_xml()` supports complete textual edits,
 including intent filters and other manifest elements; `set_xml_resource()` is
 available for existing binary-XML resources.
 
-The output has invalidated `META-INF` signature files removed. Run
-`zipalign` and sign it with a test key before installing it; Android will not
-install an unsigned APK. DEX insertion currently requires a method without
+The output has invalidated `META-INF` signature files removed and is ZIP
+aligned, including stored entries, `resources.arsc`, and page-aligned native
+libraries. Sign it with a test key before installing it; Android will not
+install an unsigned APK. Changing the package name changes the Android install
+identity, but does not rename DEX class descriptors or package-qualified
+component names. DEX insertion currently requires a method without
 try/catch handlers or packed/sparse-switch/fill-array payloads, and native
 code recompilation is not included—native libraries can be added or replaced.
+
+## Split APKs and interactive sessions
+
+`SplitApkSet` keeps every APK from a split install as a live
+`AnalyzeObject`, while providing set-wide write, sign, verify, install, and
+launch operations. `from_adb()` pulls the base APK and all paths reported by
+`pm path`; `get_base_apk()` selects the base member even if the input order is
+different:
+
+```python
+from coeus_python import SplitApkSet
+
+state = SplitApkSet.from_adb("com.example.app", serial="DEVICE")
+base = state.get_base_apk()
+base.set_debuggable(True)
+base.allow_plaintext_and_user_certificates()
+state.save_state("debuggable.coeus")
+
+state.sign_all("signed", "debug.keystore", "androiddebugkey", "android")
+state.verify_all("signed")
+state.install_all("signed", serial="DEVICE")
+state.launch("com.example.app", serial="DEVICE")
+```
+
+The state archive stores the current editable, unsigned APK members under
+`apks/` and a `state.json` high-level action history. Loading a checkpoint is
+the supported way to go back to an earlier state; the history is an audit log,
+not an automatic inverse for arbitrary DEX edits.
+
+For a line-oriented workflow, run the repository-provided shell:
+
+```text
+python coeus-python/coeus_shell.py
+coeus> pull com.example.app DEVICE
+coeus> use 0
+coeus> debuggable on
+coeus> plaintext
+coeus> save work.coeus
+coeus> sign signed debug.keystore androiddebugkey
+coeus> install signed DEVICE
+coeus> launch com.example.app DEVICE
+```
+
+The shell's `python` command opens a normal Python console with every public
+`coeus_python` object preloaded, plus `state`, `apk`, and `shell`; no import
+statement is needed for method/class-based DEX analysis and instruction-object
+editing. Tab completes shell commands and path arguments; the embedded Python
+console also enables identifier and attribute completion when readline is
+available.
+
+Installed packages can be filtered before pulling one:
+
+```text
+coeus> list heidi DEVICE
+```
+
+The expression is matched against the complete package name; omit it to list
+everything reported by `pm list packages`.
 
 ## Contributions
 

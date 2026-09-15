@@ -108,8 +108,6 @@ pub enum Instruction {
     ArrayPutShort(u8, u8, u8),
 
     CmplFloat(u8, u8, u8),
-    CmpFloat(u8, u8, u8),
-    CmpDouble(u8, u8, u8),
     CmpgFloat(u8, u8, u8),
     CmplDouble(u8, u8, u8),
     CmpgDouble(u8, u8, u8),
@@ -144,7 +142,8 @@ pub enum Instruction {
     Const,
     ConstLit16(u8, i16),
     ConstLit32(u8, i32),
-    ConstWide,
+    ConstHigh16(u8, i16),
+    ConstWide(u8, i64),
     ConstWideLit16(u8, i16),
     ConstWideLit32(u8, i32),
     ConstWideHigh16(u8, i16),
@@ -479,6 +478,17 @@ impl Instruction {
             }
             ConstLit16(dst, value) => fmt22s(0x13, *dst, 0, *value),
             ConstLit32(dst, value) => fmt31(0x14, *dst, *value),
+            ConstHigh16(dst, value) => vec![u16::from_le_bytes([0x15, *dst]), *value as u16],
+            ConstWide(dst, value) => {
+                let literal = *value as u64;
+                vec![
+                    u16::from_le_bytes([0x18, *dst]),
+                    literal as u16,
+                    (literal >> 16) as u16,
+                    (literal >> 32) as u16,
+                    (literal >> 48) as u16,
+                ]
+            }
             ConstWideLit16(dst, value) => vec![
                 u16::from_le_bytes([0x16, *dst]),
                 *value as u16,
@@ -519,8 +529,6 @@ impl Instruction {
             ],
 
             CmplFloat(dst, a, b) => fmt23(0x2d, *dst, *a, *b),
-            CmpFloat(dst, a, b) => fmt23(0x2e, *dst, *a, *b),
-            CmpDouble(dst, a, b) => fmt23(0x2f, *dst, *a, *b),
             CmpgFloat(dst, a, b) => fmt23(0x2e, *dst, *a, *b),
             CmplDouble(dst, a, b) => fmt23(0x2f, *dst, *a, *b),
             CmpgDouble(dst, a, b) => fmt23(0x30, *dst, *a, *b),
@@ -657,8 +665,8 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
                 .chain(std::iter::once(*type_idx))
                 .collect(),
             FilledNewArray(count, type_idx, regs) => fmt35(0x24, count, *type_idx, regs)?,
-            FilledNewArrayRange(count, first, type_idx) => {
-                vec![u16::from_le_bytes([0x25, *count]), *type_idx, *first]
+            FilledNewArrayRange(first, type_idx, count) => {
+                vec![u16::from_le_bytes([0x25, *first]), *type_idx, *count]
             }
             FillArrayData(array, offset) => vec![
                 u16::from_le_bytes([0x26, *array]),
@@ -803,7 +811,6 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
             }
             InvokeType(_)
             | Const
-            | ConstWide
             | NewInstanceType(_)
             | Switch(_)
             | SwitchData(_)
@@ -871,6 +878,8 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
             Instruction::Throw(..) => MNEMONICS[77],
             Instruction::ShrIntLit8(..) => MNEMONICS[80],
             Instruction::UShrIntLit8(..) => MNEMONICS[81],
+            Instruction::ConstWide(..) => "const-wide",
+            Instruction::ConstHigh16(..) => "const/high16",
             _ => MNEMONICS[0],
         }
     }
@@ -1542,6 +1551,8 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
             Instruction::ConstLit4(dst, lit) => format!("{} v{}, {:#x}", MNEMONICS[44], dst, lit),
             Instruction::ConstLit16(dst, lit) => format!("{} v{}, {:#x}", MNEMONICS[45], dst, lit),
             Instruction::ConstLit32(dst, lit) => format!("{} v{}, {:#x}", MNEMONICS[46], dst, lit),
+            Instruction::ConstHigh16(dst, lit) => format!("{} v{}, {:#x}", "const/high16", dst, (i32::from(*lit) << 16)),
+            Instruction::ConstWide(dst, lit) => format!("{} v{}, {:#x}", "const-wide", dst, lit),
             Instruction::MoveResultObject(dst) => format!("{} v{}", MNEMONICS[47], dst),
             Instruction::ArrayLength(dst, array) => {
                 format!("{} v{}, v{}", MNEMONICS[48], dst, array)
@@ -1936,43 +1947,26 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
             0x13 => Instruction::ConstLit16(high, data[0] as i16),
             0x14 => Instruction::ConstLit32(
                 high,
-                i32::from_be_bytes([
-                    ((data[0] >> 8) as u8),
-                    ((data[0] & 0xff) as u8),
-                    ((data[1] >> 8) as u8),
-                    ((data[1] & 0xff) as u8),
-                ]),
+                (data[0] as u32 | ((data[1] as u32) << 16)) as i32,
             ),
-            0x15 => Instruction::ConstLit32(high, (data[0] as i32) << 16),
+            0x15 => Instruction::ConstHigh16(high, data[0] as i16),
             0x16 => Instruction::ConstWideLit16(high, data[0] as i16),
             0x17 => Instruction::ConstWideLit32(
                 high,
-                i32::from_be_bytes([
-                    ((data[0] >> 8) as u8),
-                    ((data[0] & 0xff) as u8),
-                    ((data[1] >> 8) as u8),
-                    ((data[1] & 0xff) as u8),
-                ]),
+                (data[0] as u32 | ((data[1] as u32) << 16)) as i32,
             ),
-            0x18 => Instruction::ConstWideLit32(
+            0x18 => Instruction::ConstWide(
                 high,
-                i32::from_be_bytes([
-                    ((data[0] >> 8) as u8),
-                    ((data[0] & 0xff) as u8),
-                    ((data[1] >> 8) as u8),
-                    ((data[1] & 0xff) as u8),
-                ]),
+                (data[0] as u64
+                    | ((data[1] as u64) << 16)
+                    | ((data[2] as u64) << 32)
+                    | ((data[3] as u64) << 48)) as i64,
             ),
             0x19 => Instruction::ConstWideHigh16(high, data[0] as i16),
             0x1a => Instruction::ConstString(high, data[0]),
             0x1b => Instruction::ConstStringJumbo(
                 high,
-                u32::from_be_bytes([
-                    ((data[0] >> 8) as u8),
-                    ((data[0] & 0xff) as u8),
-                    ((data[1] >> 8) as u8),
-                    ((data[1] & 0xff) as u8),
-                ]),
+                data[0] as u32 | ((data[1] as u32) << 16),
             ),
             0x1c => Instruction::ConstClass(high, data[0]),
             0x1f => Instruction::CheckCast(high, data[0]),
@@ -2137,5 +2131,77 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
 
             _ => (2, false, 0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(op: u16, data: &[u16]) -> (Instruction, Vec<u16>) {
+        let instruction = Instruction::get_opcode(op, data);
+        let units = instruction.to_code_units().expect("encodes");
+        (instruction, units)
+    }
+
+    #[test]
+    fn const_uses_little_endian_low_word_first() {
+        let (instruction, units) = roundtrip(0x0014, &[0x68b3, 0x1234]);
+        assert_eq!(instruction, Instruction::ConstLit32(0, 0x123468b3));
+        assert_eq!(units, vec![0x0014, 0x68b3, 0x1234]);
+    }
+
+    #[test]
+    fn const_high16_roundtrips() {
+        let (instruction, units) = roundtrip(0x0015, &[0x4040]);
+        assert_eq!(instruction, Instruction::ConstHigh16(0, 0x4040));
+        assert_eq!(units, vec![0x0015, 0x4040]);
+    }
+
+    #[test]
+    fn const_wide_uses_little_endian_low_word_first() {
+        let (instruction, units) = roundtrip(0x0018, &[0x193c, 0x0506, 0x1538, 0x0102]);
+        assert_eq!(instruction, Instruction::ConstWide(0, 0x010215380506193c));
+        assert_eq!(units, vec![0x0018, 0x193c, 0x0506, 0x1538, 0x0102]);
+    }
+
+    #[test]
+    fn const_wide_lit32_uses_little_endian_low_word_first() {
+        let (instruction, units) = roundtrip(0x0017, &[0x5678, 0x1234]);
+        assert_eq!(instruction, Instruction::ConstWideLit32(0, 0x12345678));
+        assert_eq!(units, vec![0x0017, 0x5678, 0x1234]);
+    }
+
+    #[test]
+    fn const_string_jumbo_uses_little_endian_low_word_first() {
+        let (instruction, units) = roundtrip(0x001b, &[0x5678, 0x1234]);
+        assert_eq!(instruction, Instruction::ConstStringJumbo(0, 0x12345678));
+        assert_eq!(units, vec![0x001b, 0x5678, 0x1234]);
+    }
+
+    #[test]
+    fn cmp_long_roundtrips() {
+        let (instruction, units) = roundtrip(0x0031, &[0x0201]);
+        assert_eq!(instruction, Instruction::CmpLong(0, 1, 2));
+        assert_eq!(units, vec![0x0031, 0x0201]);
+    }
+
+    #[test]
+    fn array_get_23x_roundtrips() {
+        let (instruction, units) = roundtrip(0x0044, &[0x0100]);
+        assert_eq!(instruction, Instruction::ArrayGetWide(0, 0, 1));
+        assert_eq!(units, vec![0x0044, 0x0100]);
+    }
+
+    #[test]
+    fn const_high16_has_correct_mnemonic() {
+        let instruction = Instruction::ConstHigh16(0, 0x4040);
+        assert_eq!(instruction.mnemonic_from_opcode(), "const/high16");
+    }
+
+    #[test]
+    fn const_wide_has_correct_mnemonic() {
+        let instruction = Instruction::ConstWide(0, 42);
+        assert_eq!(instruction.mnemonic_from_opcode(), "const-wide");
     }
 }

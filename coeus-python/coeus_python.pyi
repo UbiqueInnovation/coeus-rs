@@ -417,6 +417,75 @@ class AnnotationField:
     def get_elements(self) -> list[AnnotationElement]:
         """Get all annotation elements"""
 
+class SplitApkSet:
+    def __init__(
+        self, paths: list[str], build_graph: bool = False, max_depth: int = -1
+    ):
+        """Load a base APK and its split APKs as one editable set."""
+    @staticmethod
+    def from_adb(
+        package_name: str,
+        serial: Optional[str] = None,
+        adb_path: Optional[str] = None,
+        build_graph: bool = False,
+        max_depth: int = -1,
+    ) -> SplitApkSet:
+        """Pull every installed APK for a package using adb."""
+    @staticmethod
+    def list_packages(
+        package_regex: Optional[str] = None,
+        serial: Optional[str] = None,
+        adb_path: Optional[str] = None,
+    ) -> list[str]:
+        """List installed package names, optionally filtered by regex."""
+    @staticmethod
+    def load_state(
+        path: str, build_graph: bool = False, max_depth: int = -1
+    ) -> SplitApkSet:
+        """Load an editable state archive produced by save_state."""
+    def __len__(self) -> int: ...
+    def __getitem__(self, index: int) -> AnalyzeObject: ...
+    def get_apks(self) -> list[AnalyzeObject]:
+        """Return the live AnalyzeObject for each APK member."""
+    def get_names(self) -> list[str]:
+        """Return member names such as base.apk and split_config.en.apk."""
+    def get_base_apk(self) -> AnalyzeObject:
+        """Return the base APK object, independent of member ordering."""
+    def get_history(self) -> list[str]:
+        """Return the container and member edit history."""
+    def write_all(self, output_dir: str) -> list[str]:
+        """Repack every member into output_dir."""
+    def sign_all(
+        self,
+        output_dir: str,
+        keystore: str,
+        alias: str,
+        store_password: str,
+        key_password: Optional[str] = None,
+        apksigner: Optional[str] = None,
+    ) -> list[str]:
+        """Repack and sign every member with Android SDK apksigner."""
+    def verify_all(self, output_dir: str, apksigner: Optional[str] = None) -> list[str]:
+        """Verify every member with Android SDK apksigner."""
+    def install_all(
+        self,
+        output_dir: str,
+        serial: Optional[str] = None,
+        adb_path: Optional[str] = None,
+        replace_existing: bool = True,
+        allow_downgrade: bool = False,
+    ) -> str:
+        """Install all repacked members with adb install-multiple."""
+    def launch(
+        self,
+        package_name: str,
+        serial: Optional[str] = None,
+        adb_path: Optional[str] = None,
+    ) -> str:
+        """Launch the installed package with adb."""
+    def save_state(self, path: str):
+        """Save unsigned current APK members and edit history to a .coeus archive."""
+
 class AnalyzeObject:
     # atest#
     def __init__(self, file_name: str, build_graph: bool, max_nesting: int):
@@ -486,6 +555,8 @@ class AnalyzeObject:
         """Edit a typed attribute in AndroidManifest.xml"""
     def set_debuggable(self, enabled: bool):
         """Set application debuggable in AndroidManifest.xml"""
+    def set_package_name(self, package_name: str):
+        """Change the manifest package/install identity without renaming DEX descriptors"""
     def get_manifest_xml(self) -> str:
         """Return the editable textual AndroidManifest.xml"""
     def set_manifest_xml(self, xml: str):
@@ -502,6 +573,20 @@ class AnalyzeObject:
         """Remove a non-DEX APK entry"""
     def write_apk(self, output: str):
         """Write the edited APK and remove invalidated signature entries"""
+    def sign_apk(
+        self,
+        output: str,
+        keystore: str,
+        alias: str,
+        store_password: str,
+        key_password: Optional[str] = None,
+        apksigner: Optional[str] = None,
+    ):
+        """Repack and sign this APK with Android SDK apksigner."""
+    def verify_apk(self, apk: str, apksigner: Optional[str] = None) -> str:
+        """Verify an APK with Android SDK apksigner."""
+    def get_history(self) -> list[str]:
+        """Return high-level edits made through the Python API."""
     def replace_instruction(
         self, method: Method, instruction: DexInstruction, replacement: DexInstruction
     ):

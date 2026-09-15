@@ -8,6 +8,7 @@
 pub mod dex;
 pub mod extraction;
 pub mod apk;
+pub mod signing;
 
 #[cfg(feature = "rhai-script")]
 pub mod scripting;

@@ -256,6 +256,7 @@ dependencies = [
  "rayon",
  "regex",
  "serde_json",
+ "zip",
 ]
 
 [[package]]

@@ -5,10 +5,10 @@
 //! of that contract: it can add/replace files and can perform small, safe
 //! edits to Android's binary XML format without requiring the Android SDK.
 
-use abxml::visitor::{Executor, ModelVisitor, XmlVisitor};
 use coeus_models::models::{AndroidManifest, ArchiveEntry, Files};
 use std::{
     collections::{BTreeMap, HashSet},
+    convert::TryFrom,
     fs::File,
     io::{Cursor, Write},
     path::Path,
@@ -68,12 +68,37 @@ pub fn repack_to_bytes(files: &Files) -> Result<Vec<u8>, Box<dyn std::error::Err
         // The analysis index is authoritative after an edit.  This also
         // covers the manifest and resources.arsc, which are indexed specially.
         let data = files.raw_file(&entry.name).unwrap_or(&entry.data);
-        let method = match entry.compression_method {
-            0 => CompressionMethod::Stored,
-            8 => CompressionMethod::Deflated,
-            _ => CompressionMethod::Stored,
+        // Android requires the resource table of APKs targeting Android 11+
+        // to be stored (never deflated) and aligned to a four-byte boundary.
+        // With extractNativeLibs=false, native libraries must also remain
+        // stored and page-aligned. Force these properties even for files
+        // added through Files::add_file, whose default archive method is
+        // deflated. `zip` emits the required ZIP extra field when an
+        // alignment is set, so this is handled as part of normal repacking.
+        let is_resource_table = entry.name == "resources.arsc";
+        let is_native_library = is_native_library_entry(&entry.name);
+        let method = if is_resource_table || is_native_library {
+            CompressionMethod::Stored
+        } else {
+            match entry.compression_method {
+                0 => CompressionMethod::Stored,
+                8 => CompressionMethod::Deflated,
+                _ => CompressionMethod::Stored,
+            }
         };
-        let options = SimpleFileOptions::default().compression_method(method);
+        let options = SimpleFileOptions::default()
+            .compression_method(method)
+            // ZIP alignment matters for every uncompressed entry after an
+            // archive is rebuilt, not only for resources.arsc.
+            .with_alignment(if is_native_library {
+                // The APK's arm64 libraries use 16 KiB PT_LOAD alignment.
+                // 16 KiB also satisfies the older 4 KiB requirement.
+                16_384
+            } else if matches!(method, CompressionMethod::Stored) {
+                4
+            } else {
+                1
+            });
         if entry.is_directory || entry.name.ends_with('/') {
             writer.add_directory(&entry.name, options)?;
         } else {
@@ -206,7 +231,39 @@ pub fn set_manifest_attribute(
     Ok(())
 }
 
-fn decode_binary_manifest(
+/// Change the Android package name in the manifest and refresh the parsed
+/// manifest view. This changes the install identity, but intentionally does
+/// not rename DEX class descriptors or other package-qualified strings.
+pub fn set_package_name(files: &mut Files, package_name: &str) -> Result<(), String> {
+    if !is_valid_package_name(package_name) {
+        return Err(format!("invalid Android package name: {package_name}"));
+    }
+    set_manifest_attribute(files, "manifest", "package", package_name)?;
+    // serde_xml_rs does not consistently expose XML attributes in this
+    // non-exhaustive model, so keep the convenience API's parsed value
+    // authoritative as well.
+    files.android_manifest.package = package_name.to_string();
+    for multi_dex in &mut files.multi_dex {
+        multi_dex.android_manifest.package = package_name.to_string();
+    }
+    Ok(())
+}
+
+fn is_valid_package_name(package_name: &str) -> bool {
+    !package_name.is_empty()
+        && package_name.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_alphabetic())
+                && segment
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+}
+
+pub(crate) fn decode_binary_manifest(
     binary_manifest: &[u8],
     binary_resources: &[u8],
 ) -> (String, AndroidManifest) {
@@ -227,18 +284,254 @@ fn decode_binary_manifest(
 
 fn decode_binary_manifest_inner(
     binary_manifest: &[u8],
-    binary_resources: &[u8],
+    _binary_resources: &[u8],
 ) -> (String, AndroidManifest) {
-    let mut visitor = ModelVisitor::default();
-    let _ = Executor::arsc(abxml::STR_ARSC, &mut visitor);
-    if !binary_resources.is_empty() {
-        let _ = Executor::arsc(binary_resources, &mut visitor);
-    }
-    let mut visitor = XmlVisitor::new(visitor.get_resources());
-    let _ = Executor::xml(Cursor::new(binary_manifest), &mut visitor);
-    let content = visitor.into_string().unwrap_or_default();
+    let content = decode_axml_document(binary_manifest).unwrap_or_default();
     let manifest = serde_xml_rs::from_str(&content).unwrap_or_default();
     (content, manifest)
+}
+
+/// Decode Android's binary XML without requiring every resource reference to
+/// be present in an `arsc` model.  In particular, newer manifest attributes
+/// can be unknown to an older resource decoder; dropping their parent element
+/// makes the resulting text impossible to edit safely.  Unknown typed values
+/// are emitted in a lossless internal form and accepted by the encoder below.
+fn decode_axml_document(input: &[u8]) -> Result<String, String> {
+    let document = AxmlDocument::parse(input)?;
+    let mut namespaces = BTreeMap::<String, String>::new();
+    for chunk in &document.chunks {
+        if chunk.kind != 0x0100 || chunk.bytes.len() < 24 {
+            continue;
+        }
+        let prefix_index = read_u32(&chunk.bytes, 16);
+        let prefix = if prefix_index == u32::MAX {
+            String::new()
+        } else {
+            document
+                .strings
+                .get(prefix_index as usize)
+                .cloned()
+                .ok_or_else(|| "invalid AXML namespace prefix".to_string())?
+        };
+        let uri = document
+            .strings
+            .get(read_u32(&chunk.bytes, 20) as usize)
+            .cloned()
+            .ok_or_else(|| "invalid AXML namespace URI".to_string())?;
+        namespaces.insert(uri, prefix);
+    }
+
+    let mut stack = Vec::<XmlNode>::new();
+    let mut root = None;
+    for chunk in &document.chunks {
+        match chunk.kind {
+            0x0102 => {
+                let header = chunk.header_size;
+                if chunk.bytes.len() < header + 14 {
+                    return Err("truncated AXML start-element chunk".to_string());
+                }
+                let namespace_index = read_u32(&chunk.bytes, header);
+                let name_index = read_u32(&chunk.bytes, header + 4);
+                let attributes_start = header + read_u16(&chunk.bytes, header + 8) as usize;
+                let attribute_size = read_u16(&chunk.bytes, header + 10) as usize;
+                let attribute_count = read_u16(&chunk.bytes, header + 12) as usize;
+                if attribute_size < 20
+                    || attributes_start
+                        .checked_add(attribute_count.saturating_mul(attribute_size))
+                        .is_none_or(|end| end > chunk.bytes.len())
+                {
+                    return Err("invalid AXML attribute table".to_string());
+                }
+                let local_name = document
+                    .strings
+                    .get(name_index as usize)
+                    .cloned()
+                    .ok_or_else(|| "invalid AXML element name".to_string())?;
+                let namespace = if namespace_index == u32::MAX {
+                    None
+                } else {
+                    Some(
+                        document
+                            .strings
+                            .get(namespace_index as usize)
+                            .cloned()
+                            .ok_or_else(|| "invalid AXML element namespace".to_string())?,
+                    )
+                };
+                let mut attributes = Vec::with_capacity(attribute_count);
+                for index in 0..attribute_count {
+                    let offset = attributes_start + index * attribute_size;
+                    let namespace_index = read_u32(&chunk.bytes, offset);
+                    let name_index = read_u32(&chunk.bytes, offset + 4);
+                    let data_type = chunk.bytes[offset + 15];
+                    let data = read_u32(&chunk.bytes, offset + 16);
+                    let name = document
+                        .strings
+                        .get(name_index as usize)
+                        .cloned()
+                        .ok_or_else(|| "invalid AXML attribute name".to_string())?;
+                    let namespace = if namespace_index == u32::MAX {
+                        None
+                    } else {
+                        Some(
+                            document
+                                .strings
+                                .get(namespace_index as usize)
+                                .cloned()
+                                .ok_or_else(|| "invalid AXML attribute namespace".to_string())?,
+                        )
+                    };
+                    let value = decode_axml_value(&document.strings, data_type, data)?;
+                    attributes.push(XmlAttribute {
+                        local_name: name,
+                        namespace,
+                        value,
+                    });
+                }
+                stack.push(XmlNode {
+                    local_name,
+                    namespace,
+                    attributes,
+                    children: Vec::new(),
+                });
+            }
+            0x0103 => {
+                let node = stack
+                    .pop()
+                    .ok_or_else(|| "AXML end-element without start-element".to_string())?;
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(XmlChild::Element(node));
+                } else if root.replace(node).is_some() {
+                    return Err("AXML document contains multiple roots".to_string());
+                }
+            }
+            0x0104 => {
+                let header = chunk.header_size;
+                if chunk.bytes.len() < header + 4 {
+                    return Err("truncated AXML text chunk".to_string());
+                }
+                let string_index = read_u32(&chunk.bytes, header);
+                let text = document
+                    .strings
+                    .get(string_index as usize)
+                    .cloned()
+                    .ok_or_else(|| "invalid AXML text string".to_string())?;
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(XmlChild::Text(text));
+                }
+            }
+            _ => {}
+        }
+    }
+    if !stack.is_empty() {
+        return Err("AXML document has unclosed elements".to_string());
+    }
+    let root = root.ok_or_else(|| "AXML document has no root element".to_string())?;
+    let document = XmlDocument {
+        root,
+        namespaces: namespaces
+            .into_iter()
+            .map(|(uri, prefix)| (prefix, uri))
+            .collect(),
+    };
+    let mut output = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n");
+    append_xml_text(&mut output, &document.root, &document.namespaces, true);
+    Ok(output)
+}
+
+fn decode_axml_value(strings: &[String], data_type: u8, data: u32) -> Result<String, String> {
+    match data_type {
+        0x00 => Ok("@raw:0x00:0x00000000".to_string()),
+        0x01 => Ok(format!("@0x{data:08x}")),
+        0x02 => Ok(format!("?0x{data:08x}")),
+        0x03 => strings
+            .get(data as usize)
+            .cloned()
+            .ok_or_else(|| "invalid AXML string value".to_string()),
+        0x10 => Ok(format!("0x{data:08x}")),
+        0x12 => Ok(if data == 0 { "false" } else { "true" }.to_string()),
+        0x11..=0x1f => Ok(format!("@raw:0x{data_type:02x}:0x{data:08x}")),
+        _ => Err(format!("unsupported AXML value type 0x{data_type:02x}")),
+    }
+}
+
+fn append_xml_text(
+    output: &mut String,
+    node: &XmlNode,
+    namespaces: &[(String, String)],
+    root: bool,
+) {
+    output.push('<');
+    append_xml_name(output, node.namespace.as_deref(), &node.local_name, namespaces);
+    if root {
+        for (prefix, uri) in namespaces {
+            output.push(' ');
+            if prefix.is_empty() {
+                output.push_str("xmlns");
+            } else {
+                output.push_str("xmlns:");
+                output.push_str(prefix);
+            }
+            output.push_str("=\"");
+            escape_xml(output, uri, true);
+            output.push('"');
+        }
+    }
+    for attribute in &node.attributes {
+        output.push(' ');
+        append_xml_name(
+            output,
+            attribute.namespace.as_deref(),
+            &attribute.local_name,
+            namespaces,
+        );
+        output.push_str("=\"");
+        escape_xml(output, &attribute.value, true);
+        output.push('"');
+    }
+    if node.children.is_empty() {
+        output.push_str(" />");
+        return;
+    }
+    output.push('>');
+    for child in &node.children {
+        match child {
+            XmlChild::Element(child) => append_xml_text(output, child, namespaces, false),
+            XmlChild::Text(text) => escape_xml(output, text, false),
+        }
+    }
+    output.push_str("</");
+    append_xml_name(output, node.namespace.as_deref(), &node.local_name, namespaces);
+    output.push('>');
+}
+
+fn append_xml_name(
+    output: &mut String,
+    namespace: Option<&str>,
+    local_name: &str,
+    namespaces: &[(String, String)],
+) {
+    if let Some(namespace) = namespace {
+        if let Some((prefix, _)) = namespaces.iter().find(|(_, uri)| uri == namespace) {
+            if !prefix.is_empty() {
+                output.push_str(prefix);
+                output.push(':');
+            }
+        }
+    }
+    output.push_str(local_name);
+}
+
+fn escape_xml(output: &mut String, value: &str, attribute: bool) {
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' if attribute => output.push_str("&quot;"),
+            _ => output.push(character),
+        }
+    }
 }
 
 fn is_signature_entry(name: &str) -> bool {
@@ -249,6 +542,10 @@ fn is_signature_entry(name: &str) -> bool {
             || upper.ends_with(".DSA")
             || upper.ends_with(".EC")
             || upper.ends_with("MANIFEST.MF"))
+}
+
+fn is_native_library_entry(name: &str) -> bool {
+    name.starts_with("lib/") && name.ends_with(".so")
 }
 
 #[derive(Debug, Clone)]
@@ -601,6 +898,15 @@ where
             });
         }
     }
+    if let Some(number) = value.strip_prefix("?0x") {
+        let number = u32::from_str_radix(number, 16)
+            .map_err(|_| format!("invalid attribute reference: {value}"))?;
+        return Ok(EncodedAttributeValue {
+            raw: u32::MAX,
+            data_type: 0x02,
+            data: number,
+        });
+    }
     if let Some(number) = value.strip_prefix("@flags:") {
         let number = number
             .parse::<i32>()
@@ -616,6 +922,20 @@ where
             raw: u32::MAX,
             data_type: 0,
             data: 0,
+        });
+    }
+    if let Some(raw) = value.strip_prefix("@raw:") {
+        let (data_type, data) = raw
+            .split_once(':')
+            .ok_or_else(|| format!("invalid raw AXML value: {value}"))?;
+        let data_type = parse_hex_byte(data_type)
+            .ok_or_else(|| format!("invalid raw AXML type: {data_type}"))?;
+        let data = parse_hex_u32(data)
+            .ok_or_else(|| format!("invalid raw AXML data: {data}"))?;
+        return Ok(EncodedAttributeValue {
+            raw: u32::MAX,
+            data_type,
+            data,
         });
     }
     if let Some(number) = value.strip_prefix("@flags:") {
@@ -1574,7 +1894,13 @@ pub fn set_binary_xml_attribute(
         if element_name != Some(element) {
             continue;
         }
-        let namespace_index = document.android_namespace_index(&document.chunks[index]);
+        let namespace_index = if element == "manifest" && attribute == "package" {
+            // `package` is an unqualified manifest attribute, unlike
+            // `android:*` attributes on the same element.
+            u32::MAX
+        } else {
+            document.android_namespace_index(&document.chunks[index])
+        };
         if set_start_element_attribute(
             &mut document.chunks[index].bytes,
             chunk_header_size,
@@ -1598,10 +1924,21 @@ enum ValueKind {
     Integer(i32),
     Reference(u32),
     String(u32),
+    Raw { data_type: u8, data: u32 },
 }
 
 impl ValueKind {
     fn parse(value: &str, document: &mut AxmlDocument) -> Result<Self, String> {
+        if let Some(raw) = value.strip_prefix("@raw:") {
+            let (data_type, data) = raw
+                .split_once(':')
+                .ok_or_else(|| format!("invalid raw AXML value: {value}"))?;
+            let data_type = parse_hex_byte(data_type)
+                .ok_or_else(|| format!("invalid raw AXML type: {data_type}"))?;
+            let data = parse_hex_u32(data)
+                .ok_or_else(|| format!("invalid raw AXML data: {data}"))?;
+            return Ok(Self::Raw { data_type, data });
+        }
         match value {
             "true" => Ok(Self::Boolean(true)),
             "false" => Ok(Self::Boolean(false)),
@@ -1793,6 +2130,14 @@ fn set_start_element_attribute(
         write_u32(chunk, 4, chunk_size);
         return Ok(true);
     };
+    // Updating an existing attribute must retain its original namespace. In
+    // particular, the manifest's unqualified `package` attribute must not be
+    // rewritten as `android:package`.
+    let namespace = if target.is_some() {
+        read_u32(chunk, offset)
+    } else {
+        namespace
+    };
     write_u32(chunk, offset, namespace);
     write_u32(chunk, offset + 4, attribute_name);
     write_attribute_value(chunk, offset, value, strings);
@@ -1833,6 +2178,13 @@ fn write_attribute_value(chunk: &mut [u8], offset: usize, value: &ValueKind, str
             chunk[offset + 14] = 0;
             chunk[offset + 15] = 0x03;
             write_u32(chunk, offset + 16, *index);
+        }
+        ValueKind::Raw { data_type, data } => {
+            write_u32(chunk, offset + 8, u32::MAX);
+            write_u16(chunk, offset + 12, 8);
+            chunk[offset + 14] = 0;
+            chunk[offset + 15] = *data_type;
+            write_u32(chunk, offset + 16, *data);
         }
     }
 }
@@ -2033,6 +2385,14 @@ fn read_uleb128(bytes: &[u8], mut offset: usize) -> Result<(u32, usize), String>
     }
 }
 
+fn parse_hex_u32(value: &str) -> Option<u32> {
+    u32::from_str_radix(value.strip_prefix("0x")?, 16).ok()
+}
+
+fn parse_hex_byte(value: &str) -> Option<u8> {
+    parse_hex_u32(value).and_then(|value| u8::try_from(value).ok())
+}
+
 fn append_uleb128(bytes: &mut Vec<u8>, mut value: u32) {
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -2117,6 +2477,13 @@ mod tests {
         assert!(network_xml.contains("cleartextTrafficPermitted"));
         assert!(files.manifest_content.contains("networkSecurityConfig"));
         assert!(files.manifest_content.contains("usesCleartextTraffic"));
+        set_package_name(&mut files, "example.modified").expect("change package name");
+        assert_eq!(files.android_manifest.package, "example.modified");
+        assert!(files
+            .raw_file("AndroidManifest.xml")
+            .unwrap()
+            .windows("example.modified".len())
+            .any(|window| window == b"example.modified"));
         let table = arsc::parse_from(Cursor::new(&files.binary_resource_file)).expect("parse arsc");
         assert!(table.packages.iter().any(|package| {
             package.type_names.strings.iter().any(|name| name == "xml")
@@ -2151,8 +2518,29 @@ mod tests {
             assert!(!manifest.is_dir());
         }
         assert!(archive.by_name(NETWORK_SECURITY_RESOURCE_PATH).is_ok());
-        assert!(archive.by_name("resources.arsc").is_ok());
+        {
+            let resources = archive
+                .by_name("resources.arsc")
+                .expect("resource table entry");
+            assert_eq!(resources.compression(), CompressionMethod::Stored);
+            assert_eq!(resources.data_start() % 4, 0);
+        }
         assert!(archive.by_name("classes.dex").is_ok());
+    }
+
+    #[test]
+    fn added_native_libraries_are_stored_and_page_aligned() {
+        let mut files = Files::new(Vec::new(), std::collections::HashMap::new());
+        files
+            .add_file("lib/arm64-v8a/libgadget.so", vec![0u8; 7])
+            .expect("add native library");
+        let output = repack_to_bytes(&files).expect("repack native library");
+        let mut archive = zip::ZipArchive::new(Cursor::new(output)).expect("read APK");
+        let library = archive
+            .by_name("lib/arm64-v8a/libgadget.so")
+            .expect("native library entry");
+        assert_eq!(library.compression(), CompressionMethod::Stored);
+        assert_eq!(library.data_start() % 16_384, 0);
     }
 
 }

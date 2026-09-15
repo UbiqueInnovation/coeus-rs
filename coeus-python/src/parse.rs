@@ -16,12 +16,17 @@ use coeus::coeus_parse::dex::{
     parse_dex_buf,
     ArrayView,
 };
-use pyo3::exceptions::{PyIOError, PyRuntimeError};
+use pyo3::exceptions::{PyIOError, PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::analysis::DexString;
 use crate::analysis::Method;
@@ -72,6 +77,122 @@ impl Dex {
 pub struct AnalyzeObject {
     pub(crate) files: Files,
     pub(crate) supergraph: Option<Arc<Supergraph>>,
+    pub(crate) history: Vec<String>,
+}
+
+impl AnalyzeObject {
+    fn record_action(&mut self, action: impl Into<String>) {
+        self.history.push(action.into());
+    }
+}
+
+impl SplitApkSet {
+    fn from_paths_internal(
+        py: Python<'_>,
+        paths: Vec<PathBuf>,
+        build_graph: bool,
+        max_depth: i64,
+    ) -> PyResult<Self> {
+        if paths.is_empty() {
+            return Err(PyRuntimeError::new_err("APK set must contain at least one APK"));
+        }
+        let mut members = Vec::with_capacity(paths.len());
+        let mut names = Vec::with_capacity(paths.len());
+        let mut seen = HashSet::new();
+        for path in paths {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(format!("invalid APK path: {}", path.display()))
+                })?
+                .to_string();
+            if !seen.insert(name.clone()) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "duplicate APK member name: {name}"
+                )));
+            }
+            let path_string = path.to_string_lossy().into_owned();
+            let object = AnalyzeObject::new(&path_string, build_graph, max_depth)?;
+            members.push(Py::new(py, object)?);
+            names.push(name);
+        }
+        Ok(Self {
+            members,
+            names,
+            history: Vec::new(),
+        })
+    }
+
+    fn output_paths(&self, output_dir: &Path) -> PyResult<Vec<PathBuf>> {
+        fs::create_dir_all(output_dir).map_err(|error| {
+            PyIOError::new_err(format!(
+                "could not create APK output directory {}: {error}",
+                output_dir.display()
+            ))
+        })?;
+        Ok(self
+            .names
+            .iter()
+            .map(|name| output_dir.join(name))
+            .collect())
+    }
+
+    fn write_members(&self, py: Python<'_>, paths: &[PathBuf]) -> PyResult<()> {
+        for (member, path) in self.members.iter().zip(paths) {
+            let object = member.bind(py).borrow();
+            coeus::coeus_parse::apk::repack(&object.files, path).map_err(|error| {
+                PyIOError::new_err(format!("could not write {}: {error}", path.display()))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn collect_history(&self, py: Python<'_>) -> Vec<String> {
+        let mut history = self.history.clone();
+        for (name, member) in self.names.iter().zip(&self.members) {
+            let object = member.bind(py).borrow();
+            history.extend(
+                object
+                    .history
+                    .iter()
+                    .map(|action| format!("{name}: {action}")),
+            );
+        }
+        history
+    }
+}
+
+fn new_staging_directory(label: &str) -> PyResult<PathBuf> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "coeus-{label}-{}-{timestamp}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&path).map_err(|error| {
+        PyIOError::new_err(format!("could not create temporary Coeus directory: {error}"))
+    })?;
+    Ok(path)
+}
+
+fn path_option(value: Option<&str>) -> Option<&Path> {
+    value.map(Path::new)
+}
+
+/// A collection of APKs belonging to one split-install set.
+///
+/// Each member remains a normal `AnalyzeObject`; the container only provides
+/// lifecycle operations which need to act on all members, such as pulling,
+/// signing, saving, and installing the set.
+#[pyclass]
+pub struct SplitApkSet {
+    members: Vec<Py<AnalyzeObject>>,
+    names: Vec<String>,
+    history: Vec<String>,
 }
 const NON_INTERESTING_CLASSES: [&str; 16] = [
     "Lj$/time",
@@ -219,6 +340,363 @@ impl AnalyzeObject {
 }
 
 #[pymethods]
+impl SplitApkSet {
+    #[new]
+    #[pyo3(signature = (paths, build_graph=false, max_depth=-1))]
+    pub fn new(
+        py: Python<'_>,
+        paths: Vec<String>,
+        build_graph: bool,
+        max_depth: i64,
+    ) -> PyResult<Self> {
+        Self::from_paths_internal(
+            py,
+            paths.into_iter().map(PathBuf::from).collect(),
+            build_graph,
+            max_depth,
+        )
+    }
+
+    /// Pull the base APK and all split APKs reported by `pm path`.
+    #[staticmethod]
+    #[pyo3(signature = (package_name, serial=None, adb_path=None, build_graph=false, max_depth=-1))]
+    pub fn from_adb(
+        py: Python<'_>,
+        package_name: &str,
+        serial: Option<&str>,
+        adb_path: Option<&str>,
+        build_graph: bool,
+        max_depth: i64,
+    ) -> PyResult<Self> {
+        let staging = new_staging_directory("adb")?;
+        let result = (|| {
+            let paths = coeus::coeus_parse::signing::pull_installed_apks(
+                package_name,
+                &staging,
+                serial,
+                path_option(adb_path),
+            )
+            .map_err(PyRuntimeError::new_err)?;
+            let mut set = Self::from_paths_internal(py, paths, build_graph, max_depth)?;
+            set.history
+                .push(format!("pulled APK set for {package_name} from adb"));
+            Ok(set)
+        })();
+        let _ = fs::remove_dir_all(&staging);
+        result
+    }
+
+    /// List installed package names, optionally filtering with a regex.
+    #[staticmethod]
+    #[pyo3(signature = (package_regex=None, serial=None, adb_path=None))]
+    pub fn list_packages(
+        package_regex: Option<&str>,
+        serial: Option<&str>,
+        adb_path: Option<&str>,
+    ) -> PyResult<Vec<String>> {
+        coeus::coeus_parse::signing::list_installed_packages(
+            package_regex,
+            serial,
+            path_option(adb_path),
+        )
+        .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Reload a previously saved `.coeus` state archive.
+    #[staticmethod]
+    #[pyo3(signature = (path, build_graph=false, max_depth=-1))]
+    pub fn load_state(
+        py: Python<'_>,
+        path: &str,
+        build_graph: bool,
+        max_depth: i64,
+    ) -> PyResult<Self> {
+        let file = File::open(path)
+            .map_err(|error| PyIOError::new_err(format!("could not open state archive: {error}")))?;
+        let mut archive = ZipArchive::new(file)
+            .map_err(|error| PyRuntimeError::new_err(format!("invalid .coeus archive: {error}")))?;
+        let mut metadata = None;
+        let mut apk_bytes = HashMap::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).map_err(|error| {
+                PyRuntimeError::new_err(format!("could not read state archive entry: {error}"))
+            })?;
+            let entry_name = entry.name().to_string();
+            if entry_name == "state.json" {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).map_err(|error| {
+                    PyRuntimeError::new_err(format!("could not read state metadata: {error}"))
+                })?;
+                metadata = Some(bytes);
+            } else if let Some(name) = entry_name.strip_prefix("apks/") {
+                if entry.is_dir()
+                    || name.is_empty()
+                    || name.contains('/')
+                    || name == "."
+                    || name == ".."
+                {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "invalid APK member in state archive: {entry_name}"
+                    )));
+                }
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).map_err(|error| {
+                    PyRuntimeError::new_err(format!(
+                        "could not read APK member {entry_name}: {error}"
+                    ))
+                })?;
+                if apk_bytes.insert(name.to_string(), bytes).is_some() {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "duplicate APK member in state archive: {name}"
+                    )));
+                }
+            }
+        }
+        let metadata = metadata.ok_or_else(|| {
+            PyRuntimeError::new_err(".coeus archive does not contain state.json")
+        })?;
+        let metadata: serde_json::Value = serde_json::from_slice(&metadata)
+            .map_err(|error| PyRuntimeError::new_err(format!("invalid state metadata: {error}")))?;
+        let members = metadata
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| PyRuntimeError::new_err("state metadata has no members list"))?;
+        let mut member_names = Vec::with_capacity(members.len());
+        for member in members {
+            let name = member
+                .as_str()
+                .filter(|name| !name.is_empty() && !name.contains('/') && *name != "." && *name != "..")
+                .ok_or_else(|| PyRuntimeError::new_err("state metadata contains an invalid member name"))?;
+            if !apk_bytes.contains_key(name) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "state archive is missing APK member {name}"
+                )));
+            }
+            member_names.push(name.to_string());
+        }
+
+        let staging = new_staging_directory("state")?;
+        let result = (|| {
+            let mut paths = Vec::with_capacity(member_names.len());
+            for name in &member_names {
+                let member_path = staging.join(name);
+                fs::write(&member_path, apk_bytes.get(name).expect("validated state member"))
+                    .map_err(|error| {
+                        PyIOError::new_err(format!(
+                            "could not materialize state member {name}: {error}"
+                        ))
+                    })?;
+                paths.push(member_path);
+            }
+            let mut set = Self::from_paths_internal(py, paths, build_graph, max_depth)?;
+            set.history = metadata
+                .get("history")
+                .and_then(serde_json::Value::as_array)
+                .map(|history| {
+                    history
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(set)
+        })();
+        let _ = fs::remove_dir_all(&staging);
+        result
+    }
+
+    pub fn __len__(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Py<AnalyzeObject>> {
+        let index = if index < 0 {
+            self.members.len() as isize + index
+        } else {
+            index
+        };
+        if index < 0 || index as usize >= self.members.len() {
+            return Err(PyIndexError::new_err("APK member index out of range"));
+        }
+        Ok(self.members[index as usize].clone_ref(py))
+    }
+
+    pub fn get_apks(&self, py: Python<'_>) -> Vec<Py<AnalyzeObject>> {
+        self.members
+            .iter()
+            .map(|member| member.clone_ref(py))
+            .collect()
+    }
+
+    pub fn get_names(&self) -> Vec<String> {
+        self.names.clone()
+    }
+
+    /// Return the base APK object. `pm path` normally reports it first, but
+    /// selecting by name makes the helper safe if a caller supplied paths in
+    /// another order.
+    pub fn get_base_apk(&self, py: Python<'_>) -> PyResult<Py<AnalyzeObject>> {
+        let index = self
+            .names
+            .iter()
+            .position(|name| name == "base.apk" || name.starts_with("base-"))
+            .unwrap_or(0);
+        Ok(self.members[index].clone_ref(py))
+    }
+
+    pub fn get_history(&self, py: Python<'_>) -> Vec<String> {
+        self.collect_history(py)
+    }
+
+    /// Write every current member to `output_dir` using its original split name.
+    pub fn write_all(&mut self, py: Python<'_>, output_dir: &str) -> PyResult<Vec<String>> {
+        let paths = self.output_paths(Path::new(output_dir))?;
+        self.write_members(py, &paths)?;
+        self.history.push(format!("write_all to {output_dir}"));
+        Ok(paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect())
+    }
+
+    /// Repack and sign every member with the same keystore and alias.
+    #[pyo3(signature = (output_dir, keystore, alias, store_password, key_password=None, apksigner=None))]
+    pub fn sign_all(
+        &mut self,
+        py: Python<'_>,
+        output_dir: &str,
+        keystore: &str,
+        alias: &str,
+        store_password: &str,
+        key_password: Option<&str>,
+        apksigner: Option<&str>,
+    ) -> PyResult<Vec<String>> {
+        let paths = self.output_paths(Path::new(output_dir))?;
+        self.write_members(py, &paths)?;
+        for path in &paths {
+            coeus::coeus_parse::signing::sign_apk(
+                path,
+                path_option(apksigner),
+                Path::new(keystore),
+                alias,
+                store_password,
+                key_password,
+            )
+            .map_err(PyRuntimeError::new_err)?;
+        }
+        self.history.push(format!("sign_all to {output_dir}"));
+        Ok(paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect())
+    }
+
+    /// Verify every signed member in an output directory.
+    #[pyo3(signature = (output_dir, apksigner=None))]
+    pub fn verify_all(
+        &self,
+        output_dir: &str,
+        apksigner: Option<&str>,
+    ) -> PyResult<Vec<String>> {
+        let paths = self.output_paths(Path::new(output_dir))?;
+        let mut output = Vec::with_capacity(paths.len());
+        for path in paths {
+            output.push(
+                coeus::coeus_parse::signing::verify_apk(path, path_option(apksigner))
+                    .map_err(PyRuntimeError::new_err)?,
+            );
+        }
+        Ok(output)
+    }
+
+    /// Install all members from an output directory using `adb install-multiple`.
+    #[pyo3(signature = (output_dir, serial=None, adb_path=None, replace_existing=true, allow_downgrade=false))]
+    pub fn install_all(
+        &mut self,
+        output_dir: &str,
+        serial: Option<&str>,
+        adb_path: Option<&str>,
+        replace_existing: bool,
+        allow_downgrade: bool,
+    ) -> PyResult<String> {
+        let paths = self.output_paths(Path::new(output_dir))?;
+        let result = coeus::coeus_parse::signing::install_apks(
+            &paths,
+            serial,
+            path_option(adb_path),
+            replace_existing,
+            allow_downgrade,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+        self.history.push(format!("install_all from {output_dir}"));
+        Ok(result)
+    }
+
+    /// Launch an installed package through `adb shell monkey`.
+    #[pyo3(signature = (package_name, serial=None, adb_path=None))]
+    pub fn launch(
+        &mut self,
+        package_name: &str,
+        serial: Option<&str>,
+        adb_path: Option<&str>,
+    ) -> PyResult<String> {
+        let result = coeus::coeus_parse::signing::launch_package(
+            package_name,
+            serial,
+            path_option(adb_path),
+        )
+        .map_err(PyRuntimeError::new_err)?;
+        self.history.push(format!("launch {package_name}"));
+        Ok(result)
+    }
+
+    /// Save current member APKs and the high-level edit history in a `.coeus` archive.
+    pub fn save_state(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        let mut history = self.collect_history(py);
+        history.push("save_state".to_string());
+        let metadata = serde_json::json!({
+            "format_version": 1,
+            "members": self.names.clone(),
+            "history": history,
+        });
+        let file = File::create(path).map_err(|error| {
+            PyIOError::new_err(format!("could not create state archive {path}: {error}"))
+        })?;
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        writer.start_file("state.json", options).map_err(|error| {
+            PyIOError::new_err(format!("could not write state metadata: {error}"))
+        })?;
+        writer
+            .write_all(metadata.to_string().as_bytes())
+            .map_err(|error| PyIOError::new_err(format!("could not write state metadata: {error}")))?;
+
+        for (name, member) in self.names.iter().zip(&self.members) {
+            let data = {
+                let object = member.bind(py).borrow();
+                coeus::coeus_parse::apk::repack_to_bytes(&object.files).map_err(|error| {
+                    PyIOError::new_err(format!("could not save APK member {name}: {error}"))
+                })?
+            };
+            writer
+                .start_file(format!("apks/{name}"), options)
+                .map_err(|error| {
+                    PyIOError::new_err(format!("could not write APK member {name}: {error}"))
+                })?;
+            writer.write_all(&data).map_err(|error| {
+                PyIOError::new_err(format!("could not write APK member {name}: {error}"))
+            })?;
+        }
+        writer
+            .finish()
+            .map_err(|error| PyIOError::new_err(format!("could not finish state archive: {error}")))?;
+        self.history.push("save_state".to_string());
+        Ok(())
+    }
+}
+
+#[pymethods]
 impl AnalyzeObject {
     #[new]
     pub fn new(archive: &str, build_graph: bool, max_depth: i64) -> PyResult<Self> {
@@ -226,6 +704,7 @@ impl AnalyzeObject {
             Ok(files) => Ok(AnalyzeObject {
                 files,
                 supergraph: None,
+                history: Vec::new(),
             }),
             Err(e) => Err(PyIOError::new_err(format!("{e:?}"))),
         }
@@ -273,7 +752,11 @@ impl AnalyzeObject {
         value: &str,
     ) -> PyResult<()> {
         coeus::coeus_parse::apk::set_manifest_attribute(&mut self.files, element, attribute, value)
-            .map_err(PyRuntimeError::new_err)
+            .map_err(PyRuntimeError::new_err)?;
+        self.record_action(format!(
+            "set_manifest_attribute {element}.{attribute}={value}"
+        ));
+        Ok(())
     }
 
     pub fn set_debuggable(&mut self, enabled: bool) -> PyResult<()> {
@@ -284,6 +767,15 @@ impl AnalyzeObject {
         )
     }
 
+    /// Change the package name used as the Android install identity.
+    /// DEX descriptors and package-qualified component names are not renamed.
+    pub fn set_package_name(&mut self, package_name: &str) -> PyResult<()> {
+        coeus::coeus_parse::apk::set_package_name(&mut self.files, package_name)
+            .map_err(PyRuntimeError::new_err)?;
+        self.record_action(format!("set_package_name {package_name}"));
+        Ok(())
+    }
+
     pub fn get_manifest_xml(&self) -> String {
         self.files.manifest_content.clone()
     }
@@ -291,44 +783,93 @@ impl AnalyzeObject {
     /// Replace AndroidManifest.xml from namespace-aware textual XML.
     pub fn set_manifest_xml(&mut self, xml: &str) -> PyResult<()> {
         coeus::coeus_parse::apk::set_manifest_xml(&mut self.files, xml)
-            .map_err(PyRuntimeError::new_err)
+            .map_err(PyRuntimeError::new_err)?;
+        self.record_action("set_manifest_xml".to_string());
+        Ok(())
     }
 
     /// Replace an Android binary-XML resource from textual XML.
     pub fn set_xml_resource(&mut self, path: &str, xml: &str) -> PyResult<()> {
         coeus::coeus_parse::apk::set_xml_resource(&mut self.files, path, xml)
-            .map_err(PyRuntimeError::new_err)
+            .map_err(PyRuntimeError::new_err)?;
+        self.record_action(format!("set_xml_resource {path}"));
+        Ok(())
     }
 
     /// Add a bundled XML resource and wire it into the manifest with a typed
     /// resource reference. It permits cleartext traffic and trusts user CAs.
     pub fn allow_plaintext_and_user_certificates(&mut self) -> PyResult<()> {
         coeus::coeus_parse::apk::allow_plaintext_and_user_certificates(&mut self.files)
-            .map_err(PyRuntimeError::new_err)
+            .map_err(PyRuntimeError::new_err)?;
+        self.record_action("allow_plaintext_and_user_certificates".to_string());
+        Ok(())
     }
 
     /// Add or replace a raw APK entry, including shared objects and DEX files.
     pub fn set_file(&mut self, name: &str, data: Vec<u8>) -> PyResult<()> {
         self.files
             .set_file(name.to_string(), data)
-            .map_err(PyRuntimeError::new_err)
+            .map_err(PyRuntimeError::new_err)?;
+        self.record_action(format!("set_file {name}"));
+        Ok(())
     }
 
     pub fn add_file(&mut self, name: &str, data: Vec<u8>) -> PyResult<()> {
         self.files
             .add_file(name.to_string(), data)
-            .map_err(PyRuntimeError::new_err)
+            .map_err(PyRuntimeError::new_err)?;
+        self.record_action(format!("add_file {name}"));
+        Ok(())
     }
 
     pub fn remove_file(&mut self, name: &str) -> PyResult<()> {
         self.files
             .remove_file(name)
-            .map_err(PyRuntimeError::new_err)
+            .map_err(PyRuntimeError::new_err)?;
+        self.record_action(format!("remove_file {name}"));
+        Ok(())
     }
 
     pub fn write_apk(&self, output: &str) -> PyResult<()> {
         coeus::coeus_parse::apk::repack(&self.files, output)
             .map_err(|error| PyIOError::new_err(error.to_string()))
+    }
+
+    /// Repack and sign one APK with the Android SDK's `apksigner` tool.
+    #[pyo3(signature = (output, keystore, alias, store_password, key_password=None, apksigner=None))]
+    pub fn sign_apk(
+        &mut self,
+        output: &str,
+        keystore: &str,
+        alias: &str,
+        store_password: &str,
+        key_password: Option<&str>,
+        apksigner: Option<&str>,
+    ) -> PyResult<()> {
+        self.write_apk(output)?;
+        coeus::coeus_parse::signing::sign_apk(
+            output,
+            path_option(apksigner),
+            Path::new(keystore),
+            alias,
+            store_password,
+            key_password,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+        self.record_action(format!("sign_apk to {output}"));
+        Ok(())
+    }
+
+    /// Verify an APK using the Android SDK's `apksigner` tool.
+    #[pyo3(signature = (apk, apksigner=None))]
+    pub fn verify_apk(&self, apk: &str, apksigner: Option<&str>) -> PyResult<String> {
+        coeus::coeus_parse::signing::verify_apk(apk, path_option(apksigner))
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Return high-level edits made through the Python API since loading.
+    pub fn get_history(&self) -> Vec<String> {
+        self.history.clone()
     }
 
     /// Replace an instruction selected from `method.get_instructions()` with
@@ -353,7 +894,9 @@ impl AnalyzeObject {
             &replacement_units,
         )
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        self.replace_loaded_dex(&dex_name, bytes)
+        self.replace_loaded_dex(&dex_name, bytes)?;
+        self.record_action(format!("replace_instruction {}", method.signature()));
+        Ok(())
     }
 
     /// Explicitly named alias for callers that prefer the longer editing API
@@ -386,7 +929,9 @@ impl AnalyzeObject {
         }
         let bytes = prepend_method_code(&dex, method_idx, &prefix)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        self.replace_loaded_dex(&dex_name, bytes)
+        self.replace_loaded_dex(&dex_name, bytes)?;
+        self.record_action(format!("prepend_instructions {}", method.signature()));
+        Ok(())
     }
 
     pub fn prepend_method_instructions(
@@ -409,7 +954,12 @@ impl AnalyzeObject {
         let (dex_name, method_idx, dex) = self.loaded_dex_for_method(method)?;
         let bytes = inject_load_library(&dex, method_idx, library_name, register)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        self.replace_loaded_dex(&dex_name, bytes)
+        self.replace_loaded_dex(&dex_name, bytes)?;
+        self.record_action(format!(
+            "inject_load_library {} ({library_name})",
+            method.signature()
+        ));
+        Ok(())
     }
 
     /// Select a method from a class object and inject the loader into it. If
@@ -454,7 +1004,11 @@ impl AnalyzeObject {
         let bytes =
             replace_method_instruction_units(&dex, method_idx, instruction_index, &code_units)
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        self.replace_loaded_dex(dex_name, bytes)
+        self.replace_loaded_dex(dex_name, bytes)?;
+        self.record_action(format!(
+            "replace_method_instruction {dex_name}:{method_idx}:{instruction_index}"
+        ));
+        Ok(())
     }
 
     pub fn prepend_method_code(
@@ -475,7 +1029,9 @@ impl AnalyzeObject {
             .ok_or_else(|| PyRuntimeError::new_err(format!("DEX not found: {dex_name}")))?;
         let bytes = prepend_method_code(&dex, method_idx, &prefix_code_units)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        self.replace_loaded_dex(dex_name, bytes)
+        self.replace_loaded_dex(dex_name, bytes)?;
+        self.record_action(format!("prepend_method_code {dex_name}:{method_idx}"));
+        Ok(())
     }
 
     /// Add the required DEX references if necessary, then insert
@@ -499,7 +1055,11 @@ impl AnalyzeObject {
             .ok_or_else(|| PyRuntimeError::new_err(format!("DEX not found: {dex_name}")))?;
         let bytes = inject_load_library(&dex, method_idx, library_name, register)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        self.replace_loaded_dex(dex_name, bytes)
+        self.replace_loaded_dex(dex_name, bytes)?;
+        self.record_action(format!(
+            "inject_load_library {dex_name}:{method_idx} ({library_name})"
+        ));
+        Ok(())
     }
 
     pub fn get_resource_string(&mut self, id: u32) -> Option<(String, HashMap<String, String>)> {
@@ -871,5 +1431,6 @@ impl AnalyzeObject {
 pub(crate) fn register(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<AnalyzeObject>()?;
     m.add_class::<Manifest>()?;
+    m.add_class::<SplitApkSet>()?;
     Ok(())
 }

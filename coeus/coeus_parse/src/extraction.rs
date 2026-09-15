@@ -5,15 +5,10 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 //! This module handles zip extraction and gathers all files into a `Files` struct, separating dex files and binary files. The dex files are parsed and inserted into `MultiDexFile` corresponding to all dex files at the same level. For binary files, we use `goblin` to allow parsing of potentially binary files. The binary parsing is a lazy operation though.
-use abxml::{
-    visitor::{Executor, ModelVisitor, XmlVisitor},
-    STR_ARSC,
-};
-
 use std::{
     collections::HashMap,
     fs::File,
-    io::{Cursor, ErrorKind, Read, Seek},
+    io::{ErrorKind, Read, Seek},
     sync::Arc,
 };
 use zip::ZipArchive;
@@ -300,22 +295,5 @@ pub fn check_for_zip_signature<T: Read>(mut ptr: T) -> bool {
 }
 
 fn decode_manifest(binary_manifest: &[u8], binary_resources: &[u8]) -> (String, AndroidManifest) {
-    if binary_manifest.is_empty() {
-        return (String::new(), AndroidManifest::default());
-    }
-    let mut visitor = ModelVisitor::default();
-    if Executor::arsc(STR_ARSC, &mut visitor).is_err() {
-        return (String::new(), AndroidManifest::default());
-    }
-    if !binary_resources.is_empty() {
-        let _ = Executor::arsc(binary_resources, &mut visitor);
-    }
-    let mut visitor = XmlVisitor::new(visitor.get_resources());
-    let _ = Executor::xml(Cursor::new(binary_manifest), &mut visitor);
-    let content = visitor.into_string().unwrap_or_default();
-    let manifest = serde_xml_rs::from_str(&content).unwrap_or_else(|err| {
-        log::warn!("Could not parse decoded manifest: {:?}", err);
-        AndroidManifest::default()
-    });
-    (content, manifest)
+    crate::apk::decode_binary_manifest(binary_manifest, binary_resources)
 }

@@ -502,7 +502,7 @@ fn rebuild_dex_with_references(
         &mut output,
         MapEntry {
             kind: 0x1000,
-            count: map_count,
+            count: 1,
             offset: new_map_off,
         },
     );
@@ -664,6 +664,220 @@ fn patch_data_offsets(
                 let mut cursor = base;
                 for _ in 0..entry.count {
                     cursor += patch_annotations_directory(data, cursor, shift)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Relocate offsets when new data items are inserted into the data section.
+///
+/// The insertion points are offsets in the original DEX.  Both comparisons
+/// therefore use the original value rather than the partially relocated one.
+#[derive(Debug, Clone, Copy)]
+struct OffsetRelocation {
+    first_insert: u32,
+    first_delta: u32,
+    second_insert: u32,
+    second_delta: u32,
+}
+
+impl OffsetRelocation {
+    fn apply(self, value: u32) -> Result<u32, DexEncodeError> {
+        let mut relocated = value;
+        if value >= self.first_insert {
+            relocated = relocated
+                .checked_add(self.first_delta)
+                .ok_or(DexEncodeError::InvalidCodeItem)?;
+        }
+        if value >= self.second_insert {
+            relocated = relocated
+                .checked_add(self.second_delta)
+                .ok_or(DexEncodeError::InvalidCodeItem)?;
+        }
+        Ok(relocated)
+    }
+}
+
+fn patch_string_ids_relocated(
+    output: &mut [u8],
+    offset: usize,
+    count: u32,
+    relocation: OffsetRelocation,
+) -> Result<(), DexEncodeError> {
+    for index in 0..count as usize {
+        let position = offset + index * 4;
+        let value = read_u32_at(output, position)?;
+        write_u32_at(output, position, relocation.apply(value)?)?;
+    }
+    Ok(())
+}
+
+fn patch_proto_ids_relocated(
+    output: &mut [u8],
+    offset: usize,
+    count: u32,
+    relocation: OffsetRelocation,
+) -> Result<(), DexEncodeError> {
+    for index in 0..count as usize {
+        let position = offset + index * 12 + 8;
+        let value = read_u32_at(output, position)?;
+        if value != 0 {
+            write_u32_at(output, position, relocation.apply(value)?)?;
+        }
+    }
+    Ok(())
+}
+
+fn patch_class_defs_relocated(
+    output: &mut [u8],
+    offset: usize,
+    count: u32,
+    relocation: OffsetRelocation,
+) -> Result<(), DexEncodeError> {
+    if count == 0 {
+        return Ok(());
+    }
+    for index in 0..count as usize {
+        let base = offset + index * 32;
+        for field in [12, 20, 24, 28] {
+            let position = base + field;
+            let value = read_u32_at(output, position)?;
+            if value != 0 {
+                write_u32_at(output, position, relocation.apply(value)?)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn patch_u32_reference_relocated(
+    data: &mut [u8],
+    offset: usize,
+    relocation: OffsetRelocation,
+) -> Result<(), DexEncodeError> {
+    let value = read_u32_at(data, offset)?;
+    if value != 0 {
+        write_u32_at(data, offset, relocation.apply(value)?)?;
+    }
+    Ok(())
+}
+
+fn patch_annotation_set_item_relocated(
+    data: &mut [u8],
+    offset: usize,
+    relocation: OffsetRelocation,
+) -> Result<usize, DexEncodeError> {
+    let count = read_u32_at(data, offset)? as usize;
+    for index in 0..count {
+        patch_u32_reference_relocated(data, offset + 4 + index * 4, relocation)?;
+    }
+    4usize
+        .checked_add(count * 4)
+        .ok_or(DexEncodeError::InvalidCodeItem)
+}
+
+fn patch_annotations_directory_relocated(
+    data: &mut [u8],
+    offset: usize,
+    relocation: OffsetRelocation,
+) -> Result<usize, DexEncodeError> {
+    patch_u32_reference_relocated(data, offset, relocation)?;
+    let field_count = read_u32_at(data, offset + 4)? as usize;
+    let method_count = read_u32_at(data, offset + 8)? as usize;
+    let parameter_count = read_u32_at(data, offset + 12)? as usize;
+    let mut cursor = offset + 16;
+    for _ in 0..field_count + method_count + parameter_count {
+        patch_u32_reference_relocated(data, cursor + 4, relocation)?;
+        cursor += 8;
+    }
+    Ok(cursor - offset)
+}
+
+fn patch_class_data_item_relocated(
+    data: &mut [u8],
+    offset: usize,
+    relocation: OffsetRelocation,
+) -> Result<usize, DexEncodeError> {
+    let mut cursor = offset;
+    let static_count = read_uleb_at(data, &mut cursor)?;
+    let instance_count = read_uleb_at(data, &mut cursor)?;
+    let direct_count = read_uleb_at(data, &mut cursor)?;
+    let virtual_count = read_uleb_at(data, &mut cursor)?;
+    for _ in 0..static_count + instance_count {
+        read_uleb_at(data, &mut cursor)?;
+        read_uleb_at(data, &mut cursor)?;
+    }
+    for _ in 0..direct_count + virtual_count {
+        read_uleb_at(data, &mut cursor)?;
+        read_uleb_at(data, &mut cursor)?;
+        let code_position = cursor;
+        let (code_off, width) = read_uleb_at_with_width(data, &mut cursor)?;
+        if code_off != 0 {
+            let relocated = relocation.apply(code_off)?;
+            if uleb_width(relocated) != width {
+                return Err(DexEncodeError::InvalidCodeItem);
+            }
+            write_fixed_uleb(data, code_position, relocated, width)?;
+        }
+    }
+    Ok(cursor - offset)
+}
+
+/// Patch references in the original data items after section insertions.
+///
+/// The newly inserted code/class-data items are deliberately excluded from
+/// this walk.  Their references are either copied from the original item and
+/// patched explicitly, or point at the newly assigned code offset already.
+fn patch_data_offsets_relocated(
+    data: &mut [u8],
+    entries: &[MapEntry],
+    old_data_off: u32,
+    relocation: OffsetRelocation,
+) -> Result<(), DexEncodeError> {
+    for entry in entries {
+        if entry.offset < old_data_off || entry.kind == 0x1000 {
+            continue;
+        }
+        let relocated_offset = relocation.apply(entry.offset)?;
+        let base = relocated_offset
+            .checked_sub(old_data_off)
+            .ok_or(DexEncodeError::InvalidCodeItem)? as usize;
+        match entry.kind {
+            0x1002 => {
+                for index in 0..entry.count as usize {
+                    patch_u32_reference_relocated(data, base + 4 + index * 4, relocation)?;
+                }
+            }
+            0x1003 => {
+                let mut cursor = base;
+                for _ in 0..entry.count {
+                    cursor += patch_annotation_set_item_relocated(data, cursor, relocation)?;
+                }
+            }
+            0x2000 => {
+                let mut cursor = base;
+                for _ in 0..entry.count {
+                    cursor += patch_class_data_item_relocated(data, cursor, relocation)?;
+                }
+            }
+            0x2001 => {
+                let mut cursor = base;
+                for _ in 0..entry.count {
+                    patch_u32_reference_relocated(data, cursor + 8, relocation)?;
+                    cursor += code_item_size(data, cursor)?;
+                    if cursor % 4 != 0 {
+                        cursor += 4 - cursor % 4;
+                    }
+                }
+            }
+            0x2006 => {
+                let mut cursor = base;
+                for _ in 0..entry.count {
+                    cursor +=
+                        patch_annotations_directory_relocated(data, cursor, relocation)?;
                 }
             }
             _ => {}
@@ -880,10 +1094,15 @@ fn write_u32_at(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), DexEn
     Ok(())
 }
 
-/// Prepend code units to a method by appending a new code_item and a copied
-/// class_data_item.  This leaves every existing DEX section in place, so all
-/// unmodelled data remains intact.  Relative branch and payload offsets remain
-/// valid because the original method body is shifted as one block.
+/// Prepend code units to a method by inserting a new code_item at the end of
+/// the existing code_item section and a copied class_data_item at the end of
+/// the existing class_data_item section.
+///
+/// DEX map entries describe contiguous sections.  Appending new items after
+/// the original map_list and merely increasing a section count makes ART walk
+/// the following section as if it were another item of the previous type.  We
+/// therefore insert both items before their next mapped section and relocate
+/// all offset-bearing references in the shifted suffix.
 pub fn prepend_method_code(
     dex: &DexFile,
     method_idx: u32,
@@ -916,38 +1135,221 @@ pub fn prepend_method_code(
         return Err(DexEncodeError::InvalidCodeItem);
     }
 
-    let mut output = dex.raw_data().to_vec();
-    align_vec(&mut output, 4);
-    let new_code_off = output.len() as u32;
-    output.extend_from_slice(&code.register_size.to_le_bytes());
-    output.extend_from_slice(&code.ins_size.to_le_bytes());
-    output.extend_from_slice(&code.outs_size.to_le_bytes());
-    output.extend_from_slice(&0u16.to_le_bytes());
-    output.extend_from_slice(&code.debug_info_off.to_le_bytes());
-    output.extend_from_slice(&((code.insns_size as usize + prefix.len()) as u32).to_le_bytes());
-    for unit in prefix {
-        output.extend_from_slice(&unit.to_le_bytes());
+    let raw = dex.raw_data();
+    let old_map_off = dex.header.map_off as usize;
+    let map_entries = read_map_entries(raw, old_map_off)?;
+    let old_map_end = old_map_off
+        .checked_add(4 + map_entries.len() * 12)
+        .ok_or(DexEncodeError::InvalidCodeItem)?;
+    if old_map_end != raw.len() {
+        return Err(DexEncodeError::InvalidCodeItem);
     }
-    output.extend_from_slice(&dex.raw_data()[original_start..original_end]);
+
+    let code_insert = section_content_end(raw, &map_entries, 0x2001)? as usize;
+    let class_data_insert = section_content_end(raw, &map_entries, 0x2000)? as usize;
+    let old_data_off = dex.header.data_off as usize;
+    if old_data_off > code_insert
+        || code_insert > class_data_insert
+        || class_data_insert > old_map_off
+    {
+        return Err(DexEncodeError::InvalidCodeItem);
+    }
+
+    let code_padding = (4 - code_insert % 4) % 4;
+    let mut new_code = Vec::with_capacity(16 + (prefix.len() + code.insns_size as usize) * 2);
+    new_code.extend_from_slice(&code.register_size.to_le_bytes());
+    new_code.extend_from_slice(&code.ins_size.to_le_bytes());
+    new_code.extend_from_slice(&code.outs_size.to_le_bytes());
+    new_code.extend_from_slice(&0u16.to_le_bytes());
+    new_code.extend_from_slice(&code.debug_info_off.to_le_bytes());
+    new_code.extend_from_slice(&((code.insns_size as usize + prefix.len()) as u32).to_le_bytes());
+    for unit in prefix {
+        new_code.extend_from_slice(&unit.to_le_bytes());
+    }
+    new_code.extend_from_slice(&raw[original_start..original_end]);
+
+    let code_insert_delta = code_padding
+        .checked_add(new_code.len())
+        .and_then(|size| size.checked_add((4 - size % 4) % 4))
+        .ok_or(DexEncodeError::InvalidCodeItem)? as u32;
 
     let class_def_off = class_def_offset(dex, class_idx)?;
     let original_class_data_off = class_data_offset(dex, class_def_off)?;
-    let new_class_data_off = output.len() as u32;
     let class_data = rewrite_class_data(
-        &dex.raw_data()[original_class_data_off..],
+        &raw[original_class_data_off..],
         method_idx,
-        new_code_off,
+        code_insert as u32 + code_padding as u32,
     )?;
-    output.extend_from_slice(&class_data);
+    let class_data_insert_delta = (class_data.len() + (4 - class_data.len() % 4) % 4) as u32;
 
+    let relocation = OffsetRelocation {
+        first_insert: code_insert as u32,
+        first_delta: code_insert_delta,
+        second_insert: class_data_insert as u32,
+        second_delta: class_data_insert_delta,
+    };
+
+    let mut output = Vec::with_capacity(
+        raw.len()
+            .checked_add(code_insert_delta as usize)
+            .and_then(|size| size.checked_add(class_data_insert_delta as usize))
+            .ok_or(DexEncodeError::InvalidCodeItem)?,
+    );
+    output.extend_from_slice(&raw[..code_insert]);
+    output.resize(output.len() + code_padding, 0);
+    let new_code_off = output.len() as u32;
+    output.extend_from_slice(&new_code);
+    output.resize(output.len() + (code_insert_delta as usize - code_padding - new_code.len()), 0);
+    output.extend_from_slice(&raw[code_insert..class_data_insert]);
+    let new_class_data_off = output.len() as u32;
+    output.extend_from_slice(&class_data);
+    output.resize(
+        output.len() + (class_data_insert_delta as usize - class_data.len()),
+        0,
+    );
+    output.extend_from_slice(&raw[class_data_insert..old_map_off]);
+
+    align_vec(&mut output, 4);
+    let new_map_off = output.len() as u32;
+
+    patch_string_ids_relocated(
+        &mut output,
+        dex.header.string_ids_off as usize,
+        dex.header.string_ids_size,
+        relocation,
+    )?;
+    patch_proto_ids_relocated(
+        &mut output,
+        dex.header.proto_ids_off as usize,
+        dex.header.proto_ids_size,
+        relocation,
+    )?;
+    patch_class_defs_relocated(
+        &mut output,
+        dex.header.class_defs_off as usize,
+        dex.header.class_defs_size,
+        relocation,
+    )?;
+    patch_data_offsets_relocated(
+        &mut output[old_data_off..new_map_off as usize],
+        &map_entries,
+        dex.header.data_off,
+        relocation,
+    )?;
+
+    // The new code item copied the old debug_info_off.  It now points into
+    // the shifted suffix and must be relocated as well.  The new class-data
+    // item already contains the new code offset and is excluded from the
+    // original-section walk above.
+    patch_u32_reference_relocated(
+        &mut output[old_data_off..new_map_off as usize],
+        (new_code_off - dex.header.data_off) as usize + 8,
+        relocation,
+    )?;
+
+    // The target class now uses the newly copied class_data_item rather than
+    // the relocated original one.
     if class_def_off + 32 > output.len() {
         return Err(DexEncodeError::InvalidCodeItem);
     }
     output[class_def_off + 24..class_def_off + 28]
         .copy_from_slice(&new_class_data_off.to_le_bytes());
-    update_map_and_header(&mut output, new_class_data_off, new_code_off)?;
+
+    let mut new_map = Vec::with_capacity(map_entries.len());
+    for mut entry in map_entries {
+        if entry.kind == 0x1000 {
+            continue;
+        }
+        entry.offset = relocation.apply(entry.offset)?;
+        if entry.kind == 0x2001 || entry.kind == 0x2000 {
+            entry.count = entry
+                .count
+                .checked_add(1)
+                .ok_or(DexEncodeError::InvalidCodeItem)?;
+        }
+        new_map.push(entry);
+    }
+    new_map.sort_by_key(|entry| (entry.offset, entry.kind));
+    let map_count = (new_map.len() + 1) as u32;
+    output.extend_from_slice(&map_count.to_le_bytes());
+    for entry in new_map {
+        append_map_entry(&mut output, entry);
+    }
+    append_map_entry(
+        &mut output,
+        MapEntry {
+            kind: 0x1000,
+            count: 1,
+            offset: new_map_off,
+        },
+    );
+
+    let file_size = output.len() as u32;
+    output[32..36].copy_from_slice(&file_size.to_le_bytes());
+    output[52..56].copy_from_slice(&new_map_off.to_le_bytes());
+    output[104..108].copy_from_slice(
+        &file_size
+            .checked_sub(dex.header.data_off)
+            .ok_or(DexEncodeError::InvalidCodeItem)?
+            .to_le_bytes(),
+    );
     repair_checksums(&mut output)?;
     Ok(output)
+}
+
+fn section_content_end(
+    raw: &[u8],
+    entries: &[MapEntry],
+    kind: u16,
+) -> Result<u32, DexEncodeError> {
+    let entry = entries
+        .iter()
+        .find(|entry| entry.kind == kind)
+        .ok_or(DexEncodeError::InvalidCodeItem)?;
+    let mut cursor = entry.offset as usize;
+    match kind {
+        0x2001 => {
+            for index in 0..entry.count as usize {
+                let item_end = cursor
+                    .checked_add(code_item_size(raw, cursor)?)
+                    .ok_or(DexEncodeError::InvalidCodeItem)?;
+                cursor = item_end;
+                if index + 1 != entry.count as usize && cursor % 4 != 0 {
+                    cursor += 4 - cursor % 4;
+                }
+            }
+        }
+        0x2000 => {
+            for _ in 0..entry.count {
+                cursor = cursor
+                    .checked_add(class_data_item_size(raw, cursor)?)
+                    .ok_or(DexEncodeError::InvalidCodeItem)?;
+            }
+        }
+        _ => return Err(DexEncodeError::InvalidCodeItem),
+    }
+    if cursor > raw.len() {
+        return Err(DexEncodeError::InvalidCodeItem);
+    }
+    Ok(cursor as u32)
+}
+
+fn class_data_item_size(data: &[u8], offset: usize) -> Result<usize, DexEncodeError> {
+    let mut cursor = offset;
+    let static_count = read_uleb_at(data, &mut cursor)?;
+    let instance_count = read_uleb_at(data, &mut cursor)?;
+    let direct_count = read_uleb_at(data, &mut cursor)?;
+    let virtual_count = read_uleb_at(data, &mut cursor)?;
+    for _ in 0..static_count + instance_count {
+        read_uleb_at(data, &mut cursor)?;
+        read_uleb_at(data, &mut cursor)?;
+    }
+    for _ in 0..direct_count + virtual_count {
+        read_uleb_at(data, &mut cursor)?;
+        read_uleb_at(data, &mut cursor)?;
+        read_uleb_at(data, &mut cursor)?;
+    }
+    Ok(cursor - offset)
 }
 
 fn class_def_offset(dex: &DexFile, class_idx: u32) -> Result<usize, DexEncodeError> {
@@ -1067,68 +1469,6 @@ fn write_uleb(output: &mut Vec<u8>, mut value: u32) {
 
 fn align_vec(output: &mut Vec<u8>, alignment: usize) {
     while output.len() % alignment != 0 { output.push(0); }
-}
-
-fn update_map_and_header(
-    output: &mut Vec<u8>,
-    class_data_off: u32,
-    code_off: u32,
-) -> Result<(), DexEncodeError> {
-    if output.len() < 112 { return Err(DexEncodeError::InvalidCodeItem); }
-    let old_map_off = u32::from_le_bytes([output[52], output[53], output[54], output[55]]) as usize;
-    if old_map_off == 0 || old_map_off + 4 > output.len() {
-        return Err(DexEncodeError::InvalidCodeItem);
-    }
-    let old_count = u32::from_le_bytes([
-        output[old_map_off], output[old_map_off + 1], output[old_map_off + 2], output[old_map_off + 3],
-    ]) as usize;
-    let mut entries = Vec::with_capacity(old_count + 2);
-    for index in 0..old_count {
-        let offset = old_map_off + 4 + index * 12;
-        if offset + 12 > output.len() { return Err(DexEncodeError::InvalidCodeItem); }
-        let kind = u16::from_le_bytes([output[offset], output[offset + 1]]);
-        if kind != 0x1000 {
-            entries.push(output[offset..offset + 12].to_vec());
-        }
-    }
-    for (kind, offset) in [(0x2001u16, code_off), (0x2000u16, class_data_off)] {
-        if let Some(entry) = entries
-            .iter_mut()
-            .find(|entry| read_u16_at(entry, 0).ok() == Some(kind))
-        {
-            let count = read_u32_at(entry, 4).unwrap_or(0).saturating_add(1);
-            entry[4..8].copy_from_slice(&count.to_le_bytes());
-            let first_offset = read_u32_at(entry, 8).unwrap_or(offset).min(offset);
-            entry[8..12].copy_from_slice(&first_offset.to_le_bytes());
-        } else {
-            let mut entry = vec![0u8; 12];
-            entry[0..2].copy_from_slice(&kind.to_le_bytes());
-            entry[4..8].copy_from_slice(&1u32.to_le_bytes());
-            entry[8..12].copy_from_slice(&offset.to_le_bytes());
-            entries.push(entry);
-        }
-    }
-    align_vec(output, 4);
-    let new_map_off = output.len() as u32;
-    entries.sort_by_key(|entry| {
-        (read_u32_at(entry, 8).unwrap_or(0), read_u16_at(entry, 0).unwrap_or(0))
-    });
-    output.extend_from_slice(&((entries.len() + 1) as u32).to_le_bytes());
-    for entry in entries { output.extend_from_slice(&entry); }
-    let mut map_entry = vec![0u8; 12];
-    map_entry[0..2].copy_from_slice(&0x1000u16.to_le_bytes());
-    map_entry[4..8].copy_from_slice(&1u32.to_le_bytes());
-    map_entry[8..12].copy_from_slice(&new_map_off.to_le_bytes());
-    output.extend_from_slice(&map_entry);
-    output[52..56].copy_from_slice(&new_map_off.to_le_bytes());
-    let file_size = output.len() as u32;
-    output[32..36].copy_from_slice(&file_size.to_le_bytes());
-    let data_off = u32::from_le_bytes([output[108], output[109], output[110], output[111]]) as usize;
-    if data_off <= output.len() {
-        let data_size = (output.len() - data_off) as u32;
-        output[104..108].copy_from_slice(&data_size.to_le_bytes());
-    }
-    Ok(())
 }
 
 fn repair_checksums(data: &mut [u8]) -> Result<(), DexEncodeError> {
@@ -1301,5 +1641,60 @@ mod tests {
             .expect("replace one-unit instruction");
         parse_dex_buf("classes.dex", &ArrayView::new(&edited), false)
             .expect("edited DEX reparses");
+    }
+
+    #[test]
+    fn prepend_method_rebuilds_aligned_map_list() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/dead_branch/classes.dex");
+        let Ok(bytes) = fs::read(path) else {
+            return;
+        };
+        let dex = parse_dex_buf("classes.dex", &ArrayView::new(&bytes), false)
+            .expect("test DEX parses");
+        let original_code_count = read_map_entries(
+            &bytes,
+            read_u32_at(&bytes, 52).expect("original map offset") as usize,
+        )
+        .expect("original map parses")
+        .into_iter()
+        .find(|entry| entry.kind == 0x2001)
+        .map(|entry| entry.count)
+        .expect("original DEX has code items");
+        let method_idx = dex
+            .classes
+            .iter()
+            .flat_map(|class| class.codes.iter())
+            .filter_map(|method| {
+                let code = method.code.as_ref()?;
+                (code.tries_size == 0
+                    && code.array_data.is_empty()
+                    && code.switch_data.is_empty())
+                    .then_some(method.method_idx)
+            })
+            .next()
+            .expect("test DEX has a method without payloads");
+
+        let edited = prepend_method_code(&dex, method_idx, &[0x0000])
+            .expect("prepend one-unit instruction");
+        parse_dex_buf("classes.dex", &ArrayView::new(&edited), false)
+            .expect("edited DEX reparses");
+
+        let map_off = read_u32_at(&edited, 52).expect("map offset") as usize;
+        let map_count = read_u32_at(&edited, map_off).expect("map count") as usize;
+        let mut map_list_count = None;
+        let mut code_item_count = None;
+        for index in 0..map_count {
+            let entry = map_off + 4 + index * 12;
+            let kind = read_u16_at(&edited, entry).expect("map kind");
+            let count = read_u32_at(&edited, entry + 4).expect("map item count");
+            match kind {
+                0x1000 => map_list_count = Some(count),
+                0x2001 => code_item_count = Some(count),
+                _ => {}
+            }
+        }
+        assert_eq!(map_list_count, Some(1));
+        assert_eq!(code_item_count, Some(original_code_count + 1));
     }
 }

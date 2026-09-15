@@ -1580,6 +1580,13 @@ impl InstructionFlow {
                     Instruction::ConstLit32(reg, val) => {
                         b.state.registers[reg as usize] = Value::Number(val as i128)
                     }
+                    Instruction::ConstHigh16(reg, val) => {
+                        b.state.registers[reg as usize] =
+                            Value::Number((i32::from(val as i16) << 16) as i128)
+                    }
+                    Instruction::ConstWide(reg, val) => {
+                        b.state.registers[reg as usize] = Value::Number(val as i128)
+                    }
 
                     Instruction::ConstString(reg, str_idx) => {
                         b.state.registers[reg as usize] = dex
@@ -1607,7 +1614,6 @@ impl InstructionFlow {
                         b.state.registers[reg as usize] = class_name;
                     }
                     Instruction::Const => {}
-                    Instruction::ConstWide => {}
 
                     // casts
                     Instruction::IntToByte(dst, src) => {

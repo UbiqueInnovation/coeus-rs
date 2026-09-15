@@ -648,6 +648,112 @@ impl VM {
         }
         self.update_register(dst.into(), new_register)
     }
+    fn reg_literal(&self, reg: usize) -> Option<i32> {
+        match self.current_state.current_stackframe.get(reg) {
+            Some(Register::Literal(v)) => Some(*v),
+            _ => None,
+        }
+    }
+    fn reg_wide(&self, reg: usize) -> Option<i64> {
+        match self.current_state.current_stackframe.get(reg) {
+            Some(Register::LiteralWide(v)) => Some(*v),
+            _ => None,
+        }
+    }
+    fn reg_float(&self, reg: usize) -> Option<f32> {
+        self.reg_literal(reg).map(|v| f32::from_bits(v as u32))
+    }
+    fn reg_double(&self, reg: usize) -> Option<f64> {
+        self.reg_wide(reg).map(|v| f64::from_bits(v as u64))
+    }
+    fn long_binop<T>(
+        &mut self,
+        dst: T,
+        a: T,
+        b: T,
+        op: fn(i64, i64) -> i64,
+    ) -> Result<(), VMException>
+    where
+        T: Into<usize> + Copy,
+    {
+        let new_register = match (self.reg_wide(a.into()), self.reg_wide(b.into())) {
+            (Some(a), Some(b)) => Register::LiteralWide(op(a, b)),
+            _ => Register::Empty,
+        };
+        self.update_register(dst.into(), new_register)
+    }
+    fn float_binop<T>(
+        &mut self,
+        dst: T,
+        a: T,
+        b: T,
+        op: fn(f32, f32) -> f32,
+    ) -> Result<(), VMException>
+    where
+        T: Into<usize> + Copy,
+    {
+        let new_register = match (self.reg_float(a.into()), self.reg_float(b.into())) {
+            (Some(a), Some(b)) => Register::Literal(op(a, b).to_bits() as i32),
+            _ => Register::Empty,
+        };
+        self.update_register(dst.into(), new_register)
+    }
+    fn double_binop<T>(
+        &mut self,
+        dst: T,
+        a: T,
+        b: T,
+        op: fn(f64, f64) -> f64,
+    ) -> Result<(), VMException>
+    where
+        T: Into<usize> + Copy,
+    {
+        let new_register = match (self.reg_double(a.into()), self.reg_double(b.into())) {
+            (Some(a), Some(b)) => Register::LiteralWide(op(a, b).to_bits() as i64),
+            _ => Register::Empty,
+        };
+        self.update_register(dst.into(), new_register)
+    }
+    fn float_cmp<T>(
+        &mut self,
+        dst: T,
+        a: T,
+        b: T,
+        nan_result: std::cmp::Ordering,
+    ) -> Result<(), VMException>
+    where
+        T: Into<usize> + Copy,
+    {
+        let new_register = match (self.reg_float(a.into()), self.reg_float(b.into())) {
+            (Some(a), Some(b)) => Register::Literal(match a.partial_cmp(&b).unwrap_or(nan_result) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }),
+            _ => Register::Empty,
+        };
+        self.update_register(dst.into(), new_register)
+    }
+    fn double_cmp<T>(
+        &mut self,
+        dst: T,
+        a: T,
+        b: T,
+        nan_result: std::cmp::Ordering,
+    ) -> Result<(), VMException>
+    where
+        T: Into<usize> + Copy,
+    {
+        let new_register = match (self.reg_double(a.into()), self.reg_double(b.into())) {
+            (Some(a), Some(b)) => Register::Literal(match a.partial_cmp(&b).unwrap_or(nan_result) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }),
+            _ => Register::Empty,
+        };
+        self.update_register(dst.into(), new_register)
+    }
 
     fn execute(&mut self, start_address: InstructionOffset) -> Result<(), VMException> {
         let mut dex_file = self.current_state.current_dex_file.clone();
@@ -753,14 +859,34 @@ impl VM {
                         .to_owned();
                     self.update_register(dst_reg as usize, src)?;
                 }
-                Instruction::MoveWide(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::MoveWide(dst, src) => {
+                    let src_reg: u8 = src.into();
+                    let dst_reg: u8 = dst.into();
+                    let src = self
+                        .current_state
+                        .current_stackframe
+                        .get(src_reg as usize)
+                        .ok_or(VMException::RegisterNotFound(src_reg as usize))?
+                        .to_owned();
+                    self.update_register(dst_reg as usize, src)?;
                 }
-                Instruction::MoveWideFrom16(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::MoveWideFrom16(dst, src) => {
+                    let src = self
+                        .current_state
+                        .current_stackframe
+                        .get(src as usize)
+                        .ok_or(VMException::RegisterNotFound(src as usize))?
+                        .to_owned();
+                    self.update_register(dst as usize, src)?;
                 }
-                Instruction::MoveWide16(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::MoveWide16(dst, src) => {
+                    let src = self
+                        .current_state
+                        .current_stackframe
+                        .get(src as usize)
+                        .ok_or(VMException::RegisterNotFound(src as usize))?
+                        .to_owned();
+                    self.update_register(dst as usize, src)?;
                 }
 
                 &Instruction::MoveObject(dst_reg, src_reg) => {
@@ -792,13 +918,20 @@ impl VM {
                         .to_owned();
                     self.update_register(dst_reg as usize, src)?;
                 }
+                &Instruction::MoveException(dst) => {
+                    self.update_register(dst as usize, self.current_state.return_reg.clone())?;
+                    self.current_state.return_reg = Register::Empty;
+                }
+                Instruction::MonitorEnter(_) | Instruction::MonitorExit(_) => {}
                 &Instruction::XorInt(dst_a, b) => {
                     let dst: u8 = dst_a.into();
                     let b: u8 = b.into();
                     self.binary_op(dst, dst, b, |a, b| Ok(a ^ b))?;
                 }
-                &Instruction::XorLong(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::XorLong(dst, b) => {
+                    let dst: u8 = dst.into();
+                    let b: u8 = b.into();
+                    self.long_binop(dst, dst, b, |a, b| a ^ b)?;
                 }
                 &Instruction::XorIntDst(dst, a, b) => {
                     self.binary_op(dst, a, b, |a, b| Ok(a ^ b))?;
@@ -806,8 +939,8 @@ impl VM {
                 &Instruction::XorIntDstLit8(dst, a, lit) => {
                     self.binary_op_lit(dst, a, lit, |a, b| a ^ b)?;
                 }
-                &Instruction::XorLongDst(_, _, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::XorLongDst(dst, a, b) => {
+                    self.long_binop(dst, a, b, |a, b| a ^ b)?;
                 }
 
                 &Instruction::XorIntDstLit16(dst, a, lit) => {
@@ -823,8 +956,11 @@ impl VM {
                         Ok(a % b)
                     })?;
                 }
-                &Instruction::RemLongDst(_, _, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::RemLongDst(dst, a, b) => {
+                    if self.reg_wide(b as usize) == Some(0) {
+                        return Err(VMException::InvalidRegisterType);
+                    }
+                    self.long_binop(dst, a, b, |a, b| a % b)?;
                 }
                 &Instruction::RemInt(dst_a, b) => {
                     let dst_a: u8 = dst_a.into();
@@ -837,8 +973,13 @@ impl VM {
                         Ok(a % b)
                     })?;
                 }
-                &Instruction::RemLong(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::RemLong(dst_a, b) => {
+                    let dst_a: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    if self.reg_wide(b as usize) == Some(0) {
+                        return Err(VMException::InvalidRegisterType);
+                    }
+                    self.long_binop(dst_a, dst_a, b, |a, b| a % b)?;
                 }
                 &Instruction::RemIntLit16(dst, a, lit) => {
                     let dst: u8 = dst.into();
@@ -871,6 +1012,61 @@ impl VM {
                         (a as u32).wrapping_shr(b as u32) as i32
                     })?;
                 }
+                &Instruction::ShlIntLit8(dst, a, lit) => {
+                    self.binary_op_lit(dst, a, lit, |a, b| a.wrapping_shl(b as u32))?;
+                }
+                &Instruction::ShlInt(dst_a, b) => {
+                    let dst: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.binary_op(dst, dst, b, |a, b| Ok(a.wrapping_shl(b as u32)))?;
+                }
+                &Instruction::ShrInt(dst_a, b) => {
+                    let dst: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.binary_op(dst, dst, b, |a, b| Ok(a.wrapping_shr(b as u32)))?;
+                }
+                &Instruction::UShrInt(dst_a, b) => {
+                    let dst: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.binary_op(dst, dst, b, |a, b| {
+                        Ok((a as u32).wrapping_shr(b as u32) as i32)
+                    })?;
+                }
+                &Instruction::ShlIntDst(dst, a, b) => {
+                    self.binary_op(dst, a, b, |a, b| Ok(a.wrapping_shl(b as u32)))?;
+                }
+                &Instruction::ShrIntDst(dst, a, b) => {
+                    self.binary_op(dst, a, b, |a, b| Ok(a.wrapping_shr(b as u32)))?;
+                }
+                &Instruction::UShrIntDst(dst, a, b) => {
+                    self.binary_op(dst, a, b, |a, b| {
+                        Ok((a as u32).wrapping_shr(b as u32) as i32)
+                    })?;
+                }
+                &Instruction::ShlLong(dst_a, b) => {
+                    let dst: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.long_binop(dst, dst, b, |a, b| a.wrapping_shl(b as u32))?;
+                }
+                &Instruction::ShrLong(dst_a, b) => {
+                    let dst: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.long_binop(dst, dst, b, |a, b| a.wrapping_shr(b as u32))?;
+                }
+                &Instruction::UShrLong(dst_a, b) => {
+                    let dst: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.long_binop(dst, dst, b, |a, b| a.wrapping_shr(b as u32))?;
+                }
+                &Instruction::ShlLongDst(dst, a, b) => {
+                    self.long_binop(dst, a, b, |a, b| a.wrapping_shl(b as u32))?;
+                }
+                &Instruction::ShrLongDst(dst, a, b) => {
+                    self.long_binop(dst, a, b, |a, b| a.wrapping_shr(b as u32))?;
+                }
+                &Instruction::UShrLongDst(dst, a, b) => {
+                    self.long_binop(dst, a, b, |a, b| a.wrapping_shr(b as u32))?;
+                }
                 &Instruction::AddIntLit16(dst, a, lit) => {
                     let dst: u16 = dst.into();
                     let a: u16 = a.into();
@@ -878,11 +1074,13 @@ impl VM {
                         (a as i16).wrapping_add(b as i16) as i32
                     })?;
                 }
-                Instruction::AddLong(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::AddLong(dst_a, b) => {
+                    let dst_a: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.long_binop(dst_a, dst_a, b, |a, b| a.wrapping_add(b))?;
                 }
-                Instruction::AddLongDst(_, _, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::AddLongDst(dst, a, b) => {
+                    self.long_binop(dst, a, b, |a, b| a.wrapping_add(b))?;
                 }
 
                 &Instruction::MulInt(dst_a, b) => {
@@ -903,11 +1101,13 @@ impl VM {
                         (a as i16).wrapping_mul(b as i16) as i32
                     })?;
                 }
-                Instruction::MulLong(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::MulLong(dst_a, b) => {
+                    let dst_a: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.long_binop(dst_a, dst_a, b, |a, b| a.wrapping_mul(b))?;
                 }
-                Instruction::MulLongDst(_, _, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::MulLongDst(dst, a, b) => {
+                    self.long_binop(dst, a, b, |a, b| a.wrapping_mul(b))?;
                 }
                 &Instruction::DivInt(dst_a, b) => {
                     let dst_a: u8 = dst_a.into();
@@ -927,11 +1127,19 @@ impl VM {
                         (a as i16).wrapping_div(b as i16) as i32
                     })?;
                 }
-                Instruction::DivLong(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::DivLong(dst_a, b) => {
+                    let dst_a: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    if self.reg_wide(b as usize) == Some(0) {
+                        return Err(VMException::InvalidRegisterType);
+                    }
+                    self.long_binop(dst_a, dst_a, b, |a, b| a.wrapping_div(b))?;
                 }
-                Instruction::DivLongDst(_, _, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::DivLongDst(dst, a, b) => {
+                    if self.reg_wide(b as usize) == Some(0) {
+                        return Err(VMException::InvalidRegisterType);
+                    }
+                    self.long_binop(dst, a, b, |a, b| a.wrapping_div(b))?;
                 }
 
                 &Instruction::SubInt(dst_a, b) => {
@@ -952,11 +1160,13 @@ impl VM {
                         (a as i16).wrapping_sub(b as i16) as i32
                     })?;
                 }
-                Instruction::SubLong(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::SubLong(dst_a, b) => {
+                    let dst_a: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.long_binop(dst_a, dst_a, b, |a, b| a.wrapping_sub(b))?;
                 }
-                Instruction::SubLongDst(_, _, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::SubLongDst(dst, a, b) => {
+                    self.long_binop(dst, a, b, |a, b| a.wrapping_sub(b))?;
                 }
 
                 &Instruction::AndInt(dst_a, b) => {
@@ -975,11 +1185,13 @@ impl VM {
                     let a: u16 = a.into();
                     self.binary_op_lit(dst, a, lit, |a, b| a & b)?;
                 }
-                Instruction::AndLong(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::AndLong(dst_a, b) => {
+                    let dst_a: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.long_binop(dst_a, dst_a, b, |a, b| a & b)?;
                 }
-                Instruction::AndLongDst(_, _, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::AndLongDst(dst, a, b) => {
+                    self.long_binop(dst, a, b, |a, b| a & b)?;
                 }
 
                 &Instruction::OrInt(dst_a, b) => {
@@ -998,11 +1210,13 @@ impl VM {
                     let a: u16 = a.into();
                     self.binary_op_lit(dst, a, lit, |a, b| a | b)?;
                 }
-                Instruction::OrLong(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::OrLong(dst_a, b) => {
+                    let dst_a: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.long_binop(dst_a, dst_a, b, |a, b| a | b)?;
                 }
-                Instruction::OrLongDst(_, _, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::OrLongDst(dst, a, b) => {
+                    self.long_binop(dst, a, b, |a, b| a | b)?;
                 }
 
                 &Instruction::Test(test, a, b, offset) => {
@@ -1233,8 +1447,9 @@ impl VM {
                     self.update_register(dst as usize, self.current_state.return_reg.clone())?;
                     self.current_state.return_reg = Register::Empty;
                 }
-                Instruction::MoveResultWide(_) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::MoveResultWide(dst) => {
+                    self.update_register(dst as usize, self.current_state.return_reg.clone())?;
+                    self.current_state.return_reg = Register::Empty;
                 }
                 &Instruction::MoveResultObject(dst) => {
                     self.update_register(dst as usize, self.current_state.return_reg.clone())?;
@@ -1329,8 +1544,25 @@ impl VM {
                     let new_register = Register::Literal(lit);
                     self.update_register(dst, new_register)?;
                 }
-                Instruction::ConstWide => {
-                    return Err(VMException::LinkerError);
+                &Instruction::ConstHigh16(dst, lit) => {
+                    let new_register = Register::Literal(i32::from(lit) << 16);
+                    self.update_register(dst, new_register)?;
+                }
+                &Instruction::ConstWide(dst, lit) => {
+                    let new_register = Register::LiteralWide(lit);
+                    self.update_register(dst, new_register)?;
+                }
+                &Instruction::ConstWideLit16(dst, lit) => {
+                    let new_register = Register::LiteralWide(lit.into());
+                    self.update_register(dst, new_register)?;
+                }
+                &Instruction::ConstWideLit32(dst, lit) => {
+                    let new_register = Register::LiteralWide(lit.into());
+                    self.update_register(dst, new_register)?;
+                }
+                &Instruction::ConstWideHigh16(dst, lit) => {
+                    let new_register = Register::LiteralWide((i64::from(lit) << 48));
+                    self.update_register(dst, new_register)?;
                 }
                 &Instruction::ConstString(dst, reference) => {
                     let const_str = self
@@ -1346,11 +1578,32 @@ impl VM {
                     )?;
                     self.update_register(dst, new_register)?;
                 }
-                Instruction::ConstStringJumbo(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::ConstStringJumbo(dst, reference) => {
+                    let const_str = self
+                        .current_state
+                        .current_dex_file
+                        .get_string(reference as usize)
+                        .ok_or(VMException::StaticDataNotFound(reference))?
+                        .to_string();
+
+                    let new_register = self.new_instance(
+                        StringClass::class_name().to_string(),
+                        Value::Object(StringClass::new(const_str.to_string())),
+                    )?;
+                    self.update_register(dst, new_register)?;
                 }
-                Instruction::ConstClass(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::ConstClass(dst, type_idx) => {
+                    let class = self.get_class(dex_file.clone(), (type_idx) as u32)?;
+                    if let Some(heap_address) = self.malloc() {
+                        self.heap.insert(
+                            heap_address,
+                            Value::Object(ClassInstance::new(class.clone())),
+                        );
+                        let new_register = Register::Reference(class.class_name.clone(), heap_address);
+                        self.update_register(dst, new_register)?;
+                    } else {
+                        return Err(VMException::OutOfMemory);
+                    }
                 }
                 &Instruction::IntToByte(dst, src) | &Instruction::IntToChar(dst, src) => {
                     let dst: u8 = dst.into();
@@ -1361,6 +1614,153 @@ impl VM {
                         let new_val: i8 = val as i8;
                         let new_register = Register::Literal(new_val as i32);
                         self.update_register(dst as usize, new_register)?;
+                    }
+                }
+                &Instruction::IntToShort(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_literal(src as usize) {
+                        self.update_register(dst as usize, Register::Literal(val as i16 as i32))?;
+                    }
+                }
+                &Instruction::IntToLong(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_literal(src as usize) {
+                        self.update_register(dst as usize, Register::LiteralWide(val as i64))?;
+                    }
+                }
+                &Instruction::IntToFloat(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_literal(src as usize) {
+                        self.update_register(
+                            dst as usize,
+                            Register::Literal((val as f32).to_bits() as i32),
+                        )?;
+                    }
+                }
+                &Instruction::IntToDouble(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_literal(src as usize) {
+                        self.update_register(
+                            dst as usize,
+                            Register::LiteralWide((val as f64).to_bits() as i64),
+                        )?;
+                    }
+                }
+                &Instruction::LongToInt(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_wide(src as usize) {
+                        self.update_register(dst as usize, Register::Literal(val as i32))?;
+                    }
+                }
+                &Instruction::LongToFloat(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_wide(src as usize) {
+                        self.update_register(
+                            dst as usize,
+                            Register::Literal((val as f32).to_bits() as i32),
+                        )?;
+                    }
+                }
+                &Instruction::LongToDouble(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_wide(src as usize) {
+                        self.update_register(
+                            dst as usize,
+                            Register::LiteralWide((val as f64).to_bits() as i64),
+                        )?;
+                    }
+                }
+                &Instruction::FloatToInt(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_float(src as usize) {
+                        self.update_register(dst as usize, Register::Literal(val as i32))?;
+                    }
+                }
+                &Instruction::FloatToLong(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_float(src as usize) {
+                        self.update_register(dst as usize, Register::LiteralWide(val as i64))?;
+                    }
+                }
+                &Instruction::FloatToDouble(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_float(src as usize) {
+                        self.update_register(
+                            dst as usize,
+                            Register::LiteralWide((val as f64).to_bits() as i64),
+                        )?;
+                    }
+                }
+                &Instruction::DoubleToInt(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_double(src as usize) {
+                        self.update_register(dst as usize, Register::Literal(val as i32))?;
+                    }
+                }
+                &Instruction::DoubleToLong(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_double(src as usize) {
+                        self.update_register(dst as usize, Register::LiteralWide(val as i64))?;
+                    }
+                }
+                &Instruction::DoubleToFloat(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_double(src as usize) {
+                        self.update_register(
+                            dst as usize,
+                            Register::Literal((val as f32).to_bits() as i32),
+                        )?;
+                    }
+                }
+                &Instruction::NegInt(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_literal(src as usize) {
+                        self.update_register(dst as usize, Register::Literal(val.wrapping_neg()))?;
+                    }
+                }
+                &Instruction::NotInt(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_literal(src as usize) {
+                        self.update_register(dst as usize, Register::Literal(!val))?;
+                    }
+                }
+                &Instruction::NegLong(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_wide(src as usize) {
+                        self.update_register(dst as usize, Register::LiteralWide(val.wrapping_neg()))?;
+                    }
+                }
+                &Instruction::NegFloat(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_literal(src as usize) {
+                        self.update_register(dst as usize, Register::Literal(val ^ 0x8000_0000u32 as i32))?;
+                    }
+                }
+                &Instruction::NegDouble(dst, src) => {
+                    let dst: u8 = dst.into();
+                    let src: u8 = src.into();
+                    if let Some(val) = self.reg_wide(src as usize) {
+                        self.update_register(
+                            dst as usize,
+                            Register::LiteralWide(val ^ 0x8000_0000_0000_0000u64 as i64),
+                        )?;
                     }
                 }
                 &Instruction::ArrayLength(dst, array_ref_reg) => {
@@ -1443,8 +1843,20 @@ impl VM {
                         return Err(VMException::OutOfMemory);
                     }
                 }
-                Instruction::FilledNewArrayRange(_, _, _) => {
-                    return Err(VMException::LinkerError);
+                Instruction::FilledNewArrayRange(first, _type_idx, count) => {
+                    let count = *count as usize;
+                    let mut data = Vec::with_capacity(count);
+                    for i in 0..count {
+                        let val = self.reg_literal(*first as usize + i).unwrap_or(0);
+                        data.extend_from_slice(&val.to_le_bytes());
+                    }
+                    if let Some(heap_address) = self.malloc() {
+                        self.heap.insert(heap_address, Value::Array(data));
+                        self.current_state.return_reg =
+                            Register::Reference("[B".to_string(), heap_address);
+                    } else {
+                        return Err(VMException::OutOfMemory);
+                    }
                 }
                 &Instruction::FillArrayData(reference, data) => {
                     if let Some(Register::Reference(_, reference)) = self
@@ -1804,8 +2216,24 @@ impl VM {
                     let new_register = Register::Literal(*o);
                     self.update_register(dst, new_register)?;
                 }
-                Instruction::StaticGetWide(_, _) => {
-                    return Err(VMException::LinkerError);
+                &Instruction::StaticGetWide(dst, field_idx) => {
+                    let field = if let Some(field) = dex_file.fields.get(field_idx as usize) {
+                        field
+                    } else {
+                        return Err(VMException::ClassNotFound(0));
+                    };
+                    let class_name =
+                        if let Some(c) = dex_file.get_type_name(field.class_idx as usize) {
+                            c.to_string()
+                        } else {
+                            return Err(VMException::ClassNotFound(field.class_idx as u16));
+                        };
+                    let field_name = format!("{}->{}", class_name, field.name);
+                    if let Some((_, addr)) = self.instances.get(&field_name) {
+                        if let Some(Value::Int(o)) = self.heap.get(addr) {
+                            self.update_register(dst, Register::LiteralWide(*o as i64))?;
+                        }
+                    }
                 }
                 &Instruction::StaticGetObject(dst, field_idx) => {
                     let field = if let Some(field) = dex_file.fields.get(field_idx as usize) {
@@ -2129,9 +2557,7 @@ impl VM {
                         return Err(VMException::InvalidRegisterType);
                     }
                 }
-                Instruction::InstanceGetWide(_, _, _) => {
-                    return Err(VMException::LinkerError);
-                }
+                Instruction::InstanceGetWide(_, _, _) => {}
                 &Instruction::InstanceGetObject(dst, instance, field_id) => {
                     let dst: u8 = dst.into();
                     let instance: u8 = instance.into();
@@ -2170,17 +2596,37 @@ impl VM {
                         return Err(VMException::InvalidRegisterType);
                     }
                 }
-                Instruction::InstanceGetBoolean(_, _, _) => {
-                    return Err(VMException::LinkerError);
-                }
-                Instruction::InstanceGetByte(_, _, _) => {
-                    return Err(VMException::LinkerError);
-                }
-                Instruction::InstanceGetChar(_, _, _) => {
-                    return Err(VMException::LinkerError);
-                }
-                Instruction::InstanceGetShort(_, _, _) => {
-                    return Err(VMException::LinkerError);
+                Instruction::InstanceGetBoolean(dst, instance, field_id)
+                | Instruction::InstanceGetByte(dst, instance, field_id)
+                | Instruction::InstanceGetChar(dst, instance, field_id)
+                | Instruction::InstanceGetShort(dst, instance, field_id) => {
+                    let dst: u8 = (*dst).into();
+                    let instance: u8 = (*instance).into();
+                    let field_id = *field_id;
+                    let field = if let Some(field) = dex_file.fields.get(field_id as usize) {
+                        field
+                    } else {
+                        return Err(VMException::ClassNotFound(0));
+                    };
+                    let class_name =
+                        if let Some(c) = dex_file.get_class_by_type(field.class_idx as u32) {
+                            c.class_name.clone()
+                        } else {
+                            return Err(VMException::ClassNotFound(field.class_idx as u16));
+                        };
+                    let field_name = format!("{}->{}", class_name, field.name);
+                    if let Some(Register::Reference(_, instance)) =
+                        self.current_state.current_stackframe.get(instance as usize)
+                    {
+                        if let Some(Value::Object(class_instance)) = self.heap.get(instance) {
+                            if let Some(field_instance) = class_instance.instances.get(&field_name)
+                            {
+                                if let Some(Value::Int(o)) = self.heap.get(field_instance) {
+                                    self.update_register(dst as usize, Register::Literal(*o))?;
+                                }
+                            }
+                        }
+                    }
                 }
                 &Instruction::InstancePut(src, instance, field_id) => {
                     let src: u8 = src.into();
@@ -2262,10 +2708,328 @@ impl VM {
                         }
                     }
                 }
-                Instruction::InstancePutBoolean(_, _, _) => {}
-                Instruction::InstancePutByte(_, _, _) => {}
-                Instruction::InstancePutChar(_, _, _) => {}
-                Instruction::InstancePutShort(_, _, _) => {}
+                Instruction::InstancePutBoolean(src, instance, field_id)
+                | Instruction::InstancePutByte(src, instance, field_id)
+                | Instruction::InstancePutChar(src, instance, field_id)
+                | Instruction::InstancePutShort(src, instance, field_id) => {
+                    let src: u8 = (*src).into();
+                    let instance: u8 = (*instance).into();
+                    let field_id = *field_id;
+                    let field = if let Some(field) = dex_file.fields.get(field_id as usize) {
+                        field
+                    } else {
+                        return Err(VMException::ClassNotFound(0));
+                    };
+                    let class_name =
+                        if let Some(c) = dex_file.get_class_by_type(field.class_idx as u32) {
+                            c.class_name.clone()
+                        } else {
+                            return Err(VMException::ClassNotFound(field.class_idx as u16));
+                        };
+                    let field_name = format!("{}->{}", class_name, field.name);
+                    if let Some(Register::Literal(src_val)) =
+                        self.current_state.current_stackframe.get(src as usize)
+                    {
+                        if let Some(Register::Reference(_, instance)) =
+                            self.current_state.current_stackframe.get(instance as usize)
+                        {
+                            if let Some(Value::Object(class_instance)) = self.heap.get(instance) {
+                                let class_instance = class_instance.clone();
+                                if let Some(field_instance) =
+                                    class_instance.instances.get(&field_name)
+                                {
+                                    if let Some(address) = self.malloc() {
+                                        self.heap
+                                            .entry(address)
+                                            .or_insert(Value::Int(*src_val));
+                                        if let Some(Value::Object(class_instance)) =
+                                            self.heap.get_mut(instance)
+                                        {
+                                            class_instance.instances.insert(field_name, address);
+                                        }
+                                    }
+                                } else {
+                                    let address;
+                                    {
+                                        address = self.malloc();
+                                        if let Some(address) = address {
+                                            self.heap
+                                                .entry(address)
+                                                .or_insert(Value::Int(*src_val));
+                                        }
+                                    }
+                                    if let Some(Value::Object(class_instance)) =
+                                        self.heap.get_mut(instance)
+                                    {
+                                        if let Some(address) = address {
+                                            class_instance.instances.insert(field_name, address);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                &Instruction::CmplFloat(dst, a, b) => {
+                    self.float_cmp(dst, a, b, std::cmp::Ordering::Less)?;
+                }
+                &Instruction::CmpgFloat(dst, a, b) => {
+                    self.float_cmp(dst, a, b, std::cmp::Ordering::Greater)?;
+                }
+                &Instruction::CmplDouble(dst, a, b) => {
+                    self.double_cmp(dst, a, b, std::cmp::Ordering::Less)?;
+                }
+                &Instruction::CmpgDouble(dst, a, b) => {
+                    self.double_cmp(dst, a, b, std::cmp::Ordering::Greater)?;
+                }
+                &Instruction::CmpLong(dst, a, b) => {
+                    let new_register = match (self.reg_wide(a as usize), self.reg_wide(b as usize)) {
+                        (Some(a), Some(b)) => Register::Literal(match a.partial_cmp(&b) {
+                            Some(std::cmp::Ordering::Less) => -1,
+                            Some(std::cmp::Ordering::Equal) => 0,
+                            Some(std::cmp::Ordering::Greater) => 1,
+                            None => 0,
+                        }),
+                        _ => Register::Empty,
+                    };
+                    self.update_register(dst, new_register)?;
+                }
+                &Instruction::AddFloat(dst_a, b) => {
+                    let dst_a: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.float_binop(dst_a, dst_a, b, |a, b| a + b)?;
+                }
+                &Instruction::AddFloatDst(dst, a, b) => {
+                    self.float_binop(dst, a, b, |a, b| a + b)?;
+                }
+                &Instruction::SubFloat(dst_a, b) => {
+                    let dst_a: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.float_binop(dst_a, dst_a, b, |a, b| a - b)?;
+                }
+                &Instruction::SubFloatDst(dst, a, b) => {
+                    self.float_binop(dst, a, b, |a, b| a - b)?;
+                }
+                &Instruction::MulFloat(dst_a, b) => {
+                    let dst_a: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.float_binop(dst_a, dst_a, b, |a, b| a * b)?;
+                }
+                &Instruction::MulFloatDst(dst, a, b) => {
+                    self.float_binop(dst, a, b, |a, b| a * b)?;
+                }
+                &Instruction::DivFloat(dst_a, b) => {
+                    let dst_a: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.float_binop(dst_a, dst_a, b, |a, b| a / b)?;
+                }
+                &Instruction::DivFloatDst(dst, a, b) => {
+                    self.float_binop(dst, a, b, |a, b| a / b)?;
+                }
+                &Instruction::RemFloat(dst_a, b) => {
+                    let dst_a: u8 = dst_a.into();
+                    let b: u8 = b.into();
+                    self.float_binop(dst_a, dst_a, b, |a, b| a % b)?;
+                }
+                &Instruction::RemFloatDst(dst, a, b) => {
+                    self.float_binop(dst, a, b, |a, b| a % b)?;
+                }
+                Instruction::AddDouble(dst_a, b) => {
+                    let dst_a: u8 = (*dst_a).into();
+                    let b: u8 = (*b).into();
+                    self.double_binop(dst_a, dst_a, b, |a, b| a + b)?;
+                }
+                &Instruction::AddDoubleDst(dst, a, b) => {
+                    self.double_binop(dst, a, b, |a, b| a + b)?;
+                }
+                Instruction::SubDouble(dst_a, b) => {
+                    let dst_a: u8 = (*dst_a).into();
+                    let b: u8 = (*b).into();
+                    self.double_binop(dst_a, dst_a, b, |a, b| a - b)?;
+                }
+                &Instruction::SubDoubleDst(dst, a, b) => {
+                    self.double_binop(dst, a, b, |a, b| a - b)?;
+                }
+                Instruction::MulDouble(dst_a, b) => {
+                    let dst_a: u8 = (*dst_a).into();
+                    let b: u8 = (*b).into();
+                    self.double_binop(dst_a, dst_a, b, |a, b| a * b)?;
+                }
+                &Instruction::MulDoubleDst(dst, a, b) => {
+                    self.double_binop(dst, a, b, |a, b| a * b)?;
+                }
+                Instruction::DivDouble(dst_a, b) => {
+                    let dst_a: u8 = (*dst_a).into();
+                    let b: u8 = (*b).into();
+                    self.double_binop(dst_a, dst_a, b, |a, b| a / b)?;
+                }
+                &Instruction::DivDoubleDst(dst, a, b) => {
+                    self.double_binop(dst, a, b, |a, b| a / b)?;
+                }
+                Instruction::RemDouble(dst_a, b) => {
+                    let dst_a: u8 = (*dst_a).into();
+                    let b: u8 = (*b).into();
+                    self.double_binop(dst_a, dst_a, b, |a, b| a % b)?;
+                }
+                &Instruction::RemDoubleDst(dst, a, b) => {
+                    self.double_binop(dst, a, b, |a, b| a % b)?;
+                }
+                &Instruction::ArrayGetWide(dst, array_reference, index) => {
+                    if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
+                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.reg_literal(index as usize),
+                    ) {
+                        if let Some(Value::Array(data)) = self.heap.get(array_reference) {
+                            let start = (index as usize)
+                                .checked_mul(8)
+                                .ok_or(VMException::IndexOutOfBounds)?;
+                            let window = data
+                                .get(start..start + 8)
+                                .ok_or(VMException::IndexOutOfBounds)?;
+                            let mut bytes = [0u8; 8];
+                            bytes.copy_from_slice(window);
+                            let new_register = Register::LiteralWide(i64::from_le_bytes(bytes));
+                            self.update_register(dst, new_register)?;
+                        }
+                    }
+                }
+                &Instruction::ArrayGetBoolean(dst, array_reference, index) => {
+                    if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
+                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.reg_literal(index as usize),
+                    ) {
+                        if let Some(Value::Array(data)) = self.heap.get(array_reference) {
+                            if let Some(&val) = data.get(index as usize) {
+                                let new_register = Register::Literal(i32::from(val != 0));
+                                self.update_register(dst, new_register)?;
+                            }
+                        }
+                    }
+                }
+                &Instruction::ArrayGetShort(dst, array_reference, index) => {
+                    if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
+                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.reg_literal(index as usize),
+                    ) {
+                        if let Some(Value::Array(data)) = self.heap.get(array_reference) {
+                            let start = (index as usize)
+                                .checked_mul(2)
+                                .ok_or(VMException::IndexOutOfBounds)?;
+                            let window = data
+                                .get(start..start + 2)
+                                .ok_or(VMException::IndexOutOfBounds)?;
+                            let bytes = [window[0], window[1]];
+                            let new_register =
+                                Register::Literal(i16::from_le_bytes(bytes) as i32);
+                            self.update_register(dst, new_register)?;
+                        }
+                    }
+                }
+                &Instruction::ArrayGetObject(dst, array_reference, index) => {
+                    if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
+                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.reg_literal(index as usize),
+                    ) {
+                        if let Some(Value::Array(data)) = self.heap.get(array_reference) {
+                            let start = (index as usize)
+                                .checked_mul(4)
+                                .ok_or(VMException::IndexOutOfBounds)?;
+                            let window = data
+                                .get(start..start + 4)
+                                .ok_or(VMException::IndexOutOfBounds)?;
+                            let bytes = [window[0], window[1], window[2], window[3]];
+                            let addr = u32::from_le_bytes(bytes);
+                            let new_register = match self.heap.get(&addr) {
+                                Some(Value::Object(class_instance)) => Register::Reference(
+                                    class_instance.class.class_name.clone(),
+                                    addr,
+                                ),
+                                _ => Register::Empty,
+                            };
+                            self.update_register(dst, new_register)?;
+                        }
+                    }
+                }
+                &Instruction::ArrayPutWide(src, array_reference, index) => {
+                    if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
+                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.reg_literal(index as usize),
+                    ) {
+                        let data = self.reg_wide(src as usize);
+                        if let (Some(Value::Array(data)), Some(val)) = (
+                            self.heap.get_mut(array_reference),
+                            data,
+                        ) {
+                            let start = (index as usize)
+                                .checked_mul(8)
+                                .ok_or(VMException::IndexOutOfBounds)?;
+                            if start + 8 > data.len() {
+                                return Err(VMException::IndexOutOfBounds);
+                            }
+                            data[start..start + 8].copy_from_slice(&val.to_le_bytes());
+                        }
+                    }
+                }
+                &Instruction::ArrayPutBoolean(src, array_reference, index) => {
+                    if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
+                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.reg_literal(index as usize),
+                    ) {
+                         let d =  self.reg_literal(src as usize);
+                        if let Some(Value::Array(data)) = self.heap.get_mut(array_reference) {
+
+                            if let Some(byte) = data.get_mut(index as usize) {
+                                if let Some(val) = d {
+                                    *byte = (val != 0) as u8;
+                                }
+                            } else {
+                                return Err(VMException::IndexOutOfBounds);
+                            }
+                        }
+                    }
+                }
+                &Instruction::ArrayPutShort(src, array_reference, index) => {
+                    if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
+                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.reg_literal(index as usize),
+                    ) {
+                        let d = self.reg_literal(src as usize);
+                        if let (Some(Value::Array(data)), Some(val)) = (
+                            self.heap.get_mut(array_reference),
+                            d
+                        ) {
+                            let start = (index as usize)
+                                .checked_mul(2)
+                                .ok_or(VMException::IndexOutOfBounds)?;
+                            if start + 2 > data.len() {
+                                return Err(VMException::IndexOutOfBounds);
+                            }
+                            data[start..start + 2].copy_from_slice(&(val as i16).to_le_bytes());
+                        }
+                    }
+                }
+                Instruction::InstanceOf(dst, object, type_idx) => {
+                    // let mut result = Register::Literal(0);
+                    // if let Some(Register::Reference(_, instance)) =
+                    //     self.current_state.current_stackframe.get((*object).into() as usize)
+                    // {
+                    //     if let Some(Value::Object(class_instance)) = self.heap.get(instance) {
+                    //         if let Some(type_name) =
+                    //             dex_file.get_type_name((*type_idx) as usize)
+                    //         {
+                    //             if class_instance.class.class_name == *type_name {
+                    //                 result = Register::Literal(1);
+                    //             }
+                    //         }
+                    //     }
+                    // }
+                    // self.update_register((*dst).into() as usize, result)?;
+                }
+                Instruction::Switch(_) | Instruction::SwitchData(_) => {}
+                Instruction::ConstMethodHandle(..)
+                | Instruction::ConstMethodType(..)
+                | Instruction::ConstDynamic(..)
+                | Instruction::InvokeCustom(..) => {}
                 _ => return Err(VMException::LinkerError),
             }
             if matches!(self.current_state.vm_state, ExecutionState::Finished) {

@@ -36,6 +36,7 @@ from coeus_python import AnalyzeObject, DexInstruction
 
 apk = AnalyzeObject("input.apk", False, -1)
 apk.set_debuggable(True)
+apk.set_package_name("com.example.modified")
 apk.allow_plaintext_and_user_certificates()
 apk.add_file("lib/arm64-v8a/libfrida-gadget.so",
              Path("libfrida-gadget.so").read_bytes())
@@ -52,14 +53,57 @@ method.inject_load_library(apk, "frida-gadget", register)
 apk.write_apk("edited-unsigned.apk")
 ```
 
+`set_package_name()` changes the Android install identity in the manifest;
+it does not rename DEX descriptors or package-qualified component names.
 `set_manifest_xml()` replaces the manifest from text, so intent filters and
 other elements can be edited directly. `set_xml_resource()` does the same for
 existing binary-XML resources. The network shortcut bundles a minimal
 network-security XML resource, creates the missing `resources.arsc` entry when
 necessary, enables cleartext traffic, and trusts both the system and user CA
 stores. DEX injection emits `const-string` followed by
-`System.loadLibrary(String)`; choose an available local register. Methods
+`System.loadLibrary(String)`; choose an available local register. The writer
+produces a ZIP-aligned APK, including page-aligned native libraries, but it
+remains unsigned. Methods
 with try/catch or switch/array payloads are rejected for safe insertion.
+
+## Split APKs, signing, and save states
+
+`SplitApkSet` holds one `AnalyzeObject` per APK member and has set-wide
+operations for repacking, signing with the Android SDK's `apksigner`,
+verification, installation, and launching:
+
+```python
+from coeus_python import SplitApkSet
+
+state = SplitApkSet.from_adb("com.example.app", serial="DEVICE")
+base = state.get_base_apk()
+base.set_debuggable(True)
+base.allow_plaintext_and_user_certificates()
+state.save_state("debuggable.coeus")
+state.sign_all("signed", "debug.keystore", "androiddebugkey", "android")
+state.verify_all("signed")
+state.install_all("signed", serial="DEVICE")
+state.launch("com.example.app", serial="DEVICE")
+```
+
+`AnalyzeObject.sign_apk()` and `SplitApkSet.sign_all()` automatically locate
+the newest `apksigner` under `ANDROID_SDK_ROOT`/`ANDROID_HOME`, or use the
+`apksigner=` override. The `.coeus` archive contains the current unsigned
+repacked APK members and `state.json` with high-level actions. Reloading a
+checkpoint with `SplitApkSet.load_state()` is the reliable undo mechanism;
+the action history is not an automatic inverse for arbitrary edits.
+
+For a ready-made interactive workflow, run `python coeus_shell.py` from this
+directory (or `python coeus-python/coeus_shell.py` from the repository root).
+The shell supports `pull`, `load`, `open`, `use`, `manifest`, `debuggable`,
+`plaintext`, `add`, `xml`, `save`, `write`, `sign`, `verify`, `install`, and
+`launch`. `list [REGEX] [SERIAL]` filters installed package names from adb
+before choosing a package to pull. Its `python` command opens a normal Python
+console with every public `coeus_python` object preloaded, plus `state`, `apk`,
+and `shell`; no import statement is needed for full class/method and
+instruction-object editing. Tab completes shell commands and common path
+arguments, and the embedded Python console enables Python identifier and
+attribute completion when readline is available.
 
 ## Native Support
 
