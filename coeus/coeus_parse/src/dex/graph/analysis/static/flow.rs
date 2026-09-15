@@ -118,8 +118,19 @@ impl<'a> Flow<'a> {
                     finished_branches.push(branch.id);
                     continue;
                 }
-                Instruction::Switch(_, table_offset) => {
-                    if let Some((_, Instruction::SwitchData(switch))) =
+                Instruction::PackedSwitch(_, table_offset) | Instruction::SparseSwitch(_, table_offset) => {
+                    if let Some((_, Instruction::PackedSwitchData(switch))) =
+                        self.instructions.get(&(pc + table_offset))
+                    {
+                        for (_, offset) in &switch.targets {
+                            if self.total_branches < 200 {
+                                let mut new_branch = branch.clone();
+                                new_branch.next = Some(pc + *offset as i32);
+                                new_branches.push(new_branch);
+                            }
+                        }
+                    }
+                    if let Some((_, Instruction::SparseSwitchData(switch))) =
                         self.instructions.get(&(pc + table_offset))
                     {
                         for (_, offset) in &switch.targets {

@@ -210,6 +210,25 @@ fn decode_binary_manifest(
     binary_manifest: &[u8],
     binary_resources: &[u8],
 ) -> (String, AndroidManifest) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        decode_binary_manifest_inner(binary_manifest, binary_resources)
+    }));
+    match result {
+        Ok(value) => value,
+        Err(_) => {
+            log::warn!("abxml rejected the APK resource table while decoding the manifest");
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decode_binary_manifest_inner(binary_manifest, &[])
+            }))
+            .unwrap_or_default()
+        }
+    }
+}
+
+fn decode_binary_manifest_inner(
+    binary_manifest: &[u8],
+    binary_resources: &[u8],
+) -> (String, AndroidManifest) {
     let mut visitor = ModelVisitor::default();
     let _ = Executor::arsc(abxml::STR_ARSC, &mut visitor);
     if !binary_resources.is_empty() {
@@ -740,6 +759,24 @@ fn lookup_resource_reference(files: &Files, reference: &str) -> Option<u32> {
 }
 
 fn ensure_xml_resource(files: &mut Files, name: &str, path: &str) -> Result<u32, String> {
+    if files.binary_resource_file.is_empty() {
+        return ensure_xml_resource_from_structured_arsc(files, name, path);
+    }
+
+    let (bytes, resource_id) = add_xml_resource_to_binary_table(
+        &files.binary_resource_file,
+        name,
+        path,
+    )?;
+    files.set_file("resources.arsc", bytes)?;
+    Ok(resource_id)
+}
+
+fn ensure_xml_resource_from_structured_arsc(
+    files: &mut Files,
+    name: &str,
+    path: &str,
+) -> Result<u32, String> {
     let mut table = if files.binary_resource_file.is_empty() {
         let package_name = manifest_package_name(files).unwrap_or_else(|| "coeus".to_string());
         arsc::Arsc {
@@ -861,7 +898,6 @@ fn ensure_xml_resource(files: &mut Files, name: &str, path: &str) -> Result<u32,
         });
     } else {
         for config in &mut type_entry.configs {
-            config.resources.missing_entries += 1;
             config
                 .resources
                 .resources
@@ -935,6 +971,569 @@ fn write_resource_table(
         .map_err(|error| format!("could not write resources.arsc: {error}"))?;
     files.set_file("resources.arsc", bytes)?;
     Ok(resource_id)
+}
+
+/// `arsc` 0.1.x does not preserve sparse entry IDs when it parses a resource
+/// table.  That is especially common for XML resources (for example IDs 0, 6
+/// and 7).  Rewriting such a table through the structured model can therefore
+/// corrupt existing references.  This small binary patcher only appends the
+/// strings, spec, and entry needed for a new XML resource and leaves all
+/// existing bytes and IDs intact.
+fn add_xml_resource_to_binary_table(
+    input: &[u8],
+    name: &str,
+    path: &str,
+) -> Result<(Vec<u8>, u32), String> {
+    let root_header = checked_u16(input, 2, "resources.arsc header")? as usize;
+    let root_size = checked_u32(input, 4, "resources.arsc size")? as usize;
+    if root_header < 12 || root_size != input.len() || checked_u32(input, 8, "package count")? == 0
+    {
+        return Err("invalid resources.arsc table header".to_string());
+    }
+
+    let global_start = root_header;
+    let global_size = chunk_size(input, global_start)?;
+    let global_end = global_start
+        .checked_add(global_size)
+        .ok_or_else(|| "global resource string pool overflows".to_string())?;
+    if global_end > input.len() || checked_u16(input, global_start, "global string pool")? != 1 {
+        return Err("resources.arsc has no valid global string pool".to_string());
+    }
+
+    let mut package_ranges = Vec::new();
+    let mut offset = global_end;
+    while offset < input.len() {
+        let size = chunk_size(input, offset)?;
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| "resource package overflows".to_string())?;
+        if end > input.len() {
+            return Err("resource package extends beyond resources.arsc".to_string());
+        }
+        if checked_u16(input, offset, "resource package")? == 0x0200 {
+            package_ranges.push((offset, end));
+        }
+        offset = end;
+    }
+    if package_ranges.is_empty() {
+        return Err("resources.arsc contains no package".to_string());
+    }
+
+    // First resolve an already existing resource.  This avoids needlessly
+    // changing the table when an APK already bundles the convenience file.
+    for &(start, end) in &package_ranges {
+        if let Some(resource_id) = find_xml_resource_id(&input[start..end], name)? {
+            return Ok((input.to_vec(), resource_id));
+        }
+    }
+
+    let (global_chunk, path_index) = append_string_pool_string(
+        &input[global_start..global_end],
+        path,
+        "global resource string pool",
+    )?;
+
+    let mut output = Vec::with_capacity(input.len() + global_chunk.len() - global_size);
+    output.extend_from_slice(&input[..global_start]);
+    output.extend_from_slice(&global_chunk);
+
+    let mut resource_id = None;
+    offset = global_end;
+    while offset < input.len() {
+        let size = chunk_size(input, offset)?;
+        let end = offset + size;
+        let chunk = &input[offset..end];
+        if checked_u16(chunk, 0, "resource table chunk")? == 0x0200 && resource_id.is_none() {
+            let package_id = checked_u32(chunk, 8, "resource package ID")?;
+            let (patched, id) = add_xml_resource_to_package(chunk, name, path_index)?;
+            resource_id = Some((package_id << 24) | id);
+            output.extend_from_slice(&patched);
+        } else {
+            output.extend_from_slice(chunk);
+        }
+        offset = end;
+    }
+
+    let resource_id = resource_id.ok_or_else(|| {
+        "resources.arsc has no application resource package with an XML type".to_string()
+    })?;
+    if output.len() > u32::MAX as usize {
+        return Err("resources.arsc is too large".to_string());
+    }
+    let output_size = output.len() as u32;
+    write_u32(&mut output, 4, output_size);
+    Ok((output, resource_id))
+}
+
+fn add_xml_resource_to_package(
+    input: &[u8],
+    name: &str,
+    path_index: u32,
+) -> Result<(Vec<u8>, u32), String> {
+    let package_header = checked_u16(input, 2, "resource package header")? as usize;
+    let package_size = checked_u32(input, 4, "resource package size")? as usize;
+    if package_header < 0x0120 || package_size != input.len() {
+        return Err("invalid resource package bounds".to_string());
+    }
+    let type_pool_offset = checked_u32(input, 268, "type string pool offset")? as usize;
+    let key_pool_offset = checked_u32(input, 276, "key string pool offset")? as usize;
+    let type_pool_end = type_pool_offset
+        .checked_add(chunk_size(input, type_pool_offset)? as usize)
+        .ok_or_else(|| "type string pool overflows package".to_string())?;
+    let key_pool_end = key_pool_offset
+        .checked_add(chunk_size(input, key_pool_offset)? as usize)
+        .ok_or_else(|| "key string pool overflows package".to_string())?;
+    if type_pool_end > input.len()
+        || key_pool_end > input.len()
+        || checked_u16(input, type_pool_offset, "type string pool")? != 1
+        || checked_u16(input, key_pool_offset, "key string pool")? != 1
+    {
+        return Err("invalid resource package string pools".to_string());
+    }
+
+    let type_names = parse_resource_string_pool(&input[type_pool_offset..type_pool_end])?;
+    let key_names = parse_resource_string_pool(&input[key_pool_offset..key_pool_end])?;
+    let Some(xml_type_id) = type_names.iter().position(|value| value == "xml").map(|i| i + 1)
+    else {
+        return Err("resources.arsc has no XML resource type".to_string());
+    };
+    let key_index = key_names
+        .iter()
+        .position(|value| value == name)
+        .map(|index| index as u32)
+        .unwrap_or(key_names.len() as u32);
+
+    let chunks = package_chunk_ranges(input, package_header)?;
+    let mut spec_count = None;
+    let mut has_xml_config = false;
+    for &(start, end) in &chunks {
+        let kind = checked_u16(input, start, "package child chunk")?;
+        if kind == 0x0202 && checked_u8(input, start + 8, "type spec ID")? as usize == xml_type_id {
+            spec_count = Some(checked_u32(input, start + 12, "type spec count")? as usize);
+        } else if kind == 0x0201
+            && checked_u8(input, start + 8, "resource type ID")? as usize == xml_type_id
+        {
+            has_xml_config = true;
+        }
+        if end > input.len() {
+            return Err("resource package child exceeds package".to_string());
+        }
+    }
+    let spec_count = spec_count.ok_or_else(|| "XML resource type has no spec chunk".to_string())?;
+    if !has_xml_config {
+        return Err("XML resource type has no configuration chunk".to_string());
+    }
+    let new_entry_id = spec_count;
+
+    let mut output = Vec::with_capacity(input.len() + 256);
+    output.extend_from_slice(&input[..package_header]);
+    let mut key_pool_written = false;
+    let mut default_config_seen = false;
+    for &(start, end) in &chunks {
+        let kind = checked_u16(input, start, "package child chunk")?;
+        let child = &input[start..end];
+        if start == key_pool_offset {
+            let (pool, _) = append_string_pool_string(child, name, "key resource string pool")?;
+            output.extend_from_slice(&pool);
+            key_pool_written = true;
+        } else if kind == 0x0202
+            && checked_u8(input, start + 8, "type spec ID")? as usize == xml_type_id
+        {
+            let mut patched = child.to_vec();
+            let old_count = checked_u32(child, 12, "type spec count")? as usize;
+            if old_count != new_entry_id {
+                return Err("resource type spec count changed while patching".to_string());
+            }
+            patched.extend_from_slice(&0u32.to_le_bytes());
+            write_u32(&mut patched, 12, (old_count + 1) as u32);
+            let patched_size = patched.len() as u32;
+            write_u32(&mut patched, 4, patched_size);
+            output.extend_from_slice(&patched);
+        } else if kind == 0x0201
+            && checked_u8(input, start + 8, "resource type ID")? as usize == xml_type_id
+        {
+            let is_default = is_default_resource_config(child)?;
+            let should_add = is_default && !default_config_seen;
+            if should_add {
+                default_config_seen = true;
+            }
+            let patched = expand_resource_config(child, new_entry_id, key_index, path_index, should_add)?;
+            output.extend_from_slice(&patched);
+        } else {
+            output.extend_from_slice(child);
+        }
+    }
+    if !key_pool_written {
+        return Err("key string pool was not found in resource package".to_string());
+    }
+    if !default_config_seen {
+        return Err("resource package has no default XML configuration".to_string());
+    }
+    let output_size = output.len() as u32;
+    write_u32(&mut output, 4, output_size);
+    let resource_id = ((xml_type_id as u32) << 16) | new_entry_id as u32;
+    Ok((output, resource_id))
+}
+
+fn find_xml_resource_id(package: &[u8], name: &str) -> Result<Option<u32>, String> {
+    let package_header = checked_u16(package, 2, "resource package header")? as usize;
+    let package_id = checked_u32(package, 8, "resource package ID")?;
+    let type_pool_offset = checked_u32(package, 268, "type string pool offset")? as usize;
+    let key_pool_offset = checked_u32(package, 276, "key string pool offset")? as usize;
+    let type_pool_end = type_pool_offset + chunk_size(package, type_pool_offset)? as usize;
+    let key_pool_end = key_pool_offset + chunk_size(package, key_pool_offset)? as usize;
+    let type_names = parse_resource_string_pool(&package[type_pool_offset..type_pool_end])?;
+    let key_names = parse_resource_string_pool(&package[key_pool_offset..key_pool_end])?;
+    let Some(key_index) = key_names.iter().position(|value| value == name) else {
+        return Ok(None);
+    };
+    let Some(xml_type_id) = type_names.iter().position(|value| value == "xml").map(|i| i + 1)
+    else {
+        return Ok(None);
+    };
+    for (start, end) in package_chunk_ranges(package, package_header)? {
+        if checked_u16(package, start, "package child chunk")? != 0x0201
+            || checked_u8(package, start + 8, "resource type ID")? as usize != xml_type_id
+        {
+            continue;
+        }
+        let count = checked_u32(package, start + 12, "resource entry count")? as usize;
+        let entry_start = checked_u32(package, start + 16, "resource entry start")? as usize;
+        let header_size = checked_u16(package, start + 2, "resource type header")? as usize;
+        let offsets_start = start + header_size;
+        let sparse = checked_u8(package, start + 9, "resource type flags")? & 0x01 != 0;
+        for entry_id in 0..count {
+            let raw_offset = checked_u32(package, offsets_start + entry_id * 4, "resource entry offset")?;
+            let (entry_id, entry_offset) = if sparse {
+                (((raw_offset & 0xffff) as usize), ((raw_offset >> 16) * 4))
+            } else {
+                (entry_id, raw_offset)
+            };
+            if !sparse && entry_offset == u32::MAX {
+                continue;
+            }
+            let entry = start
+                .checked_add(entry_start)
+                .and_then(|base| base.checked_add(entry_offset as usize))
+                .ok_or_else(|| "resource entry overflows package".to_string())?;
+            if checked_u32(package, entry + 4, "resource entry name")? as usize == key_index {
+                return Ok(Some((package_id << 24) | ((xml_type_id as u32) << 16) | entry_id as u32));
+            }
+        }
+        let _ = end;
+    }
+    Ok(None)
+}
+
+fn expand_resource_config(
+    input: &[u8],
+    entry_id: usize,
+    key_index: u32,
+    path_index: u32,
+    add_entry: bool,
+) -> Result<Vec<u8>, String> {
+    let header_size = checked_u16(input, 2, "resource config header")? as usize;
+    let old_count = checked_u32(input, 12, "resource entry count")? as usize;
+    let entry_start = checked_u32(input, 16, "resource entry start")? as usize;
+    let sparse = checked_u8(input, 9, "resource type flags")? & 0x01 != 0;
+    if entry_start < header_size || entry_start > input.len() {
+        return Err("invalid resource config entry table".to_string());
+    }
+    if sparse {
+        if entry_id > u16::MAX as usize {
+            return Err("new sparse XML resource ID is too large".to_string());
+        }
+        for index in 0..old_count {
+            let offset = checked_u32(input, header_size + index * 4, "sparse resource entry")?;
+            if (offset & 0xffff) as usize == entry_id {
+                return Err("new XML resource ID is already occupied".to_string());
+            }
+        }
+        if !add_entry {
+            return Ok(input.to_vec());
+        }
+    } else if entry_id < old_count {
+        let offset = checked_u32(input, header_size + entry_id * 4, "resource entry offset")?;
+        if offset != u32::MAX {
+            return Err("new XML resource ID is already occupied".to_string());
+        }
+    }
+    let new_count = if sparse { old_count + 1 } else { old_count.max(entry_id + 1) };
+    let added_slots = new_count - old_count;
+    let entry_data = &input[entry_start..];
+    let delta = added_slots * 4;
+    let mut output = Vec::with_capacity(input.len() + delta + if add_entry { 16 } else { 0 });
+    output.extend_from_slice(&input[..header_size]);
+    for index in 0..old_count {
+        let offset = checked_u32(input, header_size + index * 4, "resource entry offset")?;
+        if sparse {
+            output.extend_from_slice(&offset.to_le_bytes());
+        } else {
+            output.extend_from_slice(&offset.to_le_bytes());
+        }
+    }
+    if sparse {
+        let entry_offset = entry_data.len() / 4;
+        if entry_offset > u16::MAX as usize {
+            return Err("sparse XML resource data is too large".to_string());
+        }
+        output.extend_from_slice(&(entry_id as u16).to_le_bytes());
+        output.extend_from_slice(&(entry_offset as u16).to_le_bytes());
+    } else {
+        for index in old_count..new_count {
+            let offset = if add_entry && index == entry_id {
+                entry_data.len() as u32
+            } else {
+                u32::MAX
+            };
+            output.extend_from_slice(&offset.to_le_bytes());
+        }
+    }
+    output.extend_from_slice(entry_data);
+    if add_entry {
+        output.extend_from_slice(&resource_entry_bytes(key_index, path_index));
+    }
+    write_u32(&mut output, 16, (entry_start + delta) as u32);
+    write_u32(&mut output, 12, new_count as u32);
+    let output_size = output.len() as u32;
+    write_u32(&mut output, 4, output_size);
+    Ok(output)
+}
+
+fn resource_entry_bytes(key_index: u32, path_index: u32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&8u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&key_index.to_le_bytes());
+    bytes.extend_from_slice(&8u16.to_le_bytes());
+    bytes.push(0);
+    bytes.push(0x03);
+    bytes.extend_from_slice(&path_index.to_le_bytes());
+    bytes
+}
+
+fn is_default_resource_config(input: &[u8]) -> Result<bool, String> {
+    let header_size = checked_u16(input, 2, "resource config header")? as usize;
+    if header_size < 24 || header_size > input.len() {
+        return Err("invalid resource config header size".to_string());
+    }
+    // The first four bytes of ResTable_config contain its size.  All fields
+    // after that are zero for the default configuration.
+    Ok(input[24..header_size].iter().all(|byte| *byte == 0))
+}
+
+fn append_string_pool_string(
+    input: &[u8],
+    value: &str,
+    description: &str,
+) -> Result<(Vec<u8>, u32), String> {
+    let (strings, flags, string_start, style_start, style_count) = parse_string_pool_metadata(input, description)?;
+    if let Some(index) = strings.iter().position(|current| current == value) {
+        return Ok((input.to_vec(), index as u32));
+    }
+    let utf8 = flags & 0x0000_0100 != 0;
+    let encoded = encode_resource_string(value, utf8)?;
+    let old_string_data_end = if style_count == 0 { input.len() } else { style_start };
+    if old_string_data_end < string_start || old_string_data_end > input.len() {
+        return Err(format!("invalid {description} string data bounds"));
+    }
+    let old_count = strings.len();
+    let offsets_start = 28usize;
+    let old_style_offsets_start = offsets_start + old_count * 4;
+    let old_string_data = &input[string_start..old_string_data_end];
+    let style_offsets = &input[old_style_offsets_start..string_start];
+    let styles = if style_count == 0 { &input[input.len()..] } else { &input[style_start..] };
+    let mut output = Vec::with_capacity(input.len() + 4 + encoded.len() + 4);
+    let mut header = input[..28].to_vec();
+    write_u32(&mut header, 8, (old_count + 1) as u32);
+    write_u32(&mut header, 16, flags);
+    let new_string_start = string_start + 4;
+    write_u32(&mut header, 20, new_string_start as u32);
+    output.extend_from_slice(&header);
+    let mut new_string_data = old_string_data.to_vec();
+    let new_index_offset = new_string_data.len() as u32;
+    new_string_data.extend_from_slice(&encoded);
+    while new_string_data.len() % 4 != 0 {
+        new_string_data.push(0);
+    }
+    let new_style_start = if style_count == 0 {
+        0
+    } else {
+        new_string_start + new_string_data.len()
+    };
+    write_u32(&mut output, 24, new_style_start as u32);
+    output.extend_from_slice(&input[offsets_start..old_style_offsets_start]);
+    output.extend_from_slice(&new_index_offset.to_le_bytes());
+    output.extend_from_slice(style_offsets);
+    output.extend_from_slice(&new_string_data);
+    output.extend_from_slice(styles);
+    let output_size = output.len() as u32;
+    write_u32(&mut output, 4, output_size);
+    Ok((output, old_count as u32))
+}
+
+fn encode_resource_string(value: &str, utf8: bool) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    if utf8 {
+        append_resource_length(&mut output, value.chars().count())?;
+        append_resource_length(&mut output, value.len())?;
+        output.extend_from_slice(value.as_bytes());
+        output.push(0);
+    } else {
+        let units = value.encode_utf16().collect::<Vec<_>>();
+        if units.len() > 0x7fff {
+            return Err("resource string is too long".to_string());
+        }
+        output.extend_from_slice(&(units.len() as u16).to_le_bytes());
+        for unit in units {
+            output.extend_from_slice(&unit.to_le_bytes());
+        }
+        output.extend_from_slice(&0u16.to_le_bytes());
+    }
+    Ok(output)
+}
+
+fn append_resource_length(output: &mut Vec<u8>, value: usize) -> Result<(), String> {
+    if value > 0x7fff {
+        return Err("resource string is too long".to_string());
+    }
+    if value > 0x7f {
+        output.push(((value >> 8) as u8) | 0x80);
+        output.push(value as u8);
+    } else {
+        output.push(value as u8);
+    }
+    Ok(())
+}
+
+fn parse_resource_string_pool(input: &[u8]) -> Result<Vec<String>, String> {
+    Ok(parse_string_pool_metadata(input, "string pool")?.0)
+}
+
+fn parse_string_pool_metadata(
+    input: &[u8],
+    description: &str,
+) -> Result<(Vec<String>, u32, usize, usize, usize), String> {
+    if input.len() < 28 || checked_u16(input, 0, description)? != 1 {
+        return Err(format!("invalid {description}"));
+    }
+    let count = checked_u32(input, 8, description)? as usize;
+    let style_count = checked_u32(input, 12, description)? as usize;
+    let flags = checked_u32(input, 16, description)?;
+    let string_start = checked_u32(input, 20, description)? as usize;
+    let style_start = checked_u32(input, 24, description)? as usize;
+    let offsets_end = 28usize
+        .checked_add(count * 4)
+        .and_then(|end| end.checked_add(style_count * 4))
+        .ok_or_else(|| format!("{description} offsets overflow"))?;
+    let string_end = if style_count == 0 { input.len() } else { style_start };
+    if offsets_end > input.len() || string_start < offsets_end || string_end > input.len() {
+        return Err(format!("invalid {description} offsets"));
+    }
+    let utf8 = flags & 0x0000_0100 != 0;
+    let mut strings = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = checked_u32(input, 28 + index * 4, description)? as usize;
+        let mut cursor = string_start
+            .checked_add(offset)
+            .ok_or_else(|| format!("{description} string offset overflow"))?;
+        if cursor >= string_end {
+            return Err(format!("invalid {description} string offset"));
+        }
+        let value = if utf8 {
+            let _chars = read_resource_length(input, &mut cursor, string_end)?;
+            let bytes = read_resource_length(input, &mut cursor, string_end)?;
+            let end = cursor.checked_add(bytes).ok_or_else(|| format!("{description} string overflow"))?;
+            if end >= string_end {
+                return Err(format!("invalid {description} UTF-8 string"));
+            }
+            let value = std::str::from_utf8(&input[cursor..end])
+                .map_err(|_| format!("invalid UTF-8 in {description}"))?
+                .to_string();
+            if input[end] != 0 {
+                return Err(format!("unterminated {description} string"));
+            }
+            value
+        } else {
+            let length = checked_u16(input, cursor, description)? as usize;
+            cursor += 2;
+            let end = cursor.checked_add(length * 2).ok_or_else(|| format!("{description} UTF-16 string overflow"))?;
+            if end + 2 > string_end {
+                return Err(format!("invalid {description} UTF-16 string"));
+            }
+            let mut units = Vec::with_capacity(length);
+            for position in (cursor..end).step_by(2) {
+                units.push(checked_u16(input, position, description)?);
+            }
+            String::from_utf16(&units).map_err(|_| format!("invalid UTF-16 in {description}"))?
+        };
+        strings.push(value);
+    }
+    Ok((strings, flags, string_start, style_start, style_count))
+}
+
+fn read_resource_length(input: &[u8], cursor: &mut usize, end: usize) -> Result<usize, String> {
+    if *cursor >= end {
+        return Err("truncated resource string length".to_string());
+    }
+    let first = input[*cursor];
+    *cursor += 1;
+    if first & 0x80 == 0 {
+        Ok(first as usize)
+    } else if *cursor < end {
+        let second = input[*cursor];
+        *cursor += 1;
+        Ok((((first & 0x7f) as usize) << 8) | second as usize)
+    } else {
+        Err("truncated resource string length".to_string())
+    }
+}
+
+fn package_chunk_ranges(input: &[u8], header_size: usize) -> Result<Vec<(usize, usize)>, String> {
+    let package_size = input.len();
+    let mut ranges = Vec::new();
+    let mut offset = header_size;
+    while offset < package_size {
+        let size = chunk_size(input, offset)?;
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| "package child chunk overflows".to_string())?;
+        if end > package_size {
+            return Err("package child chunk exceeds package".to_string());
+        }
+        ranges.push((offset, end));
+        offset = end;
+    }
+    Ok(ranges)
+}
+
+fn chunk_size(input: &[u8], offset: usize) -> Result<usize, String> {
+    let size = checked_u32(input, offset + 4, "resource chunk size")? as usize;
+    if size < 8 {
+        return Err("resource chunk has an invalid size".to_string());
+    }
+    Ok(size)
+}
+
+fn checked_u8(input: &[u8], offset: usize, description: &str) -> Result<u8, String> {
+    input
+        .get(offset)
+        .copied()
+        .ok_or_else(|| format!("truncated {description}"))
+}
+
+fn checked_u16(input: &[u8], offset: usize, description: &str) -> Result<u16, String> {
+    let bytes = input
+        .get(offset..offset + 2)
+        .ok_or_else(|| format!("truncated {description}"))?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn checked_u32(input: &[u8], offset: usize, description: &str) -> Result<u32, String> {
+    let bytes = input
+        .get(offset..offset + 4)
+        .ok_or_else(|| format!("truncated {description}"))?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 fn push_u16(output: &mut Vec<u8>, value: u16) {
@@ -1555,4 +2154,5 @@ mod tests {
         assert!(archive.by_name("resources.arsc").is_ok());
         assert!(archive.by_name("classes.dex").is_ok());
     }
+
 }

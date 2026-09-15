@@ -16,6 +16,7 @@ use ux::{i4, u4};
 #[derive(Clone, Hash, Eq, PartialEq)]
 pub enum Instruction {
     Nop,
+    MoveException(u8),
 
     Move(u4, u4),
     MoveFrom16(u8, u16),
@@ -26,6 +27,9 @@ pub enum Instruction {
     MoveObject(u4, u4),
     MoveObjectFrom16(u8, u16),
     MoveObject16(u16, u16),
+
+    MonitorEnter(u8),
+    MonitorExit(u8),
 
     XorInt(u4, u4),
     XorLong(u4, u4),
@@ -90,10 +94,26 @@ pub enum Instruction {
     Goto16(i16),
     Goto32(i32),
 
+    ArrayGetWide(u8, u8, u8),
+    ArrayGetObject(u8, u8, u8),
+    ArrayGetBoolean(u8, u8, u8),
     ArrayGetByte(u8, u8, u8),
-    ArrayPutByte(u8, u8, u8),
     ArrayGetChar(u8, u8, u8),
+    ArrayGetShort(u8, u8, u8),
+    ArrayPutWide(u8, u8, u8),
+    ArrayPutObject(u8, u8, u8),
+    ArrayPutBoolean(u8, u8, u8),
+    ArrayPutByte(u8, u8, u8),
     ArrayPutChar(u8, u8, u8),
+    ArrayPutShort(u8, u8, u8),
+
+    CmplFloat(u8, u8, u8),
+    CmpFloat(u8, u8, u8),
+    CmpDouble(u8, u8, u8),
+    CmpgFloat(u8, u8, u8),
+    CmplDouble(u8, u8, u8),
+    CmpgDouble(u8, u8, u8),
+    CmpLong(u8, u8, u8),
 
     Invoke(u16),
 
@@ -109,6 +129,7 @@ pub enum Instruction {
     InvokeStaticRange(u8, u16, u16),
     InvokeInterfaceRange(u8, u16, u16),
 
+    InvokeCustom(u4, u16, Vec<u8>),
     InvokeType(String),
 
     MoveResult(u8),
@@ -119,18 +140,42 @@ pub enum Instruction {
 
     Return(u8),
 
-    Const,
     ConstLit4(u4, i4),
+    Const,
     ConstLit16(u8, i16),
     ConstLit32(u8, i32),
     ConstWide,
+    ConstWideLit16(u8, i16),
+    ConstWideLit32(u8, i32),
+    ConstWideHigh16(u8, i16),
     ConstString(u8, u16),
     ConstStringJumbo(u8, u32),
     ConstClass(u8, u16),
     CheckCast(u8, u16),
+    InstanceOf(u4, u4, u16),
 
     IntToByte(u4, u4),
     IntToChar(u4, u4),
+    IntToLong(u4, u4),
+    IntToFloat(u4, u4),
+    IntToDouble(u4, u4),
+    LongToInt(u4, u4),
+    LongToFloat(u4, u4),
+    LongToDouble(u4, u4),
+    FloatToInt(u4, u4),
+    FloatToLong(u4, u4),
+    FloatToDouble(u4, u4),
+    DoubleToInt(u4, u4),
+    DoubleToLong(u4, u4),
+    DoubleToFloat(u4, u4),
+    IntToShort(u4, u4),
+
+    NegInt(u4, u4),
+    NegLong(u4, u4),
+    NegFloat(u4, u4),
+    NegDouble(u4, u4),
+    NotInt(u4, u4),
+
     ArrayLength(u4, u4),
     NewInstance(u8, u16),
     NewInstanceType(String),
@@ -155,7 +200,9 @@ pub enum Instruction {
     StaticPutChar(u8, u16),
     StaticPutShort(u8, u16),
 
-    Switch(u8, i32),
+    PackedSwitch(u8, i32),
+    SparseSwitch(u8, i32),
+    Switch(Switch),
     InstanceGet(u4, u4, u16),
     InstanceGetWide(u4, u4, u16),
     InstanceGetObject(u4, u4, u16),
@@ -172,11 +219,53 @@ pub enum Instruction {
     InstancePutShort(u4, u4, u16),
     Throw(u8),
 
+    AddFloat(u4, u4),
+    AddFloatDst(u8, u8, u8),
+    SubFloat(u4, u4),
+    SubFloatDst(u8, u8, u8),
+    MulFloat(u4, u4),
+    MulFloatDst(u8, u8, u8),
+    DivFloat(u4, u4),
+    DivFloatDst(u8, u8, u8),
+    RemFloat(u4, u4),
+    RemFloatDst(u8, u8, u8),
+
+    AddDouble(u4, u4),
+    AddDoubleDst(u8, u8, u8),
+    SubDouble(u4, u4),
+    SubDoubleDst(u8, u8, u8),
+    MulDouble(u4, u4),
+    MulDoubleDst(u8, u8, u8),
+    DivDouble(u4, u4),
+    DivDoubleDst(u8, u8, u8),
+    RemDouble(u4, u4),
+    RemDoubleDst(u8, u8, u8),
+
+    ShlInt(u4, u4),
+    ShrInt(u4, u4),
+    UShrInt(u4, u4),
+    ShlIntDst(u8, u8, u8),
+    ShrIntDst(u8, u8, u8),
+    UShrIntDst(u8, u8, u8),
+    ShlIntLit8(u8, u8, u8),
     ShrIntLit8(u8, u8, u8),
     UShrIntLit8(u8, u8, u8),
 
+    ShlLong(u4, u4),
+    ShrLong(u4, u4),
+    UShrLong(u4, u4),
+    ShlLongDst(u8, u8, u8),
+    ShrLongDst(u8, u8, u8),
+    UShrLongDst(u8, u8, u8),
+
+    ConstMethodHandle(u8, u16),
+    ConstMethodType(u8, u16),
+    ConstDynamic(u8, u16, u32),
+
     NotImpl(u8, u8),
     ArrayData(u16, Vec<u8>),
+    PackedSwitchData(Switch),
+    SparseSwitchData(Switch),
     SwitchData(Switch),
     ArbitraryData(String),
 }
@@ -185,589 +274,15 @@ impl Debug for Instruction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Nop => write!(f, "Nop"),
-            Self::Move(arg0, arg1) => f.debug_tuple("Move").field(arg0).field(arg1).finish(),
-            Self::MoveFrom16(arg0, arg1) => {
-                f.debug_tuple("MoveFrom16").field(arg0).field(arg1).finish()
-            }
-            Self::Move16(arg0, arg1) => f.debug_tuple("Move16").field(arg0).field(arg1).finish(),
-            Self::MoveWide(arg0, arg1) => {
-                f.debug_tuple("MoveWide").field(arg0).field(arg1).finish()
-            }
-            Self::MoveWideFrom16(arg0, arg1) => f
-                .debug_tuple("MoveWideFrom16")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::MoveWide16(arg0, arg1) => {
-                f.debug_tuple("MoveWide16").field(arg0).field(arg1).finish()
-            }
-            Self::MoveObject(arg0, arg1) => {
-                f.debug_tuple("MoveObject").field(arg0).field(arg1).finish()
-            }
-            Self::MoveObjectFrom16(arg0, arg1) => f
-                .debug_tuple("MoveObjectFrom16")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::MoveObject16(arg0, arg1) => f
-                .debug_tuple("MoveObject16")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::XorInt(arg0, arg1) => f.debug_tuple("XorInt").field(arg0).field(arg1).finish(),
-            Self::XorLong(arg0, arg1) => f.debug_tuple("XorLong").field(arg0).field(arg1).finish(),
-            Self::XorIntDst(arg0, arg1, arg2) => f
-                .debug_tuple("XorIntDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::XorLongDst(arg0, arg1, arg2) => f
-                .debug_tuple("XorLongDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::XorIntDstLit8(arg0, arg1, arg2) => f
-                .debug_tuple("XorIntDstLit8")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::XorIntDstLit16(arg0, arg1, arg2) => f
-                .debug_tuple("XorIntDstLit16")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::RemIntDst(arg0, arg1, arg2) => f
-                .debug_tuple("RemIntDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::RemLongDst(arg0, arg1, arg2) => f
-                .debug_tuple("RemLongDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::RemInt(arg0, arg1) => f.debug_tuple("RemInt").field(arg0).field(arg1).finish(),
-            Self::RemLong(arg0, arg1) => f.debug_tuple("RemLong").field(arg0).field(arg1).finish(),
-            Self::RemIntLit16(arg0, arg1, arg2) => f
-                .debug_tuple("RemIntLit16")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::RemIntLit8(arg0, arg1, arg2) => f
-                .debug_tuple("RemIntLit8")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::AddInt(arg0, arg1) => f.debug_tuple("AddInt").field(arg0).field(arg1).finish(),
-            Self::AddIntDst(arg0, arg1, arg2) => f
-                .debug_tuple("AddIntDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::AddIntLit8(arg0, arg1, arg2) => f
-                .debug_tuple("AddIntLit8")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::AddIntLit16(arg0, arg1, arg2) => f
-                .debug_tuple("AddIntLit16")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::AddLong(arg0, arg1) => f.debug_tuple("AddLong").field(arg0).field(arg1).finish(),
-            Self::AddLongDst(arg0, arg1, arg2) => f
-                .debug_tuple("AddLongDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::SubInt(arg0, arg1) => f.debug_tuple("SubInt").field(arg0).field(arg1).finish(),
-            Self::SubIntDst(arg0, arg1, arg2) => f
-                .debug_tuple("SubIntDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::SubIntLit8(arg0, arg1, arg2) => f
-                .debug_tuple("SubIntLit8")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::SubIntLit16(arg0, arg1, arg2) => f
-                .debug_tuple("SubIntLit16")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::SubLong(arg0, arg1) => f.debug_tuple("SubLong").field(arg0).field(arg1).finish(),
-            Self::SubLongDst(arg0, arg1, arg2) => f
-                .debug_tuple("SubLongDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::MulInt(arg0, arg1) => f.debug_tuple("MulInt").field(arg0).field(arg1).finish(),
-            Self::MulIntDst(arg0, arg1, arg2) => f
-                .debug_tuple("MulIntDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::MulIntLit8(arg0, arg1, arg2) => f
-                .debug_tuple("MulIntLit8")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::MulIntLit16(arg0, arg1, arg2) => f
-                .debug_tuple("MulIntLit16")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::MulLong(arg0, arg1) => f.debug_tuple("MulLong").field(arg0).field(arg1).finish(),
-            Self::MulLongDst(arg0, arg1, arg2) => f
-                .debug_tuple("MulLongDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-
-            Self::DivInt(arg0, arg1) => f.debug_tuple("DivInt").field(arg0).field(arg1).finish(),
-            Self::DivIntDst(arg0, arg1, arg2) => f
-                .debug_tuple("DivIntDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::DivIntLit8(arg0, arg1, arg2) => f
-                .debug_tuple("DivIntLit8")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::DivIntLit16(arg0, arg1, arg2) => f
-                .debug_tuple("DivIntLit16")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::DivLong(arg0, arg1) => f.debug_tuple("DivLong").field(arg0).field(arg1).finish(),
-            Self::DivLongDst(arg0, arg1, arg2) => f
-                .debug_tuple("DivLongDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-
-            Self::AndInt(arg0, arg1) => f.debug_tuple("AndInt").field(arg0).field(arg1).finish(),
-            Self::AndIntDst(arg0, arg1, arg2) => f
-                .debug_tuple("AndIntDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::AndIntLit8(arg0, arg1, arg2) => f
-                .debug_tuple("AndIntLit8")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::AndIntLit16(arg0, arg1, arg2) => f
-                .debug_tuple("AndIntLit16")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::AndLong(arg0, arg1) => f.debug_tuple("AndLong").field(arg0).field(arg1).finish(),
-            Self::AndLongDst(arg0, arg1, arg2) => f
-                .debug_tuple("AndLongDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::OrInt(arg0, arg1) => f.debug_tuple("OrInt").field(arg0).field(arg1).finish(),
-            Self::OrIntDst(arg0, arg1, arg2) => f
-                .debug_tuple("OrIntDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::OrIntLit8(arg0, arg1, arg2) => f
-                .debug_tuple("OrIntLit8")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::OrIntLit16(arg0, arg1, arg2) => f
-                .debug_tuple("OrIntLit16")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::OrLong(arg0, arg1) => f.debug_tuple("OrLong").field(arg0).field(arg1).finish(),
-            Self::OrLongDst(arg0, arg1, arg2) => f
-                .debug_tuple("OrLongDst")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::Test(arg0, arg1, arg2, arg3) => f
-                .debug_tuple("Test")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .field(arg3)
-                .finish(),
-            Self::TestZero(arg0, arg1, arg2) => f
-                .debug_tuple("TestZero")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::Goto8(arg0) => f.debug_tuple("Goto8").field(arg0).finish(),
-            Self::Goto16(arg0) => f.debug_tuple("Goto16").field(arg0).finish(),
-            Self::Goto32(arg0) => f.debug_tuple("Goto32").field(arg0).finish(),
-            Self::ArrayGetByte(arg0, arg1, arg2) => f
-                .debug_tuple("ArrayGetByte")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::ArrayPutByte(arg0, arg1, arg2) => f
-                .debug_tuple("ArrayPutByte")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::ArrayGetChar(arg0, arg1, arg2) => f
-                .debug_tuple("ArrayGetChar")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::ArrayPutChar(arg0, arg1, arg2) => f
-                .debug_tuple("ArrayPutChar")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::Invoke(arg0) => f.debug_tuple("Invoke").field(arg0).finish(),
-            Self::InvokeVirtual(arg0, arg1, arg2) => f
-                .debug_tuple("InvokeVirtual")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InvokeSuper(arg0, arg1, arg2) => f
-                .debug_tuple("InvokeSuper")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InvokeDirect(arg0, arg1, arg2) => f
-                .debug_tuple("InvokeDirect")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InvokeStatic(arg0, arg1, arg2) => f
-                .debug_tuple("InvokeStatic")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InvokeInterface(arg0, arg1, arg2) => f
-                .debug_tuple("InvokeInterface")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InvokeVirtualRange(arg0, arg1, arg2) => f
-                .debug_tuple("InvokeVirtualRange")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InvokeSuperRange(arg0, arg1, arg2) => f
-                .debug_tuple("InvokeSuperRange")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InvokeDirectRange(arg0, arg1, arg2) => f
-                .debug_tuple("InvokeDirectRange")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InvokeStaticRange(arg0, arg1, arg2) => f
-                .debug_tuple("InvokeStaticRange")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InvokeInterfaceRange(arg0, arg1, arg2) => f
-                .debug_tuple("InvokeInterfaceRange")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InvokeType(arg0) => f.debug_tuple("InvokeType").field(arg0).finish(),
-            Self::MoveResult(arg0) => f.debug_tuple("MoveResult").field(arg0).finish(),
-            Self::MoveResultWide(arg0) => f.debug_tuple("MoveResultWide").field(arg0).finish(),
-            Self::MoveResultObject(arg0) => f.debug_tuple("MoveResultObject").field(arg0).finish(),
             Self::ReturnVoid => write!(f, "ReturnVoid"),
-            Self::Return(arg0) => f.debug_tuple("Return").field(arg0).finish(),
-            Self::Const => write!(f, "Const"),
-            Self::ConstLit4(arg0, arg1) => {
-                f.debug_tuple("ConstLit4").field(arg0).field(arg1).finish()
-            }
-            Self::ConstLit16(arg0, arg1) => {
-                f.debug_tuple("ConstLit16").field(arg0).field(arg1).finish()
-            }
-            Self::ConstLit32(arg0, arg1) => {
-                f.debug_tuple("ConstLit32").field(arg0).field(arg1).finish()
-            }
-            Self::ConstWide => write!(f, "ConstWide"),
-            Self::ConstString(arg0, arg1) => f
-                .debug_tuple("ConstString")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::ConstStringJumbo(arg0, arg1) => f
-                .debug_tuple("ConstStringJumbo")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::ConstClass(arg0, arg1) => {
-                f.debug_tuple("ConstClass").field(arg0).field(arg1).finish()
-            }
-            Self::CheckCast(arg0, arg1) => {
-                f.debug_tuple("CheckCast").field(arg0).field(arg1).finish()
-            }
-            Self::IntToByte(arg0, arg1) => {
-                f.debug_tuple("IntToByte").field(arg0).field(arg1).finish()
-            }
-            Self::IntToChar(arg0, arg1) => {
-                f.debug_tuple("IntToChar").field(arg0).field(arg1).finish()
-            }
-            Self::ArrayLength(arg0, arg1) => f
-                .debug_tuple("ArrayLength")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::NewInstance(arg0, arg1) => f
-                .debug_tuple("NewInstance")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::NewInstanceType(arg0) => f.debug_tuple("NewInstanceType").field(arg0).finish(),
-            Self::NewArray(arg0, arg1, arg2) => f
-                .debug_tuple("NewArray")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::FilledNewArray(arg0, arg1, arg2) => f
-                .debug_tuple("FilledNewArray")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::FilledNewArrayRange(arg0, arg1, arg2) => f
-                .debug_tuple("FilledNewArrayRange")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::FillArrayData(arg0, arg1) => f
-                .debug_tuple("FillArrayData")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::StaticGet(arg0, arg1) => {
-                f.debug_tuple("StaticGet").field(arg0).field(arg1).finish()
-            }
-            Self::StaticGetWide(arg0, arg1) => f
-                .debug_tuple("StaticGetWide")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::StaticGetObject(arg0, arg1) => f
-                .debug_tuple("StaticGetObject")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::StaticGetBoolean(arg0, arg1) => f
-                .debug_tuple("StaticGetBoolean")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::StaticGetByte(arg0, arg1) => f
-                .debug_tuple("StaticGetByte")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::StaticGetChar(arg0, arg1) => f
-                .debug_tuple("StaticGetChar")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::StaticGetShort(arg0, arg1) => f
-                .debug_tuple("StaticGetShort")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::StaticPut(arg0, arg1) => {
-                f.debug_tuple("StaticPut").field(arg0).field(arg1).finish()
-            }
-            Self::StaticPutWide(arg0, arg1) => f
-                .debug_tuple("StaticPutWide")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::StaticPutObject(arg0, arg1) => f
-                .debug_tuple("StaticPutObject")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::StaticPutBoolean(arg0, arg1) => f
-                .debug_tuple("StaticPutBoolean")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::StaticPutByte(arg0, arg1) => f
-                .debug_tuple("StaticPutByte")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::StaticPutChar(arg0, arg1) => f
-                .debug_tuple("StaticPutChar")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::StaticPutShort(arg0, arg1) => f
-                .debug_tuple("StaticPutShort")
-                .field(arg0)
-                .field(arg1)
-                .finish(),
-            Self::Switch(arg0, arg1) => f.debug_tuple("Switch").field(arg0).field(arg1).finish(),
-            Self::InstanceGet(arg0, arg1, arg2) => f
-                .debug_tuple("InstanceGet")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InstanceGetWide(arg0, arg1, arg2) => f
-                .debug_tuple("InstanceGetWide")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InstanceGetObject(arg0, arg1, arg2) => f
-                .debug_tuple("InstanceGetObject")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InstanceGetBoolean(arg0, arg1, arg2) => f
-                .debug_tuple("InstanceGetBoolean")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InstanceGetByte(arg0, arg1, arg2) => f
-                .debug_tuple("InstanceGetByte")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InstanceGetChar(arg0, arg1, arg2) => f
-                .debug_tuple("InstanceGetChar")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InstanceGetShort(arg0, arg1, arg2) => f
-                .debug_tuple("InstanceGetShort")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InstancePut(arg0, arg1, arg2) => f
-                .debug_tuple("InstancePut")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InstancePutWide(arg0, arg1, arg2) => f
-                .debug_tuple("InstancePutWide")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InstancePutObject(arg0, arg1, arg2) => f
-                .debug_tuple("InstancePutObject")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InstancePutBoolean(arg0, arg1, arg2) => f
-                .debug_tuple("InstancePutBoolean")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InstancePutByte(arg0, arg1, arg2) => f
-                .debug_tuple("InstancePutByte")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InstancePutChar(arg0, arg1, arg2) => f
-                .debug_tuple("InstancePutChar")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::InstancePutShort(arg0, arg1, arg2) => f
-                .debug_tuple("InstancePutShort")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::Throw(arg0) => f.debug_tuple("Throw").field(arg0).finish(),
-            Self::NotImpl(arg0, arg1) => f.debug_tuple("NotImpl").field(arg0).field(arg1).finish(),
+            Self::ArbitraryData(arg0) => f.write_str(&arg0),
             Self::ArrayData(arg0, arg1) => {
                 f.debug_tuple("ArrayData").field(arg0).field(arg1).finish()
             }
-            Self::SwitchData(arg0) => f.debug_tuple("SwitchData").field(arg0).finish(),
-            Self::ArbitraryData(arg0) => f.write_str(&arg0),
-            Self::ShrIntLit8(arg0, arg1, arg2) => f
-                .debug_tuple("ShrIntLit8")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
-            Self::UShrIntLit8(arg0, arg1, arg2) => f
-                .debug_tuple("ShrIntLit8")
-                .field(arg0)
-                .field(arg1)
-                .field(arg2)
-                .finish(),
+            Self::PackedSwitchData(arg0) => f.debug_tuple("PackedSwitchData").field(arg0).finish(),
+            Self::SparseSwitchData(arg0) => f.debug_tuple("SparseSwitchData").field(arg0).finish(),
+            Self::NotImpl(arg0, arg1) => f.debug_tuple("NotImpl").field(arg0).field(arg1).finish(),
+            _ => f.debug_tuple("Instruction").field(&self.mnemonic_from_opcode()).finish(),
         }
     }
 }
@@ -862,9 +377,9 @@ fn test_function_code(function: &TestFunction) -> u8 {
         TestFunction::Equal => 0,
         TestFunction::NotEqual => 1,
         TestFunction::LessThan => 2,
-        TestFunction::LessEqual => 3,
+        TestFunction::GreaterEqual => 3,
         TestFunction::GreaterThan => 4,
-        TestFunction::GreaterEqual => 5,
+        TestFunction::LessEqual => 5,
     }
 }
 
@@ -937,6 +452,10 @@ impl Instruction {
 
         let result = match self {
             Nop => one(0x00, 0),
+            MoveException(reg) => one(0x0d, *reg),
+            MonitorEnter(reg) => one(0x1d, *reg),
+            MonitorExit(reg) => one(0x1e, *reg),
+
             Move(dst, src) => fmt12(0x01, dst, src),
             MoveFrom16(dst, src) => fmt22(0x02, *dst, *src),
             Move16(dst, src) => vec![0x0003, *dst, *src],
@@ -960,6 +479,19 @@ impl Instruction {
             }
             ConstLit16(dst, value) => fmt22s(0x13, *dst, 0, *value),
             ConstLit32(dst, value) => fmt31(0x14, *dst, *value),
+            ConstWideLit16(dst, value) => vec![
+                u16::from_le_bytes([0x16, *dst]),
+                *value as u16,
+            ],
+            ConstWideLit32(dst, value) => vec![
+                u16::from_le_bytes([0x17, *dst]),
+                *value as u32 as u16,
+                (*value as u32 >> 16) as u16,
+            ],
+            ConstWideHigh16(dst, value) => vec![
+                u16::from_le_bytes([0x19, *dst]),
+                *value as u16,
+            ],
             ConstString(dst, string_idx) => fmt22(0x1a, *dst, *string_idx),
             ConstStringJumbo(dst, string_idx) => {
                 vec![
@@ -970,6 +502,7 @@ impl Instruction {
             }
             ConstClass(dst, type_idx) => fmt22(0x1c, *dst, *type_idx),
             CheckCast(dst, type_idx) => fmt22(0x1f, *dst, *type_idx),
+            InstanceOf(dst, object, type_idx) => fmt22c(0x20, dst, object, *type_idx),
 
             Goto8(offset) => one(0x28, *offset as u8),
             Goto16(offset) => vec![0x0029, *offset as u16],
@@ -985,10 +518,26 @@ impl Instruction {
                 *offset as u16,
             ],
 
-            ArrayGetByte(dst, array, index) => fmt23(0x48, *dst, *array, *index),
-            ArrayGetChar(dst, array, index) => fmt23(0x49, *dst, *array, *index),
-            ArrayPutByte(src, array, index) => fmt23(0x4f, *src, *array, *index),
-            ArrayPutChar(src, array, index) => fmt23(0x50, *src, *array, *index),
+            CmplFloat(dst, a, b) => fmt23(0x2d, *dst, *a, *b),
+            CmpFloat(dst, a, b) => fmt23(0x2e, *dst, *a, *b),
+            CmpDouble(dst, a, b) => fmt23(0x2f, *dst, *a, *b),
+            CmpgFloat(dst, a, b) => fmt23(0x2e, *dst, *a, *b),
+            CmplDouble(dst, a, b) => fmt23(0x2f, *dst, *a, *b),
+            CmpgDouble(dst, a, b) => fmt23(0x30, *dst, *a, *b),
+            CmpLong(dst, a, b) => fmt23(0x31, *dst, *a, *b),
+
+            ArrayGetWide(dst, array, index) => fmt23(0x44, *dst, *array, *index),
+            ArrayGetObject(dst, array, index) => fmt23(0x45, *dst, *array, *index),
+            ArrayGetBoolean(dst, array, index) => fmt23(0x46, *dst, *array, *index),
+            ArrayGetByte(dst, array, index) => fmt23(0x47, *dst, *array, *index),
+            ArrayGetChar(dst, array, index) => fmt23(0x48, *dst, *array, *index),
+            ArrayGetShort(dst, array, index) => fmt23(0x49, *dst, *array, *index),
+            ArrayPutWide(src, array, index) => fmt23(0x4a, *src, *array, *index),
+            ArrayPutObject(src, array, index) => fmt23(0x4b, *src, *array, *index),
+            ArrayPutBoolean(src, array, index) => fmt23(0x4c, *src, *array, *index),
+            ArrayPutByte(src, array, index) => fmt23(0x4d, *src, *array, *index),
+            ArrayPutChar(src, array, index) => fmt23(0x4e, *src, *array, *index),
+            ArrayPutShort(src, array, index) => fmt23(0x4f, *src, *array, *index),
             ArrayLength(dst, array) => fmt12(0x21, dst, array),
 
             XorInt(dst, src) => fmt12(0xb7, dst, src),
@@ -1004,27 +553,19 @@ impl Instruction {
             RemIntLit8(dst, src, value) => fmt22s(0xdc, *dst, *src, *value as i16),
             RemIntLit16(dst, src, value) => fmt22s4(0xd4, dst, src, *value as i16),
             AddInt(dst, src) => fmt12(0xb0, dst, src),
-            AddLong(dst, src) => fmt12(0xbb, dst, src),
             AddIntDst(dst, a, b) => fmt23(0x90, *dst, *a, *b),
-            AddLongDst(dst, a, b) => fmt23(0x9b, *dst, *a, *b),
             AddIntLit8(dst, src, value) => fmt22s(0xd8, *dst, *src, *value as i16),
             AddIntLit16(dst, src, value) => fmt22s4(0xd0, dst, src, *value as i16),
             SubInt(dst, src) => fmt12(0xb1, dst, src),
-            SubLong(dst, src) => fmt12(0xbc, dst, src),
             SubIntDst(dst, a, b) => fmt23(0x91, *dst, *a, *b),
-            SubLongDst(dst, a, b) => fmt23(0x9c, *dst, *a, *b),
             SubIntLit8(dst, src, value) => fmt22s(0xd9, *dst, *src, *value as i16),
             SubIntLit16(dst, src, value) => fmt22s4(0xd1, dst, src, *value as i16),
             MulInt(dst, src) => fmt12(0xb2, dst, src),
-            MulLong(dst, src) => fmt12(0xbd, dst, src),
             MulIntDst(dst, a, b) => fmt23(0x92, *dst, *a, *b),
-            MulLongDst(dst, a, b) => fmt23(0x9d, *dst, *a, *b),
             MulIntLit8(dst, src, value) => fmt22s(0xda, *dst, *src, *value as i16),
             MulIntLit16(dst, src, value) => fmt22s4(0xd2, dst, src, *value as i16),
             DivInt(dst, src) => fmt12(0xb3, dst, src),
-            DivLong(dst, src) => fmt12(0xbe, dst, src),
             DivIntDst(dst, a, b) => fmt23(0x93, *dst, *a, *b),
-            DivLongDst(dst, a, b) => fmt23(0x9e, *dst, *a, *b),
             DivIntLit8(dst, src, value) => fmt22s(0xdb, *dst, *src, *value as i16),
             DivIntLit16(dst, src, value) => fmt22s4(0xd3, dst, src, *value as i16),
             AndInt(dst, src) => fmt12(0xb5, dst, src),
@@ -1039,11 +580,77 @@ impl Instruction {
             OrLongDst(dst, a, b) => fmt23(0xa1, *dst, *a, *b),
             OrIntLit8(dst, src, value) => fmt22s(0xde, *dst, *src, *value as i16),
             OrIntLit16(dst, src, value) => fmt22s4(0xd6, dst, src, *value as i16),
+
+ShlInt(dst, src) => fmt12(0xb8, dst, src),
+            ShrInt(dst, src) => fmt12(0xb9, dst, src),
+            UShrInt(dst, src) => fmt12(0xba, dst, src),
+            ShlIntDst(dst, a, b) => fmt23(0x98, *dst, *a, *b),
+            ShrIntDst(dst, a, b) => fmt23(0x99, *dst, *a, *b),
+            UShrIntDst(dst, a, b) => fmt23(0x9a, *dst, *a, *b),
+            ShlIntLit8(dst, src, value) => fmt22s(0xe0, *dst, *src, *value as i16),
             ShrIntLit8(dst, src, value) => fmt22s(0xe1, *dst, *src, *value as i16),
             UShrIntLit8(dst, src, value) => fmt22s(0xe2, *dst, *src, *value as i16),
 
-            IntToByte(dst, src) => fmt12(0x8d, dst, src),
-            IntToChar(dst, src) => fmt12(0x82, dst, src),
+            ShlLong(dst, src) => fmt12(0xc3, dst, src),
+            ShrLong(dst, src) => fmt12(0xc4, dst, src),
+            UShrLong(dst, src) => fmt12(0xc5, dst, src),
+            ShlLongDst(dst, a, b) => fmt23(0xa3, *dst, *a, *b),
+            ShrLongDst(dst, a, b) => fmt23(0xa4, *dst, *a, *b),
+            UShrLongDst(dst, a, b) => fmt23(0xa5, *dst, *a, *b),
+
+            NegInt(dst, src) => fmt12(0x7b, dst, src),
+            NotInt(dst, src) => fmt12(0x7c, dst, src),
+            NegLong(dst, src) => fmt12(0x7d, dst, src),
+            NegFloat(dst, src) => fmt12(0x7f, dst, src),
+            NegDouble(dst, src) => fmt12(0x80, dst, src),
+
+            IntToLong(dst, src) => fmt12(0x81, dst, src),
+            IntToFloat(dst, src) => fmt12(0x82, dst, src),
+            IntToDouble(dst, src) => fmt12(0x83, dst, src),
+            IntToByte(dst, src) => fmt12(0x84, dst, src),
+            IntToChar(dst, src) => fmt12(0x85, dst, src),
+            IntToShort(dst, src) => fmt12(0x86, dst, src),
+            LongToInt(dst, src) => fmt12(0x87, dst, src),
+            LongToFloat(dst, src) => fmt12(0x88, dst, src),
+            LongToDouble(dst, src) => fmt12(0x89, dst, src),
+            FloatToInt(dst, src) => fmt12(0x8a, dst, src),
+            FloatToLong(dst, src) => fmt12(0x8b, dst, src),
+            FloatToDouble(dst, src) => fmt12(0x8c, dst, src),
+            DoubleToInt(dst, src) => fmt12(0x8d, dst, src),
+            DoubleToLong(dst, src) => fmt12(0x8e, dst, src),
+            DoubleToFloat(dst, src) => fmt12(0x8f, dst, src),
+
+            AddFloat(dst, src) => fmt12(0xc6, dst, src),
+            AddFloatDst(dst, a, b) => fmt23(0xa6, *dst, *a, *b),
+            SubFloat(dst, src) => fmt12(0xc7, dst, src),
+            SubFloatDst(dst, a, b) => fmt23(0xa7, *dst, *a, *b),
+            MulFloat(dst, src) => fmt12(0xc8, dst, src),
+            MulFloatDst(dst, a, b) => fmt23(0xa8, *dst, *a, *b),
+            DivFloat(dst, src) => fmt12(0xc9, dst, src),
+            DivFloatDst(dst, a, b) => fmt23(0xa9, *dst, *a, *b),
+            RemFloat(dst, src) => fmt12(0xca, dst, src),
+            RemFloatDst(dst, a, b) => fmt23(0xaa, *dst, *a, *b),
+
+            AddDouble(dst, src) => fmt12(0xcb, dst, src),
+            AddDoubleDst(dst, a, b) => fmt23(0xab, *dst, *a, *b),
+            SubDouble(dst, src) => fmt12(0xcc, dst, src),
+            SubDoubleDst(dst, a, b) => fmt23(0xac, *dst, *a, *b),
+            MulDouble(dst, src) => fmt12(0xcd, dst, src),
+            MulDoubleDst(dst, a, b) => fmt23(0xad, *dst, *a, *b),
+            DivDouble(dst, src) => fmt12(0xce, dst, src),
+            DivDoubleDst(dst, a, b) => fmt23(0xae, *dst, *a, *b),
+            RemDouble(dst, src) => fmt12(0xcf, dst, src),
+            RemDoubleDst(dst, a, b) => fmt23(0xaf, *dst, *a, *b),
+
+            AddLong(dst, src) => fmt12(0xbb, dst, src),
+            AddLongDst(dst, a, b) => fmt23(0x9b, *dst, *a, *b),
+            SubLong(dst, src) => fmt12(0xbc, dst, src),
+            SubLongDst(dst, a, b) => fmt23(0x9c, *dst, *a, *b),
+            MulLong(dst, src) => fmt12(0xbd, dst, src),
+            MulLongDst(dst, a, b) => fmt23(0x9d, *dst, *a, *b),
+            DivLong(dst, src) => fmt12(0xbe, dst, src),
+            DivLongDst(dst, a, b) => fmt23(0x9e, *dst, *a, *b),
+
             NewInstance(dst, type_idx) => fmt22(0x22, *dst, *type_idx),
             NewArray(dst, size, type_idx) => one(0x23, u4(dst) | (u4(size) << 4))
                 .into_iter()
@@ -1080,6 +687,7 @@ impl Instruction {
                 vec![u16::from_le_bytes([0x78, *count]), *method, *first]
             }
             Invoke(method) => vec![u16::from_le_bytes([0xfa, 0]), *method],
+            InvokeCustom(count, method, regs) => fmt35(0xf9, count, *method, regs)?,
 
             InstanceGet(dst, object, field) => fmt22c(0x52, dst, object, *field),
             InstanceGetWide(dst, object, field) => fmt22c(0x53, dst, object, *field),
@@ -1110,11 +718,24 @@ impl Instruction {
             StaticPutChar(src, field) => fmt22(0x6c, *src, *field),
             StaticPutShort(src, field) => fmt22(0x6d, *src, *field),
 
-            Switch(register, offset) => vec![
+            PackedSwitch(register, offset) => vec![
                 u16::from_le_bytes([0x2b, *register]),
                 *offset as u32 as u16,
                 (*offset as u32 >> 16) as u16,
             ],
+            SparseSwitch(register, offset) => vec![
+                u16::from_le_bytes([0x2c, *register]),
+                *offset as u32 as u16,
+                (*offset as u32 >> 16) as u16,
+            ],
+            ConstMethodHandle(dst, idx) => fmt22(0xfc, *dst, *idx),
+            ConstMethodType(dst, idx) => fmt22(0xfd, *dst, *idx),
+            ConstDynamic(dst, idx, extra) => vec![
+                u16::from_le_bytes([0xfe, *dst]),
+                *idx,
+                *extra as u16,
+            ],
+
             NotImpl(opcode, high) => one(*opcode, *high),
             ArrayData(width, data) => {
                 if *width == 0 || data.len() % *width as usize != 0 {
@@ -1134,12 +755,60 @@ impl Instruction {
                 }
                 result
             }
-            Const | ConstWide | InvokeType(_) | NewInstanceType(_) | SwitchData(_)
+            PackedSwitchData(switch) => {
+                let entries = switch.targets.len() as u32;
+                let first_key = switch
+                    .targets
+                    .keys()
+                    .min()
+                    .copied()
+                    .unwrap_or(0);
+                let mut result = vec![
+                    u16::from_le_bytes([0x00, 0x01]),
+                    entries as u16,
+                    (entries >> 16) as u16,
+                    first_key as u32 as u16,
+                    (first_key as u32 >> 16) as u16,
+                ];
+                for i in 0..entries {
+                    let key = first_key + i as i32;
+                    let target = switch.targets.get(&key).copied().unwrap_or(0);
+                    result.push(target as u32 as u16);
+                    result.push((target as u32 >> 16) as u16);
+                }
+                result
+            }
+            SparseSwitchData(switch) => {
+                let entries = switch.targets.len() as u32;
+                let mut sorted: Vec<(i32, i32)> = switch
+                    .targets
+                    .iter()
+                    .map(|(&k, &v)| (k, v))
+                    .collect();
+                sorted.sort_by_key(|&(k, _)| k);
+                let mut result = vec![
+                    u16::from_le_bytes([0x00, 0x02]),
+                    entries as u16,
+                    (entries >> 16) as u16,
+                ];
+                for &(key, _) in &sorted {
+                    result.push(key as u32 as u16);
+                    result.push((key as u32 >> 16) as u16);
+                }
+                for &(_, target) in &sorted {
+                    result.push(target as u32 as u16);
+                    result.push((target as u32 >> 16) as u16);
+                }
+                result
+            }
+            InvokeType(_)
+            | Const
+            | ConstWide
+            | NewInstanceType(_)
+            | Switch(_)
+            | SwitchData(_)
             | ArbitraryData(_) => {
-                return Err(format!(
-                    "instruction is a display placeholder and cannot be encoded: {:?}",
-                    self
-                ));
+                return Err("instruction is a decoder placeholder and cannot be encoded".to_string())
             }
         };
         Ok(result)
@@ -1935,7 +1604,12 @@ impl Instruction {
             0x0a => Instruction::MoveResult(high),
             0x0b => Instruction::MoveResultWide(high),
             0xc => Instruction::MoveResultObject(high),
-            0x2b => Instruction::Switch(
+            0xd => Instruction::MoveException(high),
+
+            0x1d => Instruction::MonitorEnter(high),
+            0x1e => Instruction::MonitorExit(high),
+
+            0x2b => Instruction::PackedSwitch(
                 high,
                 i32::from_be_bytes([
                     (data[1] >> 8) as u8,
@@ -1944,7 +1618,7 @@ impl Instruction {
                     (data[0] & 0xff) as u8,
                 ]),
             ),
-            0x2c => Instruction::Switch(
+            0x2c => Instruction::SparseSwitch(
                 high,
                 i32::from_be_bytes([
                     (data[1] >> 8) as u8,
@@ -1954,6 +1628,12 @@ impl Instruction {
                 ]),
             ),
             0x27 => Instruction::Throw(high),
+
+            0x2d => Instruction::CmplFloat(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x2e => Instruction::CmpgFloat(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x2f => Instruction::CmplDouble(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x30 => Instruction::CmpgDouble(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x31 => Instruction::CmpLong(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
 
             0xb7 => Instruction::XorInt(u4::new(high & 0b1111), u4::new(high >> 4)),
             0xc2 => Instruction::XorLong(u4::new(high & 0b1111), u4::new(high >> 4)),
@@ -1972,29 +1652,37 @@ impl Instruction {
 
             0x90 => Instruction::AddIntDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0x9b => Instruction::AddLongDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xab => Instruction::AddDoubleDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0xb0 => Instruction::AddInt(u4::new(high & 0b1111), u4::new(high >> 4)),
             0xbb => Instruction::AddLong(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xcb => Instruction::AddDouble(u4::new(high & 0b1111), u4::new(high >> 4)),
             0xd0 => Instruction::AddIntLit16(u4::new(high & 0b1111), u4::new(high >> 4), data[0]),
             0xd8 => Instruction::AddIntLit8(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
 
             0x92 => Instruction::MulIntDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0x9d => Instruction::MulLongDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xad => Instruction::MulDoubleDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0xb2 => Instruction::MulInt(u4::new(high & 0b1111), u4::new(high >> 4)),
             0xbd => Instruction::MulLong(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xcd => Instruction::MulDouble(u4::new(high & 0b1111), u4::new(high >> 4)),
             0xd2 => Instruction::MulIntLit16(u4::new(high & 0b1111), u4::new(high >> 4), data[0]),
             0xda => Instruction::MulIntLit8(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
 
             0x93 => Instruction::DivIntDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0x9e => Instruction::DivLongDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xae => Instruction::DivDoubleDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0xb3 => Instruction::DivInt(u4::new(high & 0b1111), u4::new(high >> 4)),
             0xbe => Instruction::DivLong(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xce => Instruction::DivDouble(u4::new(high & 0b1111), u4::new(high >> 4)),
             0xd3 => Instruction::DivIntLit16(u4::new(high & 0b1111), u4::new(high >> 4), data[0]),
             0xdb => Instruction::DivIntLit8(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
 
             0x91 => Instruction::SubIntDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0x9c => Instruction::SubLongDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xac => Instruction::SubDoubleDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0xb1 => Instruction::SubInt(u4::new(high & 0b1111), u4::new(high >> 4)),
             0xbc => Instruction::SubLong(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xcc => Instruction::SubDouble(u4::new(high & 0b1111), u4::new(high >> 4)),
             0xd1 => Instruction::SubIntLit16(u4::new(high & 0b1111), u4::new(high >> 4), data[0]),
             0xd9 => Instruction::SubIntLit8(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
 
@@ -2012,6 +1700,23 @@ impl Instruction {
             0xd6 => Instruction::OrIntLit16(u4::new(high & 0b1111), u4::new(high >> 4), data[0]),
             0xde => Instruction::OrIntLit8(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
 
+            0x98 => Instruction::ShlIntDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x99 => Instruction::ShrIntDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x9a => Instruction::UShrIntDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xa3 => Instruction::ShlLongDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xa4 => Instruction::ShrLongDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xa5 => Instruction::UShrLongDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xb8 => Instruction::ShlInt(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xb9 => Instruction::ShrInt(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xba => Instruction::UShrInt(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xc3 => Instruction::ShlLong(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xc4 => Instruction::ShrLong(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xc5 => Instruction::UShrLong(u4::new(high & 0b1111), u4::new(high >> 4)),
+
+            0xe0 => Instruction::ShlIntLit8(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xe1 => Instruction::ShrIntLit8(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xe2 => Instruction::UShrIntLit8(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+
             0x32..=0x37 => Instruction::Test(
                 (low[1] - 0x32).into(),
                 u4::new(high & 0b1111),
@@ -2022,10 +1727,54 @@ impl Instruction {
             0x28 => Instruction::Goto8(high as i8),
             0x29 => Instruction::Goto16(data[0] as i16),
             0x2a => Instruction::Goto32(((data[1] as i32) << 16) | data[0] as i32),
-            0x48 => Instruction::ArrayGetByte(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
-            0x49 => Instruction::ArrayGetChar(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
-            0x4f => Instruction::ArrayPutByte(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
-            0x50 => Instruction::ArrayPutChar(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+
+            0x44 => Instruction::ArrayGetWide(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x45 => Instruction::ArrayGetObject(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x46 => Instruction::ArrayGetBoolean(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x47 => Instruction::ArrayGetByte(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x48 => Instruction::ArrayGetChar(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x49 => Instruction::ArrayGetShort(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x4a => Instruction::ArrayPutWide(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x4b => Instruction::ArrayPutObject(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x4c => Instruction::ArrayPutBoolean(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x4d => Instruction::ArrayPutByte(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x4e => Instruction::ArrayPutChar(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x4f => Instruction::ArrayPutShort(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+
+            0x7b => Instruction::NegInt(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x7c => Instruction::NotInt(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x7d => Instruction::NegLong(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x7e => Instruction::NegFloat(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x7f => Instruction::NegDouble(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x80 => Instruction::IntToLong(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x81 => Instruction::IntToFloat(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x82 => Instruction::IntToDouble(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x83 => Instruction::IntToByte(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x84 => Instruction::IntToChar(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x85 => Instruction::IntToShort(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x86 => Instruction::LongToInt(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x87 => Instruction::LongToFloat(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x88 => Instruction::LongToDouble(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x89 => Instruction::FloatToInt(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x8a => Instruction::FloatToLong(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x8b => Instruction::FloatToDouble(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x8c => Instruction::DoubleToInt(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x8d => Instruction::DoubleToLong(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x8e => Instruction::DoubleToFloat(u4::new(high & 0b1111), u4::new(high >> 4)),
+
+            0xa6 => Instruction::AddFloatDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xa7 => Instruction::SubFloatDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xa8 => Instruction::MulFloatDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xa9 => Instruction::DivFloatDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xaa => Instruction::RemFloatDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xaf => Instruction::RemDoubleDst(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xc6 => Instruction::AddFloat(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xc7 => Instruction::SubFloat(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xc8 => Instruction::MulFloat(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xc9 => Instruction::DivFloat(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xca => Instruction::RemFloat(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0xcf => Instruction::RemDouble(u4::new(high & 0b1111), u4::new(high >> 4)),
+
             0x6e => {
                 let arg_num = u4::new((high & 0b11110000) >> 4);
                 let content: Vec<u8> = match (high & 0b11110000) >> 4 {
@@ -2195,7 +1944,26 @@ impl Instruction {
                 ]),
             ),
             0x15 => Instruction::ConstLit32(high, (data[0] as i32) << 16),
-            0x16..=0x19 => Instruction::ConstWide,
+            0x16 => Instruction::ConstWideLit16(high, data[0] as i16),
+            0x17 => Instruction::ConstWideLit32(
+                high,
+                i32::from_be_bytes([
+                    ((data[0] >> 8) as u8),
+                    ((data[0] & 0xff) as u8),
+                    ((data[1] >> 8) as u8),
+                    ((data[1] & 0xff) as u8),
+                ]),
+            ),
+            0x18 => Instruction::ConstWideLit32(
+                high,
+                i32::from_be_bytes([
+                    ((data[0] >> 8) as u8),
+                    ((data[0] & 0xff) as u8),
+                    ((data[1] >> 8) as u8),
+                    ((data[1] & 0xff) as u8),
+                ]),
+            ),
+            0x19 => Instruction::ConstWideHigh16(high, data[0] as i16),
             0x1a => Instruction::ConstString(high, data[0]),
             0x1b => Instruction::ConstStringJumbo(
                 high,
@@ -2208,8 +1976,7 @@ impl Instruction {
             ),
             0x1c => Instruction::ConstClass(high, data[0]),
             0x1f => Instruction::CheckCast(high, data[0]),
-            0x8d => Instruction::IntToByte(u4::new(high & 0b1111), u4::new(high >> 4)),
-            0x82 => Instruction::IntToChar(u4::new(high & 0b1111), u4::new(high >> 4)),
+            0x20 => Instruction::InstanceOf(u4::new(high & 0b1111), u4::new(high >> 4), data[0]),
             0x21 => Instruction::ArrayLength(u4::new(high & 0b1111), u4::new(high >> 4)),
             0x22 => Instruction::NewInstance(high, data[0]),
             0x23 => Instruction::NewArray(u4::new(high & 0b1111), u4::new(high >> 4), data[0]),
@@ -2299,8 +2066,8 @@ impl Instruction {
             0x6c => Instruction::StaticPutChar(high, data[0]),
             0x6d => Instruction::StaticPutShort(high, data[0]),
 
-            0xe1 => Instruction::ShrIntLit8(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
-            0xe2 => Instruction::UShrIntLit8(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0xfc => Instruction::ConstMethodHandle(high, data[0]),
+            0xfd => Instruction::ConstMethodType(high, data[0]),
 
             _ => Instruction::NotImpl(low[1], high),
         }

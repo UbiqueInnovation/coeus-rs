@@ -1550,12 +1550,12 @@ impl Decode for CodeItem {
                     insns.push((
                         op_size.into(),
                         i.into(),
-                        Instruction::SwitchData(switch.clone()),
+                        Instruction::PackedSwitchData(switch.clone()),
                     ));
                     switch_data.push((
                         op_size.into(),
                         i.into(),
-                        Instruction::SwitchData(switch.clone()),
+                        Instruction::PackedSwitchData(switch.clone()),
                     ));
                 } else if op.to_be_bytes()[0] == 0x02 {
                     //sparse switch
@@ -1577,12 +1577,12 @@ impl Decode for CodeItem {
                     insns.push((
                         op_size.into(),
                         i.into(),
-                        Instruction::SwitchData(switch.clone()),
+                        Instruction::SparseSwitchData(switch.clone()),
                     ));
                     switch_data.push((
                         op_size.into(),
                         i.into(),
-                        Instruction::SwitchData(switch.clone()),
+                        Instruction::SparseSwitchData(switch.clone()),
                     ));
                 } else {
                     // log::debug!("found array with {} elements of size {}", op_size, element_size);

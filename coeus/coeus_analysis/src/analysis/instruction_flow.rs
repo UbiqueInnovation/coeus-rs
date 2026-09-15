@@ -1208,8 +1208,26 @@ impl InstructionFlow {
                             branches_to_add.lock().unwrap().push((b.pc, new_branch));
                         }
                     }
-                    Instruction::Switch(_, table_offset) => {
-                        if let Some((_, Instruction::SwitchData(switch))) =
+                    Instruction::PackedSwitch(_, table_offset) | Instruction::SparseSwitch(_, table_offset) => {
+                        if let Some((_, Instruction::PackedSwitchData(switch))) =
+                            method.get(&(b.pc + table_offset))
+                        {
+                            for (_, offset) in &switch.targets {
+                                if already_branched
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|(_, offset)| offset == &b.pc)
+                                {
+                                    continue;
+                                }
+                                let mut new_branch = b.clone();
+                                new_branch.parent_id = Some(b.id);
+                                new_branch.pc += *offset as i32;
+                                branches_to_add.lock().unwrap().push((b.pc, new_branch));
+                            }
+                        }
+                        if let Some((_, Instruction::SparseSwitchData(switch))) =
                             method.get(&(b.pc + table_offset))
                         {
                             for (_, offset) in &switch.targets {
@@ -1829,7 +1847,7 @@ impl InstructionFlow {
                         }
                     }
                     Instruction::ArrayData(_, _) => {}
-                    Instruction::SwitchData(_) => {}
+                    Instruction::PackedSwitchData(_) | Instruction::SparseSwitchData(_) => {}
 
                     Instruction::ShrIntLit8(dst, left, lit) => {
                         b.state.registers[u8::from(dst) as usize] =
@@ -1841,6 +1859,7 @@ impl InstructionFlow {
                     }
 
                     Instruction::Nop => {}
+                    _ => {}
                 }
                 // reset last_function if this is not a function call
                 // and we are not in an move-result-object

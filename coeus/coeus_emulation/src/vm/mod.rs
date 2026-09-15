@@ -679,7 +679,7 @@ impl VM {
                 InstructionSize(current_instruction.0 .0 / 2);
             match &current_instruction.1 {
                 Instruction::ArbitraryData(_) => {}
-                Instruction::Switch(reg, table_offset) => {
+                Instruction::PackedSwitch(reg, table_offset) | Instruction::SparseSwitch(reg, table_offset) => {
                     let reg_data = if let Some(Register::Literal(reg)) =
                         self.current_state.current_stackframe.get(*reg as usize)
                     {
@@ -687,7 +687,21 @@ impl VM {
                     } else {
                         return Err(VMException::RegisterNotFound((*reg) as usize));
                     };
-                    if let Some((_, Instruction::SwitchData(switch))) =
+                    if let Some((_, Instruction::PackedSwitchData(switch))) =
+                        code_item.get(&(self.current_state.pc + *table_offset))
+                    {
+                        if let Some(offset) = switch.targets.get(reg_data) {
+                            self.current_state.pc += *offset as i32;
+                            current_instruction = code_item.get(&self.current_state.pc).ok_or(
+                                VMException::NoInstructionAtAddress(
+                                    self.current_state.current_method_index,
+                                    self.current_state.pc.into(),
+                                ),
+                            )?;
+                            continue;
+                        }
+                    }
+                    if let Some((_, Instruction::SparseSwitchData(switch))) =
                         code_item.get(&(self.current_state.pc + *table_offset))
                     {
                         if let Some(offset) = switch.targets.get(reg_data) {
@@ -704,7 +718,7 @@ impl VM {
                 }
                 // for now we just ignore checkcasts
                 Instruction::CheckCast(..) => {}
-                Instruction::SwitchData(_) => {}
+                Instruction::PackedSwitchData(_) | Instruction::SparseSwitchData(_) => {}
                 Instruction::Throw(_) => {
                     return Err(VMException::ExceptionThrown);
                 }
@@ -2252,6 +2266,7 @@ impl VM {
                 Instruction::InstancePutByte(_, _, _) => {}
                 Instruction::InstancePutChar(_, _, _) => {}
                 Instruction::InstancePutShort(_, _, _) => {}
+                _ => return Err(VMException::LinkerError),
             }
             if matches!(self.current_state.vm_state, ExecutionState::Finished) {
                 return Ok(());
