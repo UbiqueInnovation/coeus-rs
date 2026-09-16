@@ -1698,9 +1698,11 @@ impl CoeusApp {
                 });
             return;
         }
+        let max_sidebar_width = (ctx.screen_rect().width() * 0.30).max(1.0);
         egui::SidePanel::left("project-sidebar")
             .resizable(true)
             .default_width(300.0)
+            .max_width(max_sidebar_width)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading(
@@ -1900,56 +1902,60 @@ impl CoeusApp {
                     ui.label(RichText::new(format!("Results ({} / {})", self.results.len(), self.result_count)).strong());
                     let mut picked = None;
                     let mut action = None;
-                    egui::ScrollArea::vertical().id_salt("results").show(ui, |ui| {
-                        for result in self.results.clone() {
-                            let selected = self.selected_id.as_ref() == Some(&result.id);
-                            let response = ui.horizontal(|ui| {
-                                let response = ui.selectable_label(
-                                    selected,
-                                    RichText::new(format!("[{}] {}", result.kind, result.label))
-                                        .monospace()
-                                        .size(12.0)
-                                        .color(if self.notes.contains_key(&result.note_key) {
-                                            Color32::from_rgb(255, 220, 125)
-                                        } else {
-                                            Color32::WHITE
-                                        }),
-                                );
-                                self.show_note_chip(
-                                    ui,
-                                    &result.kind,
-                                    &result.note_key,
-                                    &result.label,
-                                );
-                                response
-                            }).inner;
-                            if response.clicked() {
-                                picked = Some(result.clone());
+                    egui::ScrollArea::vertical()
+                        .id_salt("results")
+                        .auto_shrink([false, false])
+                        .max_height(ui.available_height().max(1.0))
+                        .show(ui, |ui| {
+                            for result in self.results.clone() {
+                                let selected = self.selected_id.as_ref() == Some(&result.id);
+                                let response = ui.horizontal(|ui| {
+                                    let response = ui.selectable_label(
+                                        selected,
+                                        RichText::new(format!("[{}] {}", result.kind, result.label))
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(if self.notes.contains_key(&result.note_key) {
+                                                Color32::from_rgb(255, 220, 125)
+                                            } else {
+                                                Color32::WHITE
+                                            }),
+                                    );
+                                    self.show_note_chip(
+                                        ui,
+                                        &result.kind,
+                                        &result.note_key,
+                                        &result.label,
+                                    );
+                                    response
+                                }).inner;
+                                if response.clicked() {
+                                    picked = Some(result.clone());
+                                }
+                                response.context_menu(|ui| {
+                                    if ui.button("Open code").clicked() {
+                                        action = Some(SearchAction::Open(result.clone()));
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Find cross-references").clicked() {
+                                        action = Some(SearchAction::Xrefs(result.clone()));
+                                        ui.close_menu();
+                                    }
+                                    if !result.note_key.is_empty()
+                                        && ui
+                                            .button(if self.notes.contains_key(&result.note_key) {
+                                                "Edit note"
+                                            } else {
+                                                "Add note"
+                                            })
+                                            .clicked()
+                                    {
+                                        action = Some(SearchAction::EditNote(result.clone()));
+                                        ui.close_menu();
+                                    }
+                                });
                             }
-                            response.context_menu(|ui| {
-                                if ui.button("Open code").clicked() {
-                                    action = Some(SearchAction::Open(result.clone()));
-                                    ui.close_menu();
-                                }
-                                if ui.button("Find cross-references").clicked() {
-                                    action = Some(SearchAction::Xrefs(result.clone()));
-                                    ui.close_menu();
-                                }
-                                if !result.note_key.is_empty()
-                                    && ui
-                                        .button(if self.notes.contains_key(&result.note_key) {
-                                            "Edit note"
-                                        } else {
-                                            "Add note"
-                                        })
-                                        .clicked()
-                                {
-                                    action = Some(SearchAction::EditNote(result.clone()));
-                                    ui.close_menu();
-                                }
-                            });
-                        }
-                    });
+                        });
                     if let Some(action) = action {
                         match action {
                             SearchAction::Open(result) => {
@@ -2119,28 +2125,26 @@ impl CoeusApp {
             ui.heading(format!("Cross-references ({})", self.xrefs.len()));
             let mut picked = None;
             ui.collapsing("References", |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for result in self.xrefs.clone() {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(
-                                    false,
-                                    RichText::new(&result.label).monospace().color(
-                                        if self.notes.contains_key(&result.note_key) {
-                                            Color32::from_rgb(255, 220, 125)
-                                        } else {
-                                            Color32::WHITE
-                                        },
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                picked = Some(result.clone());
-                            }
-                            self.show_note_chip(ui, &result.kind, &result.note_key, &result.label);
-                        });
-                    }
-                });
+                for result in self.xrefs.clone() {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(
+                                false,
+                                RichText::new(&result.label).monospace().color(
+                                    if self.notes.contains_key(&result.note_key) {
+                                        Color32::from_rgb(255, 220, 125)
+                                    } else {
+                                        Color32::WHITE
+                                    },
+                                ),
+                            )
+                            .clicked()
+                        {
+                            picked = Some(result.clone());
+                        }
+                        self.show_note_chip(ui, &result.kind, &result.note_key, &result.label);
+                    });
+                }
             });
             if let Some(result) = picked {
                 self.selected_id = Some(result.id.clone());
@@ -2192,15 +2196,18 @@ impl CoeusApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Smali method");
-                if !self.code.title.is_empty() {
-                    ui.label(
+            ui.heading("Smali method");
+            if !self.code.title.is_empty() {
+                ui.add(
+                    egui::Label::new(
                         RichText::new(&self.code.title)
                             .monospace()
                             .color(Color32::from_rgb(160, 210, 255)),
-                    );
-                }
+                    )
+                    .wrap(),
+                );
+            }
+            ui.horizontal_wrapped(|ui| {
                 if let Some(target) = self.current_annotation_target() {
                     self.show_note_chip(
                         ui,
@@ -2938,15 +2945,34 @@ impl CoeusApp {
             );
             ui.separator();
             for edge_kind in all_graph_edge_kinds() {
-                let (color, _) = graph_edge_style(edge_kind);
-                ui.colored_label(color, "━━");
+                let (color, width) = graph_edge_style(edge_kind);
+                let (swatch, painter) = ui.allocate_painter(
+                    Vec2::new(24.0, ui.spacing().interact_size.y),
+                    Sense::hover(),
+                );
+                let line_rect = swatch.rect.shrink2(Vec2::new(2.0, 0.0));
+                painter.line_segment(
+                    [line_rect.left_center(), line_rect.right_center()],
+                    Stroke::new(width, color),
+                );
                 ui.label(edge_kind.label());
             }
+            ui.separator();
+            ui.label(
+                RichText::new("Cmd + scroll to zoom")
+                    .small()
+                    .color(Color32::GRAY),
+            );
         });
+        let graph_width = ui.available_width().max(1.0);
+        let graph_height = (ui.available_height() - 32.0).max(240.0);
         egui::Resize::default()
-            .id_salt("graph-pane")
-            .default_height(520.0)
+            .id_salt("graph-pane-full-height")
+            .default_width(graph_width)
+            .default_height(graph_height)
+            .max_width(graph_width)
             .min_height(240.0)
+            .max_height(graph_height)
             .resizable([false, true])
             .show(ui, |ui| self.render_graph_canvas(ui));
         ui.collapsing("Raw DOT", |ui| {
@@ -2988,11 +3014,29 @@ impl CoeusApp {
         let fit_zoom = ((viewport.x - 24.0) / logical_size.x)
             .min((viewport.y - 24.0) / logical_size.y)
             .clamp(0.12, 1.5);
-        let zoom = if self.graph.fit_to_view {
+        let mut zoom = if self.graph.fit_to_view {
             fit_zoom
         } else {
             self.graph.zoom
         };
+        let clip_rect = ui.clip_rect();
+        let cmd_zoom_delta = ui.ctx().input(|input| {
+            if input.modifiers.command
+                && input
+                    .pointer
+                    .hover_pos()
+                    .is_some_and(|pointer| clip_rect.contains(pointer))
+            {
+                input.zoom_delta()
+            } else {
+                1.0
+            }
+        });
+        if (cmd_zoom_delta - 1.0).abs() > f32::EPSILON {
+            zoom = (zoom * cmd_zoom_delta).clamp(0.1, 3.0);
+            self.graph.zoom = zoom;
+            self.graph.fit_to_view = false;
+        }
         let canvas = Vec2::new(
             (logical_size.x * zoom + 24.0).max(viewport.x),
             (logical_size.y * zoom + 24.0).max(viewport.y).max(320.0),
@@ -3001,6 +3045,7 @@ impl CoeusApp {
         egui::Frame::dark_canvas(ui.style()).show(ui, |ui| {
             egui::ScrollArea::both()
                 .id_salt("graph-canvas")
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let (rect, _) = ui.allocate_exact_size(canvas, Sense::hover());
                     let painter = ui.painter_at(rect);
@@ -3268,16 +3313,23 @@ impl CoeusApp {
             layout.wrap.max_width = wrap_width;
             ui.fonts(|fonts| fonts.layout_job(layout))
         };
-        let xml_size = ui.available_size();
-        let response = ui.add_sized(
-            xml_size,
-            egui::TextEdit::multiline(&mut self.manifest_xml)
-                .font(FontId::monospace(12.0))
-                .desired_width(xml_size.x)
-                .code_editor()
-                .layouter(&mut layouter),
-        );
-        if response.changed() {
+        let mut xml_changed = false;
+        egui::ScrollArea::both()
+            .id_salt("manifest-editor")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let xml_size = ui.available_size();
+                let response = ui.add_sized(
+                    xml_size,
+                    egui::TextEdit::multiline(&mut self.manifest_xml)
+                        .font(FontId::monospace(12.0))
+                        .desired_width(xml_size.x)
+                        .code_editor()
+                        .layouter(&mut layouter),
+                );
+                xml_changed = response.changed();
+            });
+        if xml_changed {
             self.manifest_dirty = true;
         }
         match action {
@@ -4239,8 +4291,18 @@ impl eframe::App for CoeusApp {
             self.show_code(ctx);
         } else {
             egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-                Tab::Search => self.show_search(ui),
-                Tab::Graph => self.show_graph(ui),
+                Tab::Search => {
+                    egui::ScrollArea::both()
+                        .id_salt("search-tab")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.show_search(ui));
+                }
+                Tab::Graph => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("graph-tab")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.show_graph(ui));
+                }
                 Tab::Debugger => self.show_debugger(ui),
                 Tab::Manifest => self.show_manifest(ui),
                 Tab::Deploy => self.show_deploy(ui),
