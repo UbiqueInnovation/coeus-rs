@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 
@@ -27,9 +29,66 @@ fn command_failure(command: &str, output: &Output) -> String {
 }
 
 fn run_command(command: &mut Command, description: &str) -> Result<Output, String> {
-    command
-        .output()
-        .map_err(|error| format!("could not execute {description}: {error}"))
+    const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not execute {description}: {error}"))?;
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    loop {
+        match child
+            .try_wait()
+            .map_err(|error| format!("could not poll {description}: {error}"))?
+        {
+            Some(status) => {
+                let output = child
+                    .wait_with_output()
+                    .map_err(|error| format!("could not collect {description}: {error}"))?;
+                debug_assert_eq!(output.status, status);
+                return Ok(output);
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{description} timed out after 30 seconds"));
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    }
+}
+
+/// `adb jdwp` may keep its stdout stream open after publishing the current
+/// PID list. Discovery is complete once the command has had a short window to
+/// emit data, so do not wait for normal process termination here.
+fn run_jdwp_discovery(command: &mut Command) -> Result<(Output, bool), String> {
+    const DISCOVERY_WINDOW: Duration = Duration::from_secs(2);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not execute adb jdwp: {error}"))?;
+    let deadline = Instant::now() + DISCOVERY_WINDOW;
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| format!("could not poll adb jdwp: {error}"))?
+            .is_some()
+        {
+            let output = child
+                .wait_with_output()
+                .map_err(|error| format!("could not collect adb jdwp: {error}"))?;
+            return Ok((output, false));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .map_err(|error| format!("could not collect adb jdwp: {error}"))?;
+            return Ok((output, true));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn resolve_apksigner(explicit: Option<&Path>) -> PathBuf {
@@ -271,8 +330,8 @@ pub fn list_debuggable_apps(
 ) -> Result<Vec<DebuggableApp>, String> {
     let adb = adb_name(adb_path);
     let mut command = adb_command(&adb, serial, &["jdwp"]);
-    let output = run_command(&mut command, "adb jdwp")?;
-    if !output.status.success() {
+    let (output, discovery_was_stopped) = run_jdwp_discovery(&mut command)?;
+    if !discovery_was_stopped && !output.status.success() {
         return Err(command_failure("adb jdwp", &output));
     }
     let pids = parse_jdwp_pids(&output.stdout);

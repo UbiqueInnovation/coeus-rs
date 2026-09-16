@@ -19,9 +19,32 @@ cargo run --release
 
 Use the Browse button to choose an APK in the application. The Python
 executable can be overridden with `COEUS_PYTHON=/path/to/python`.
+The project controls can save and reopen a `.coeus` project archive. The
+archive is the GUI's portable virtual project boundary: it contains the
+current bytes of every APK member, Coeus edit history, GUI annotations, and
+`gui/session.py`, a generated Python replay script. `Export script…` writes
+that script separately for review or automation. Reopening an archive does
+not require the source APKs to remain available.
 The project/search sidebar, code pane, instruction pane, graph canvas, and
 source panes can be resized; the project and instruction panes can also be
-collapsed.
+collapsed. The Code / Edit tab gives the smali source and replacement-node
+pane the full available work area, with replacement nodes attached to the
+left side of the code view.
+
+The ADB tab lists installed packages on a connected device. Select a package
+to pull its base APK and split APKs to a local directory, or load the complete
+split set directly for analysis. The Sign / Install tab signs single APKs with
+`apksigner` and split sets with `SplitApkSet.sign_all()`, then installs them
+with `adb install` or `adb install-multiple`.
+
+The Manifest tab exposes an editable, XML-syntax-highlighted
+AndroidManifest.xml, a lightweight formatter, and shortcuts for enabling
+debuggable mode and allowing plaintext traffic with user-installed
+certificates.
+
+The Sign / Install tab can generate `debug.keystore` beside the loaded APK or
+project. It uses `keytool`, fills the generated path into the signing form,
+and refuses to overwrite an existing keystore.
 
 ## Editing model
 
@@ -46,6 +69,13 @@ cross-reference results; opening a new object from the middle of the stack
 starts a new branch. They also accept Command-Tab for forward and
 Command-Shift-Tab for backward navigation when the operating system forwards
 those shortcuts to the application.
+
+Methods, classes, and DEX strings can be annotated from the Search result menu,
+the selected object view, or the Code header/context menu. Notes use canonical
+object identities, so a yellow post-it chip appears beside the object wherever
+it is referenced in search results, cross-references, graph details, or decoded
+code. Click a chip to read the full note; notes are stored in the GUI metadata
+when a `.coeus` project is saved.
 
 Instruction nodes with parameters open a typed argument form before applying.
 For example, the function replacement node exposes argument register count,

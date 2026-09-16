@@ -36,6 +36,9 @@ impl FromBytes for JdwpCommandPacket {
         let flags = buf.read_u8()?;
         let command_set = buf.read_u8()?;
         let command = buf.read_u8()?;
+        if length < 11 {
+            bail!("Invalid JDWP command packet length: {length}");
+        }
         let mut data = vec![0u8; (length - 11) as usize];
         buf.read_exact(&mut data)?;
 
@@ -83,6 +86,9 @@ impl FromBytes for JdwpReplyPacket {
         let id = buf.read_u32::<BigEndian>()?;
         let flags = buf.read_u8()?;
         let error_code = buf.read_u16::<BigEndian>()?;
+        if length < 11 {
+            bail!("Invalid JDWP reply packet length: {length}");
+        }
         let mut data = vec![0u8; (length - 11) as usize];
         buf.read_exact(&mut data)?;
 
@@ -367,9 +373,7 @@ impl StackFrame {
             let cmd =
                 JdwpCommandPacket::set_values(20, self.thread_id, self.frame_id, slot_idx, value)?;
             client.send_cmd(JdwpPacket::CommandPacket(cmd))?;
-            let Some(JdwpPacket::ReplyPacket(_)) = client.wait_for_package().await else {
-                bail!("Wrong answer");
-            };
+            let _ = client.wait_for_reply().await?;
             Ok(())
         })
     }
@@ -410,10 +414,7 @@ impl StackFrame {
                         &slots_in_scope,
                     )?;
                     client.send_cmd(JdwpPacket::CommandPacket(cmd))?;
-                    let Some(JdwpPacket::ReplyPacket(reply)) = client.wait_for_package().await
-                    else {
-                        bail!("Wrong answer");
-                    };
+                    let reply = client.wait_for_reply().await?;
                     error_code = reply.get_error();
                     if error_code == 34 {
                         continue;
@@ -463,6 +464,8 @@ pub struct Composite {
 pub enum Event {
     SingleStep(SimpleEventData),
     Breakpoint(SimpleEventData),
+    VmStart(u64),
+    VmDeath,
 }
 
 #[derive(Debug)]
@@ -526,7 +529,16 @@ impl TryFrom<JdwpCommandPacket> for Composite {
                     let bp: SimpleEventData = SimpleEventData::from_bytes(&mut reader)?;
                     events.push(Event::Breakpoint(bp));
                 }
-                _ => continue,
+                90 => {
+                    let _request_id = reader.read_u32::<BigEndian>()?;
+                    let thread_id = reader.read_u64::<BigEndian>()?;
+                    events.push(Event::VmStart(thread_id));
+                }
+                99 => {
+                    let _request_id = reader.read_u32::<BigEndian>()?;
+                    events.push(Event::VmDeath);
+                }
+                _ => bail!("Unsupported JDWP event kind: {event_kind}"),
             }
         }
         Ok(Self {
@@ -621,13 +633,7 @@ impl Thread {
         runtime.block_on(async {
             let cmd = JdwpCommandPacket::get_stack_frames(rand::random(), self.thread_id, 0, 1)?;
             client.send_cmd(JdwpPacket::CommandPacket(cmd))?;
-            let response = client
-                .wait_for_package()
-                .await
-                .ok_or_else(|| anyhow::Error::msg("No answer"))?;
-            let JdwpPacket::ReplyPacket(reply) = response else {
-                bail!("Wrong packet");
-            };
+            let reply = client.wait_for_reply().await?;
             let mut reader = Cursor::new(reply.data);
             let number_of_frames = reader.read_u32::<BigEndian>()?;
             if number_of_frames != 1 {

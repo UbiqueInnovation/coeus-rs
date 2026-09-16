@@ -8,17 +8,25 @@ existing Python API as the single source of truth for analysis and debugging.
 
 import queue
 import re
+import shutil
+import subprocess
 import sys
+import json
+import tempfile
 import threading
 import traceback
 import os
+import zipfile
+from pathlib import Path
 
 from coeus_python import (
     AnalyzeObject,
     DexInstruction,
     Debugger,
     StackValue,
+    SplitApkSet,
     VmInstance,
+    forward_jdwp,
     list_debuggable_apps,
 )
 
@@ -33,6 +41,7 @@ ENABLE_EXPERIMENTAL_METHOD_EDITS = os.environ.get(
 class Backend:
     def __init__(self):
         self.ao = None
+        self.split_set = None
         self.objects = {}
         self.next_object_id = 1
         self.debugger = None
@@ -41,6 +50,16 @@ class Backend:
         self.debug_values = []
         self.debug_wait = None
         self.debug_waiting = False
+        self.debug_breakpoints = set()
+        self.debug_control_queue = queue.Queue()
+        self.debug_connect_result = None
+        self.debug_connecting = False
+        self.debug_apps_result = None
+        self.debug_apps_loading = False
+        self.session_origin = None
+        self.session_events = []
+        self.session_script_override = None
+        self.notes = {}
 
     def _refresh_method(self, object_id):
         """Refresh a method wrapper after Coeus reparses an edited DEX."""
@@ -104,6 +123,20 @@ class Backend:
             pass
         return str(obj)
 
+    @staticmethod
+    def _annotation_key(kind, obj):
+        """Return an identity that survives transient GUI object IDs."""
+        try:
+            if kind == "method":
+                return "method:{}".format(obj.signature())
+            if kind == "class":
+                return "class:{}".format(obj.name())
+            if kind == "string":
+                return "string:{}:{}".format(obj.get_dex_name(), obj.get_index())
+        except Exception:
+            pass
+        return ""
+
     def _result(self, obj, evidence=None, kind=None):
         object_id = self._id(obj, evidence, kind)
         actual_kind = self.objects[object_id]["kind"]
@@ -120,6 +153,11 @@ class Backend:
         dex_name = self._dex_name(actual_kind, self.objects[object_id]["object"])
         if dex_name:
             result["dex"] = dex_name
+        annotation_key = self._annotation_key(
+            actual_kind, self.objects[object_id]["object"]
+        )
+        if annotation_key:
+            result["note_key"] = annotation_key
         return result
 
     @staticmethod
@@ -146,6 +184,12 @@ class Backend:
 
     def load(self, path):
         self.ao = AnalyzeObject(path, False, -1)
+        self.split_set = None
+        self.session_origin = {"kind": "apk", "path": str(path)}
+        self.session_events = []
+        self.session_script_override = None
+        self.notes = {}
+        self.debug_breakpoints.clear()
         self.objects.clear()
         self.next_object_id = 1
         manifests = self.ao.get_manifests()
@@ -155,13 +199,632 @@ class Backend:
             "package": package,
             "dex": self.ao.get_dex_names(),
             "files": len(self.ao.get_file_names()),
+            "manifest": self.ao.get_manifest_xml(),
+            "split": False,
+            "members": [],
+            "notes": self.notes,
+            "history": self._history(),
         }
+
+    def load_split(self, paths):
+        paths = [str(path) for path in paths if str(path).strip()]
+        if not paths:
+            raise RuntimeError("select at least one APK for the split set")
+        self.split_set = SplitApkSet(paths, False, -1)
+        self.ao = self.split_set.get_base_apk()
+        self.session_origin = {"kind": "split", "paths": paths}
+        self.session_events = []
+        self.session_script_override = None
+        self.notes = {}
+        self.debug_breakpoints.clear()
+        self.objects.clear()
+        self.next_object_id = 1
+        manifests = self.ao.get_manifests()
+        package = manifests[0].get_package() if manifests else ""
+        return {
+            "path": ", ".join(paths),
+            "package": package,
+            "dex": self.ao.get_dex_names(),
+            "files": len(self.ao.get_file_names()),
+            "manifest": self.ao.get_manifest_xml(),
+            "split": True,
+            "members": self.split_set.get_names(),
+            "notes": self.notes,
+            "history": self._history(),
+        }
+
+    def load_split_from_adb(self, package, serial=None, adb_path=None):
+        package = str(package).strip()
+        if not package:
+            raise RuntimeError("enter a package name to pull its split APKs")
+        self.split_set = SplitApkSet.from_adb(
+            package,
+            str(serial).strip() if serial else None,
+            str(adb_path).strip() if adb_path else None,
+            False,
+            -1,
+        )
+        self.ao = self.split_set.get_base_apk()
+        self.session_origin = {
+            "kind": "adb",
+            "package": package,
+            "serial": str(serial).strip() if serial else None,
+            "adb_path": str(adb_path).strip() if adb_path else None,
+        }
+        self.session_events = []
+        self.session_script_override = None
+        self.notes = {}
+        self.debug_breakpoints.clear()
+        self.objects.clear()
+        self.next_object_id = 1
+        manifests = self.ao.get_manifests()
+        actual_package = manifests[0].get_package() if manifests else package
+        return {
+            "path": "ADB: {}".format(package),
+            "package": actual_package,
+            "dex": self.ao.get_dex_names(),
+            "files": len(self.ao.get_file_names()),
+            "manifest": self.ao.get_manifest_xml(),
+            "split": True,
+            "members": self.split_set.get_names(),
+            "notes": self.notes,
+            "history": self._history(),
+        }
+
+    def load_project(self, path):
+        path = str(path)
+        self.split_set = SplitApkSet.load_state(path, False, -1)
+        self.ao = self.split_set.get_base_apk()
+        self.session_origin = {"kind": "state", "path": path}
+        self.session_events = []
+        self.session_script_override = None
+        self.notes = {}
+        try:
+            with zipfile.ZipFile(path, "r") as archive:
+                metadata = json.loads(archive.read("gui/session.json").decode("utf-8"))
+                saved_script = archive.read("gui/session.py").decode("utf-8")
+            if saved_script.strip():
+                # The archive already contains the script for the edits that
+                # produced its embedded APK bytes. Replaying those events on
+                # the embedded, already-edited APK would apply them twice.
+                self.session_script_override = saved_script
+            notes = metadata.get("notes", {})
+            if isinstance(notes, dict):
+                self.notes = {
+                    str(key): str(value)
+                    for key, value in notes.items()
+                    if str(key).strip() and str(value).strip()
+                }
+        except (KeyError, OSError, ValueError, UnicodeDecodeError, zipfile.BadZipFile):
+            pass
+        self.debug_breakpoints.clear()
+        self.objects.clear()
+        self.next_object_id = 1
+        manifests = self.ao.get_manifests()
+        package = manifests[0].get_package() if manifests else ""
+        return {
+            "path": path,
+            "package": package,
+            "dex": self.ao.get_dex_names(),
+            "files": len(self.ao.get_file_names()),
+            "manifest": self.ao.get_manifest_xml(),
+            "split": len(self.split_set.get_names()) > 1,
+            "members": self.split_set.get_names(),
+            "notes": self.notes,
+            "history": self._history(),
+        }
+
+    def manifest_data(self):
+        if self.ao is None:
+            raise RuntimeError("load an APK first")
+        manifests = self.ao.get_manifests()
+        return {
+            "xml": self.ao.get_manifest_xml(),
+            "package": manifests[0].get_package() if manifests else "",
+            "history": self._history(),
+        }
+
+    def _history(self):
+        if self.split_set is not None:
+            return self.split_set.get_history()
+        if self.ao is not None:
+            return self.ao.get_history()
+        return []
+
+    def _record_event(self, event):
+        self.session_script_override = None
+        self.session_events.append(event)
+
+    def history_data(self):
+        return {
+            "history": self._history(),
+            "events": list(self.session_events),
+            "script": self.session_script(),
+        }
+
+    @staticmethod
+    def _script_instruction(factory, arguments):
+        arguments = arguments or {}
+
+        def integer(name, default=0):
+            value = str(arguments.get(name, default))
+            return "int({}, 0)".format(json.dumps(value))
+
+        def text(name, default=""):
+            return json.dumps(str(arguments.get(name, default)))
+
+        if factory == "nop":
+            return "DexInstruction.nop()"
+        if factory == "return_void":
+            return "DexInstruction.return_void()"
+        if factory == "return_value":
+            return "DexInstruction.return_value({})".format(integer("register"))
+        if factory == "throw":
+            return "DexInstruction.throw({})".format(integer("register"))
+        if factory == "const_string_value":
+            return "DexInstruction.const_string_value({}, {})".format(
+                integer("register"), text("value")
+            )
+        if factory == "const_string":
+            return "DexInstruction.const_string({}, {})".format(
+                integer("register"), integer("string_index")
+            )
+        if factory == "const_string_jumbo":
+            return "DexInstruction.const_string_jumbo({}, {})".format(
+                integer("register"), integer("string_index")
+            )
+        if factory == "const_lit32":
+            return "DexInstruction.const_lit32({}, {})".format(
+                integer("register"), integer("value")
+            )
+        if factory in {"move_from16", "move_object_from16"}:
+            return "DexInstruction.{}({}, {})".format(
+                factory, integer("register"), integer("source_register")
+            )
+        if factory in {"new_instance", "check_cast"}:
+            return "DexInstruction.{}({}, {})".format(
+                factory, integer("register"), integer("type_index")
+            )
+        if factory == "invoke_static_range":
+            return "DexInstruction.invoke_static_range({}, {}, {})".format(
+                integer("register_count", 1),
+                integer("method_index"),
+                integer("first_register"),
+            )
+        if factory in {"if_eq", "if_ne", "if_lt", "if_le", "if_gt", "if_ge"}:
+            return "DexInstruction.{}({}, {}, after)".format(
+                factory, integer("left_register"), integer("right_register")
+            )
+        if factory in {"if_eqz", "if_nez", "if_ltz", "if_lez", "if_gtz", "if_gez"}:
+            return "DexInstruction.{}({}, after)".format(factory, integer("register"))
+        if factory == "goto":
+            return "DexInstruction.goto(after)"
+        if factory == "switch":
+            return "DexInstruction.switch({}, [({}, after)])".format(
+                integer("register"), integer("case_value")
+            )
+        return None
+
+    def session_script(self):
+        if self.session_script_override is not None and not self.session_events:
+            return self.session_script_override
+        origin = self.session_origin or {}
+        lines = [
+            "# Generated by Coeus GUI. Review paths and values before running.",
+            "import re",
+            "from coeus_python import AnalyzeObject, DexInstruction, SplitApkSet",
+            "",
+        ]
+        kind = origin.get("kind")
+        if kind == "state":
+            lines.extend([
+                "analysis = SplitApkSet.load_state({})".format(
+                    json.dumps(origin.get("path", "project.coeus"))
+                ),
+                "ao = analysis.get_base_apk()",
+            ])
+        elif kind == "split":
+            lines.extend([
+                "analysis = SplitApkSet({})".format(
+                    json.dumps(origin.get("paths", []))
+                ),
+                "ao = analysis.get_base_apk()",
+            ])
+        elif kind == "adb":
+            lines.extend([
+                "analysis = SplitApkSet.from_adb({}, {}, {})".format(
+                    json.dumps(origin.get("package", "")),
+                    json.dumps(origin.get("serial")),
+                    json.dumps(origin.get("adb_path")),
+                ),
+                "ao = analysis.get_base_apk()",
+            ])
+        else:
+            lines.append(
+                "ao = AnalyzeObject({}, False, -1)".format(
+                    json.dumps(origin.get("path", "input.apk"))
+                )
+            )
+        lines.extend([
+            "",
+            "def find_method(signature):",
+            "    name = signature.split('->', 1)[-1].split('(', 1)[0]",
+            "    for evidence in ao.find_methods(re.escape(name)):",
+            "        try:",
+            "            method = evidence.as_method()",
+            "            if method.signature() == signature:",
+            "                return method",
+            "        except Exception:",
+            "            pass",
+            "    raise RuntimeError('method not found: ' + signature)",
+            "",
+            "def find_string(dex_name, index):",
+            "    for evidence in ao.find_strings('.*'):",
+            "        try:",
+            "            value = evidence.as_string()",
+            "            if value.get_dex_name() == dex_name and value.get_index() == index:",
+            "                return value",
+            "        except Exception:",
+            "            pass",
+            "    raise RuntimeError('string not found: {}:{}'.format(dex_name, index))",
+            "",
+        ])
+        for event in self.session_events:
+            operation = event.get("operation")
+            if operation == "set_manifest_xml":
+                lines.extend([
+                    "ao.set_manifest_xml({})".format(json.dumps(event.get("xml", ""))),
+                    "",
+                ])
+            elif operation == "set_debuggable":
+                lines.extend(["ao.set_debuggable({})".format(bool(event.get("enabled"))), ""])
+            elif operation == "allow_plaintext_and_user_certificates":
+                lines.extend(["ao.allow_plaintext_and_user_certificates()", ""])
+            elif operation == "replace_string":
+                lines.extend([
+                    "ao.replace_string(find_string({}, {}), {})".format(
+                        json.dumps(event.get("dex", "")),
+                        int(event.get("index", 0)),
+                        json.dumps(event.get("replacement", "")),
+                    ),
+                    "",
+                ])
+            elif operation == "apply_edit":
+                replacement = self._script_instruction(
+                    event.get("factory", ""), event.get("arguments", {})
+                )
+                if replacement is None:
+                    lines.append("# Unsupported recorded edit: {!r}".format(event))
+                    lines.append("")
+                    continue
+                lines.extend([
+                    "method = find_method({})".format(
+                        json.dumps(event.get("method", ""))
+                    ),
+                    "target = next(i for i in method.get_instructions() if i.get_offset() == {})".format(
+                        int(event.get("offset", 0))
+                    ),
+                    "editor = ao.edit_method(method)",
+                    "after = editor.label_after(target)",
+                    "replacement = {}".format(replacement),
+                ])
+                action = event.get("action", "replace")
+                if action == "prepend":
+                    lines.append("editor.prepend([replacement])")
+                elif action == "insert_before":
+                    lines.append("editor.insert_before(target, [replacement])")
+                elif action == "insert_after":
+                    lines.append("editor.insert_after(target, [replacement])")
+                else:
+                    lines.append("editor.replace(target, [replacement])")
+                lines.extend(["method = editor.commit(ao)", ""])
+            elif operation == "write":
+                lines.extend([
+                    "ao.write_apk({})".format(json.dumps(event.get("path", "edited.apk"))),
+                    "",
+                ])
+        lines.extend([
+            "# Example output when no explicit write was recorded:",
+            "# ao.write_apk('edited.apk')",
+        ])
+        return "\n".join(lines) + "\n"
+
+    def _write_project_metadata(self, path):
+        metadata = {
+            "format_version": 1,
+            "origin": self.session_origin,
+            "events": self.session_events,
+            "history": self._history(),
+            "notes": self.notes,
+        }
+        directory = str(Path(path).expanduser().resolve().parent)
+        temporary = tempfile.NamedTemporaryFile(
+            prefix=".coeus-project-", suffix=".tmp", dir=directory, delete=False
+        )
+        temporary_path = temporary.name
+        temporary.close()
+        try:
+            with zipfile.ZipFile(path, "r") as source, zipfile.ZipFile(
+                temporary_path, "w", compression=zipfile.ZIP_DEFLATED
+            ) as target:
+                for entry in source.infolist():
+                    if entry.filename in {"gui/session.json", "gui/session.py"}:
+                        continue
+                    target.writestr(entry, source.read(entry.filename))
+                target.writestr(
+                    "gui/session.json",
+                    json.dumps(metadata, indent=2, sort_keys=True).encode("utf-8"),
+                )
+                target.writestr("gui/session.py", self.session_script().encode("utf-8"))
+            os.replace(temporary_path, path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+    def save_project(self, path):
+        if self.ao is None:
+            raise RuntimeError("load an APK before saving a project")
+        path = str(path)
+        if self.split_set is not None:
+            self.split_set.save_state(path)
+        elif hasattr(self.ao, "save_state"):
+            self.ao.save_state(path)
+        else:
+            raise RuntimeError("the installed coeus_python wheel cannot save project state")
+        self._write_project_metadata(path)
+        return {"path": path, "history": self._history(), "script": self.session_script()}
+
+    def set_note(self, key, note):
+        """Create, replace, or remove a GUI annotation."""
+        key = str(key).strip()
+        if not key:
+            raise RuntimeError("note requires an annotated object")
+        note = str(note)
+        if note.strip():
+            self.notes[key] = note
+        else:
+            self.notes.pop(key, None)
+        return {"key": key, "note": self.notes.get(key, "")}
+
+    def export_script(self, path):
+        path = str(path)
+        Path(path).write_text(self.session_script(), encoding="utf-8")
+        return {"path": path}
+
+    def generate_keystore(
+        self, directory, alias, store_password, key_password=None, filename="debug.keystore"
+    ):
+        directory = Path(str(directory)).expanduser()
+        if not directory.is_dir():
+            raise RuntimeError("keystore folder does not exist: {}".format(directory))
+        filename = Path(str(filename)).name
+        if not filename or filename in {".", ".."}:
+            raise RuntimeError("invalid keystore filename")
+        path = directory / filename
+        if path.exists():
+            raise RuntimeError("keystore already exists: {}".format(path))
+        alias = str(alias).strip()
+        store_password = str(store_password)
+        if not alias:
+            raise RuntimeError("keystore alias must not be empty")
+        if not store_password:
+            raise RuntimeError("keystore password must not be empty")
+        key_password = str(key_password) if key_password else store_password
+        executable = shutil.which("keytool") or "keytool"
+        completed = subprocess.run(
+            [
+                executable,
+                "-genkeypair",
+                "-noprompt",
+                "-keystore",
+                str(path),
+                "-alias",
+                alias,
+                "-keyalg",
+                "RSA",
+                "-keysize",
+                "2048",
+                "-validity",
+                "10000",
+                "-storepass",
+                store_password,
+                "-keypass",
+                key_password,
+                "-dname",
+                "CN=CoEUS Debug,O=CoEUS,C=US",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if completed.returncode != 0:
+            if path.exists():
+                path.unlink()
+            raise RuntimeError(
+                "keytool failed: {}".format(
+                    (completed.stderr or completed.stdout).strip()
+                )
+            )
+        return {"path": str(path), "alias": alias}
+
+    def set_manifest_xml(self, xml):
+        if self.ao is None:
+            raise RuntimeError("load an APK first")
+        xml = str(xml)
+        self.ao.set_manifest_xml(xml)
+        self._record_event({"operation": "set_manifest_xml", "xml": xml})
+        data = self.manifest_data()
+        data["history"] = self._history()
+        return data
+
+    def set_debuggable(self, enabled):
+        if self.ao is None:
+            raise RuntimeError("load an APK first")
+        enabled = bool(enabled)
+        self.ao.set_debuggable(enabled)
+        self._record_event({"operation": "set_debuggable", "enabled": enabled})
+        data = self.manifest_data()
+        data["history"] = self._history()
+        return data
+
+    def allow_plaintext_and_user_certificates(self):
+        if self.ao is None:
+            raise RuntimeError("load an APK first")
+        self.ao.allow_plaintext_and_user_certificates()
+        self._record_event(
+            {"operation": "allow_plaintext_and_user_certificates"}
+        )
+        data = self.manifest_data()
+        data["history"] = self._history()
+        return data
 
     def write(self, path):
         if self.ao is None:
             raise RuntimeError("load an APK first")
         self.ao.write_apk(path)
-        return {"path": path, "history": self.ao.get_history()}
+        self._record_event({"operation": "write", "path": str(path)})
+        return {"path": path, "history": self._history()}
+
+    @staticmethod
+    def _adb_executable(adb_path):
+        if adb_path and str(adb_path).strip():
+            return str(adb_path).strip()
+        return shutil.which("adb") or "adb"
+
+    def adb_devices(self, adb_path=None):
+        executable = self._adb_executable(adb_path)
+        completed = subprocess.run(
+            [executable, "devices", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "adb devices failed: {}".format(
+                    (completed.stderr or completed.stdout).strip()
+                )
+            )
+        devices = []
+        for line in completed.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("List of devices"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            serial, state = parts[:2]
+            if state != "device":
+                continue
+            model = next(
+                (part.split(":", 1)[1] for part in parts[2:] if part.startswith("model:")),
+                "",
+            )
+            devices.append({
+                "serial": serial,
+                "model": model,
+                "label": "{}{}".format(serial, " — {}".format(model) if model else ""),
+            })
+        return {"devices": devices}
+
+    def adb_packages(self, package_regex=None, serial=None, adb_path=None):
+        packages = SplitApkSet.list_packages(
+            str(package_regex) if package_regex and str(package_regex).strip() else None,
+            str(serial).strip() if serial else None,
+            str(adb_path).strip() if adb_path else None,
+        )
+        return {"packages": packages}
+
+    def pull_apks(self, package, output_dir, serial=None, adb_path=None):
+        loaded = self.load_split_from_adb(package, serial, adb_path)
+        if self.split_set is None:
+            raise RuntimeError("ADB did not return an APK set")
+        paths = self.split_set.write_all(str(output_dir))
+        return {"loaded": loaded, "output_dir": str(output_dir), "paths": paths}
+
+    def install_apk(self, path, serial=None, adb_path=None, replace_existing=True):
+        executable = self._adb_executable(adb_path)
+        command = [executable]
+        if serial and str(serial).strip():
+            command.extend(["-s", str(serial).strip()])
+        command.append("install")
+        if replace_existing:
+            command.append("-r")
+        command.append(str(path))
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        output = (completed.stdout or completed.stderr).strip()
+        if completed.returncode != 0:
+            raise RuntimeError("adb install failed: {}".format(output))
+        return {"path": str(path), "serial": serial or "", "output": output}
+
+    def sign_apk(self, output, keystore, alias, store_password, key_password=None, apksigner=None):
+        if self.ao is None:
+            raise RuntimeError("load an APK first")
+        self.ao.sign_apk(
+            str(output),
+            str(keystore),
+            str(alias),
+            str(store_password),
+            str(key_password) if key_password else None,
+            str(apksigner) if apksigner else None,
+        )
+        return {"path": str(output)}
+
+    def sign_split(self, output_dir, keystore, alias, store_password,
+                   key_password=None, apksigner=None):
+        if self.split_set is None:
+            raise RuntimeError("load a split APK set first")
+        paths = self.split_set.sign_all(
+            str(output_dir),
+            str(keystore),
+            str(alias),
+            str(store_password),
+            str(key_password) if key_password else None,
+            str(apksigner) if apksigner else None,
+        )
+        return {"output_dir": str(output_dir), "paths": paths, "split": True}
+
+    def install_split(self, output_dir, serial=None, adb_path=None, replace_existing=True):
+        if self.split_set is None:
+            raise RuntimeError("load a split APK set first")
+        output = self.split_set.install_all(
+            str(output_dir),
+            str(serial).strip() if serial else None,
+            str(adb_path).strip() if adb_path else None,
+            bool(replace_existing),
+            False,
+        )
+        return {
+            "output_dir": str(output_dir),
+            "serial": serial or "",
+            "output": output,
+            "split": True,
+        }
+
+    def sign_and_install_split(self, output_dir, keystore, alias, store_password,
+                               key_password=None, apksigner=None, serial=None,
+                               adb_path=None, replace_existing=True):
+        self.sign_split(
+            output_dir, keystore, alias, store_password, key_password, apksigner
+        )
+        return self.install_split(output_dir, serial, adb_path, replace_existing)
+
+    def sign_and_install(self, output, keystore, alias, store_password,
+                         key_password=None, apksigner=None, serial=None,
+                         adb_path=None, replace_existing=True):
+        signed = self.sign_apk(
+            output, keystore, alias, store_password, key_password, apksigner
+        )
+        installed = self.install_apk(
+            signed["path"], serial, adb_path, replace_existing
+        )
+        signed.update(installed)
+        return signed
 
     def search(self, kind, query):
         if self.ao is None:
@@ -278,6 +941,9 @@ class Backend:
             "kind": kind,
             "label": self._label(kind, obj),
         }
+        annotation_key = self._annotation_key(kind, obj)
+        if annotation_key:
+            data["note_key"] = annotation_key
         if kind == "method":
             data.update(
                 {
@@ -302,18 +968,29 @@ class Backend:
         entry = self._entry(object_id)
         if entry["kind"] != "string":
             raise RuntimeError("string-pool editing requires a DEX string")
-        self.ao.replace_string(entry["object"], str(replacement))
+        dex_name = entry["object"].get_dex_name()
+        string_index = entry["object"].get_index()
+        replacement = str(replacement)
+        self.ao.replace_string(entry["object"], replacement)
         refreshed = None
-        for evidence in self.ao.find_strings(re.escape(str(replacement))):
+        for evidence in self.ao.find_strings(re.escape(replacement)):
             kind, obj = self._concrete(evidence)
-            if kind == "string" and obj.content() == str(replacement):
+            if kind == "string" and obj.content() == replacement:
                 refreshed = (evidence, obj)
                 break
         if refreshed is not None:
             evidence, obj = refreshed
             entry["object"] = obj
             entry["evidence"] = evidence
-        return {"id": object_id, "value": str(replacement)}
+        self._record_event(
+            {
+                "operation": "replace_string",
+                "dex": dex_name,
+                "index": int(string_index),
+                "replacement": replacement,
+            }
+        )
+        return {"id": object_id, "value": replacement, "history": self._history()}
 
     @staticmethod
     def _edit_argument(name, label, value, kind="integer", picker=None):
@@ -596,7 +1273,22 @@ class Backend:
             editor.replace(option["target"], [option["object"]])
         method_entry["object"] = editor.commit(self.ao)
         method_entry["evidence"] = None
-        return self.describe(option["method_id"])
+        self._record_event(
+            {
+                "operation": "apply_edit",
+                "method": method.signature(),
+                "offset": int(option["offset"]),
+                "action": option["action"],
+                "factory": option["factory"],
+                "arguments": {
+                    str(name): str(value)
+                    for name, value in argument_values.items()
+                },
+            }
+        )
+        data = self.describe(option["method_id"])
+        data["history"] = self._history()
+        return data
 
     def cross_references(self, object_id):
         if self.ao is None:
@@ -689,21 +1381,113 @@ class Backend:
             "targets": targets,
         }
 
+    @staticmethod
+    def _debug_connect_worker(result_queue, host, port, forward=None):
+        try:
+            if forward is not None:
+                pid, serial, adb_path = forward
+                forward_jdwp(pid, port, serial, adb_path)
+            result_queue.put(("ok", Debugger(host, int(port))))
+        except Exception as error:
+            result_queue.put(("error", str(error)))
+
     def debug_connect(self, host, port):
-        self.debugger = Debugger(host, int(port))
+        if self.debug_connecting:
+            return {"connecting": True, "host": host, "port": int(port)}
+        self.debug_connect_result = queue.Queue(maxsize=1)
+        self.debug_connecting = True
+        threading.Thread(
+            target=self._debug_connect_worker,
+            args=(self.debug_connect_result, str(host), int(port)),
+            daemon=True,
+        ).start()
+        return {"connecting": True, "host": host, "port": int(port)}
+
+    def debug_attach(self, pid, port, serial=None, adb_path=None):
+        if self.debug_connecting:
+            return {"connecting": True, "port": int(port)}
+        self.debug_connect_result = queue.Queue(maxsize=1)
+        self.debug_connecting = True
+        threading.Thread(
+            target=self._debug_connect_worker,
+            args=(
+                self.debug_connect_result,
+                "127.0.0.1",
+                int(port),
+                (
+                    int(pid),
+                    str(serial).strip() if serial else None,
+                    str(adb_path).strip() if adb_path else None,
+                ),
+            ),
+            daemon=True,
+        ).start()
+        return {"connecting": True, "port": int(port), "pid": int(pid)}
+
+    def debug_connect_poll(self):
+        if not self.debug_connecting or self.debug_connect_result is None:
+            return {"connecting": False, "connected": self.debugger is not None}
+        try:
+            status, value = self.debug_connect_result.get_nowait()
+        except queue.Empty:
+            return {"connecting": True}
+        self.debug_connecting = False
+        self.debug_connect_result = None
+        if status == "error":
+            raise RuntimeError(value)
+        self.debugger = value
         self.debug_frame = None
         self.debug_method = None
         self.debug_values = []
-        return {"connected": True, "host": host, "port": int(port)}
+        self.debug_breakpoints.clear()
+        return {"connecting": False, "connected": True}
+
+    @staticmethod
+    def _debug_apps_worker(result_queue, serial, adb_path):
+        try:
+            apps = list_debuggable_apps(serial, adb_path)
+            result_queue.put((
+                "ok",
+                [
+                    {
+                        "pid": app.pid,
+                        "process": app.process_name,
+                        "package": app.package_name,
+                    }
+                    for app in apps
+                ],
+            ))
+        except Exception as error:
+            result_queue.put(("error", str(error)))
 
     def debug_apps(self, serial=None, adb_path=None):
-        apps = list_debuggable_apps(serial, adb_path)
-        return {
-            "apps": [
-                {"pid": app.pid, "process": app.process_name, "package": app.package_name}
-                for app in apps
-            ]
-        }
+        if self.debug_apps_loading:
+            return {"loading": True}
+        self.debug_apps_result = queue.Queue(maxsize=1)
+        self.debug_apps_loading = True
+        threading.Thread(
+            target=self._debug_apps_worker,
+            args=(
+                self.debug_apps_result,
+                str(serial).strip() if serial else None,
+                str(adb_path).strip() if adb_path else None,
+            ),
+            daemon=True,
+        ).start()
+        return {"loading": True}
+
+    def debug_apps_poll(self):
+        if not self.debug_apps_loading or self.debug_apps_result is None:
+            return {"loading": False, "apps": []}
+        try:
+            status, value = self.debug_apps_result.get_nowait()
+        except queue.Empty:
+            return {"loading": True}
+        self.debug_apps_loading = False
+        self.debug_apps_result = None
+        if status == "error":
+            raise RuntimeError(value)
+        return {"loading": False, "apps": value}
 
     def debug_breakpoint(self, object_id, offset):
         if self.debugger is None:
@@ -711,15 +1495,115 @@ class Backend:
         entry = self._entry(object_id)
         if entry["kind"] != "method":
             raise RuntimeError("breakpoints require a method")
-        self.debugger.set_breakpoint(entry["object"], int(offset))
-        return {"location": "{}@0x{:x}".format(entry["object"].signature(), int(offset))}
+        offset = int(offset)
+        key = (entry["object"].signature(), offset)
+        enabled = key not in self.debug_breakpoints
+        if self.debug_waiting:
+            result = queue.Queue(maxsize=1)
+            self.debug_control_queue.put(
+                ("set" if enabled else "clear", entry["object"], offset, result)
+            )
+            try:
+                status, error = result.get(timeout=5)
+            except queue.Empty:
+                raise RuntimeError(
+                    "timed out while changing the breakpoint from the JDWP wait thread"
+                )
+            if status != "ok":
+                raise RuntimeError(error)
+            if enabled:
+                self.debug_breakpoints.add(key)
+                return {
+                    "enabled": True,
+                    "offset": offset,
+                    "location": "{}@0x{:x}".format(entry["object"].signature(), offset),
+                    "waiting": True,
+                }
+            else:
+                self.debug_waiting = False
+                self.debug_wait = None
+                self.debug_breakpoints.remove(key)
+                return {
+                    "enabled": False,
+                    "offset": offset,
+                    "location": "{}@0x{:x}".format(entry["object"].signature(), offset),
+                    "waiting": False,
+                }
+
+        if not enabled:
+            self.debugger.clear_breakpoint(entry["object"], offset)
+            self.debug_breakpoints.remove(key)
+            return {
+                "enabled": False,
+                "offset": offset,
+                "location": "{}@0x{:x}".format(entry["object"].signature(), offset),
+                "waiting": False,
+            }
+        self.debugger.set_breakpoint(entry["object"], offset)
+        self.debug_breakpoints.add(key)
+        # A stopped frame means the VM is already suspended and there is no
+        # need to start an event waiter yet. Starting one here would make the
+        # GUI report ``waiting`` and disable Resume, leaving the user unable
+        # to continue after adding a breakpoint to another instruction.
+        # Once the user resumes, debug_resume starts the waiter and the new
+        # breakpoint remains active for the next event.
+        wait = {"waiting": False}
+        if self.debug_frame is None:
+            # Start listening immediately so a breakpoint remains useful even
+            # if the user switches away from the Debugger tab. The worker owns
+            # the native JDWP wait, while the JSON bridge stays available for
+            # the GUI.
+            wait = self.debug_wait_start()
+        return {
+            "enabled": True,
+            "offset": offset,
+            "location": "{}@0x{:x}".format(entry["object"].signature(), offset),
+            **wait,
+        }
+
+    def _handle_debug_control(self, command):
+        kind, method, offset, result = command
+        try:
+            if kind == "set":
+                self.debugger.set_breakpoint(method, offset)
+            elif kind == "clear":
+                self.debugger.clear_breakpoint(method, offset)
+            else:
+                raise RuntimeError("unknown debugger control: {}".format(kind))
+        except Exception as error:
+            result.put(("error", str(error)))
+        else:
+            result.put(("ok", None))
+        # Clearing cancels the wait worker. Setting leaves it as the owner of
+        # the JDWP connection so it can continue polling safely.
+        return kind == "clear"
 
     def _wait_worker(self):
-        try:
-            frame = self.debugger.wait_for_package()
+        while True:
+            try:
+                command = self.debug_control_queue.get_nowait()
+            except queue.Empty:
+                command = None
+            if command is not None and self._handle_debug_control(command):
+                return
+            try:
+                frame = self.debugger.poll_for_package(250)
+            except Exception as error:
+                self.debug_wait.put(("error", str(error)))
+                return
+            if frame is None:
+                continue
+            # Prefer a clear request that arrived while the native poll was
+            # resolving the stopped frame. In that case the breakpoint is
+            # cleared and the frame is intentionally discarded.
+            try:
+                command = self.debug_control_queue.get_nowait()
+            except queue.Empty:
+                command = None
+            if command is not None and self._handle_debug_control(command):
+                return
             self.debug_wait.put(("frame", frame))
-        except Exception as error:
-            self.debug_wait.put(("error", str(error)))
+            return
 
     def debug_wait_start(self):
         if self.debugger is None:
@@ -744,16 +1628,51 @@ class Backend:
     def _frame_data(self, frame):
         class_name = frame.get_class_name(self.debugger)
         method_name = frame.get_method_name(self.debugger)
+        method_signature = frame.get_method_signature(self.debugger)
         classes = self.ao.find_classes(re.escape(class_name))
         if not classes:
             raise RuntimeError("class {} is not present in the loaded APK".format(class_name))
-        method = classes[0].as_class()[method_name]
+        method = None
+        lookup_errors = []
+        for evidence in classes:
+            try:
+                method = evidence.as_class().get_method_by_proto_type(
+                    method_name, method_signature
+                )
+                break
+            except Exception as error:
+                lookup_errors.append(str(error))
+        if method is None:
+            for evidence in classes:
+                try:
+                    method = evidence.as_class().get_method(method_name)
+                    break
+                except Exception as error:
+                    lookup_errors.append(str(error))
+        if method is None:
+            detail = "; ".join(dict.fromkeys(lookup_errors))
+            raise RuntimeError(
+                "method {}{} not found in {}{}".format(
+                    method_name,
+                    method_signature,
+                    class_name,
+                    ": {}".format(detail) if detail else "",
+                )
+            )
         method_id = self._id(method, kind="method")
-        values = frame.get_values_for(self.debugger, method)
+        values_error = None
+        try:
+            values = frame.get_values_for(self.debugger, method)
+        except Exception as error:
+            # A valid stopped frame may not have local-variable metadata (for
+            # example in optimized code). Keep the frame navigable and
+            # resumable even when register inspection is unavailable.
+            values = []
+            values_error = str(error)
         self.debug_frame = frame
         self.debug_method = method
         self.debug_values = values
-        return {
+        result = {
             "class": class_name,
             "method": method_name,
             "method_id": method_id,
@@ -763,6 +1682,9 @@ class Backend:
                 for index, value in enumerate(values)
             ],
         }
+        if values_error:
+            result["values_error"] = values_error
+        return result
 
     def debug_poll(self):
         if not self.debug_waiting or self.debug_wait is None:
@@ -774,12 +1696,17 @@ class Backend:
         self.debug_waiting = False
         if status == "error":
             raise RuntimeError(value)
+        if status == "timeout":
+            return {"waiting": False, "timeout": True}
         return {"waiting": False, "frame": self._frame_data(value)}
 
     def debug_resume(self):
         if self.debugger is None:
             raise RuntimeError("connect a debugger first")
         self.debugger.resume()
+        self.debug_frame = None
+        self.debug_method = None
+        self.debug_values = []
         return self.debug_wait_start()
 
     def debug_step(self):
@@ -787,6 +1714,9 @@ class Backend:
             raise RuntimeError("the debugger is not stopped at a frame")
         self.debug_frame.step(self.debugger)
         self.debugger.resume()
+        self.debug_frame = None
+        self.debug_method = None
+        self.debug_values = []
         return self.debug_wait_start()
 
     def debug_set_value(self, slot, text):
@@ -817,8 +1747,113 @@ class Backend:
         op = request.get("op")
         if op == "load":
             return self.load(request["path"])
+        if op == "load_split":
+            return self.load_split(request.get("paths", []))
+        if op == "load_split_from_adb":
+            return self.load_split_from_adb(
+                request.get("package", ""),
+                request.get("serial"),
+                request.get("adb_path"),
+            )
+        if op == "load_project":
+            return self.load_project(request["path"])
+        if op == "history":
+            return self.history_data()
+        if op == "manifest":
+            return self.manifest_data()
+        if op == "set_manifest_xml":
+            return self.set_manifest_xml(request.get("xml", ""))
+        if op == "set_debuggable":
+            return self.set_debuggable(request.get("enabled", False))
+        if op == "allow_plaintext_and_user_certificates":
+            return self.allow_plaintext_and_user_certificates()
         if op == "write":
             return self.write(request["path"])
+        if op == "save_project":
+            return self.save_project(request["path"])
+        if op == "set_note":
+            return self.set_note(request["key"], request.get("note", ""))
+        if op == "export_script":
+            return self.export_script(request["path"])
+        if op == "generate_keystore":
+            return self.generate_keystore(
+                request["directory"],
+                request["alias"],
+                request["store_password"],
+                request.get("key_password"),
+                request.get("filename", "debug.keystore"),
+            )
+        if op == "adb_devices":
+            return self.adb_devices(request.get("adb_path"))
+        if op == "adb_packages":
+            return self.adb_packages(
+                request.get("package_regex"),
+                request.get("serial"),
+                request.get("adb_path"),
+            )
+        if op == "pull_apks":
+            return self.pull_apks(
+                request.get("package", ""),
+                request["output_dir"],
+                request.get("serial"),
+                request.get("adb_path"),
+            )
+        if op == "sign":
+            return self.sign_apk(
+                request["output"],
+                request["keystore"],
+                request["alias"],
+                request["store_password"],
+                request.get("key_password"),
+                request.get("apksigner"),
+            )
+        if op == "sign_split":
+            return self.sign_split(
+                request["output_dir"],
+                request["keystore"],
+                request["alias"],
+                request["store_password"],
+                request.get("key_password"),
+                request.get("apksigner"),
+            )
+        if op == "install":
+            return self.install_apk(
+                request["path"],
+                request.get("serial"),
+                request.get("adb_path"),
+                request.get("replace_existing", True),
+            )
+        if op == "install_split":
+            return self.install_split(
+                request["output_dir"],
+                request.get("serial"),
+                request.get("adb_path"),
+                request.get("replace_existing", True),
+            )
+        if op == "sign_and_install":
+            return self.sign_and_install(
+                request["output"],
+                request["keystore"],
+                request["alias"],
+                request["store_password"],
+                request.get("key_password"),
+                request.get("apksigner"),
+                request.get("serial"),
+                request.get("adb_path"),
+                request.get("replace_existing", True),
+            )
+        if op == "sign_and_install_split":
+            return self.sign_and_install_split(
+                request["output_dir"],
+                request["keystore"],
+                request["alias"],
+                request["store_password"],
+                request.get("key_password"),
+                request.get("apksigner"),
+                request.get("serial"),
+                request.get("adb_path"),
+                request.get("replace_existing", True),
+            )
         if op == "replace_string":
             return self.replace_string(request["id"], request["value"])
         if op == "search":
@@ -843,8 +1878,19 @@ class Backend:
             return self.graph_node_details(request.get("label", ""), request.get("node_id"))
         if op == "debug_connect":
             return self.debug_connect(request.get("host", "127.0.0.1"), request.get("port", 8000))
+        if op == "debug_attach":
+            return self.debug_attach(
+                request["pid"],
+                request.get("port", 8000),
+                request.get("serial"),
+                request.get("adb_path"),
+            )
+        if op == "debug_connect_poll":
+            return self.debug_connect_poll()
         if op == "debug_apps":
             return self.debug_apps(request.get("serial"), request.get("adb_path"))
+        if op == "debug_apps_poll":
+            return self.debug_apps_poll()
         if op == "debug_breakpoint":
             return self.debug_breakpoint(request["id"], request["offset"])
         if op == "debug_wait":

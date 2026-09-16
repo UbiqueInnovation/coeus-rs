@@ -1156,6 +1156,48 @@ impl AnalyzeObject {
             .map_err(|error| PyIOError::new_err(error.to_string()))
     }
 
+    /// Save the current single-APK state and edit history to a `.coeus`
+    /// archive. The archive contains the edited APK bytes, so reopening it
+    /// does not depend on the original APK remaining on disk.
+    pub fn save_state(&mut self, path: &str) -> PyResult<()> {
+        let mut history = self.history.clone();
+        history.push("save_state".to_string());
+        let metadata = serde_json::json!({
+            "format_version": 1,
+            "members": ["base.apk"],
+            "history": history,
+        });
+        let file = File::create(path).map_err(|error| {
+            PyIOError::new_err(format!("could not create state archive {path}: {error}"))
+        })?;
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        writer.start_file("state.json", options).map_err(|error| {
+            PyIOError::new_err(format!("could not write state metadata: {error}"))
+        })?;
+        writer
+            .write_all(metadata.to_string().as_bytes())
+            .map_err(|error| {
+                PyIOError::new_err(format!("could not write state metadata: {error}"))
+            })?;
+        let data = coeus::coeus_parse::apk::repack_to_bytes(&self.files).map_err(|error| {
+            PyIOError::new_err(format!("could not write APK member base.apk: {error}"))
+        })?;
+        writer
+            .start_file("apks/base.apk", options)
+            .map_err(|error| {
+                PyIOError::new_err(format!("could not write APK member base.apk: {error}"))
+            })?;
+        writer.write_all(&data).map_err(|error| {
+            PyIOError::new_err(format!("could not write APK member base.apk: {error}"))
+        })?;
+        writer.finish().map_err(|error| {
+            PyIOError::new_err(format!("could not finish state archive: {error}"))
+        })?;
+        self.history.push("save_state".to_string());
+        Ok(())
+    }
+
     /// Repack and sign one APK with the Android SDK's `apksigner` tool.
     #[pyo3(signature = (output, keystore, alias, store_password, key_password=None, apksigner=None))]
     pub fn sign_apk(

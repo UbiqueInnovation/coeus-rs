@@ -7,16 +7,16 @@ use std::convert::TryFrom;
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 use coeus::coeus_debug::{
     jdwp::JdwpClient,
-    models::{ClassInstance, Composite, Event, JdwpPacket, SlotValue, StackFrame},
+    models::{ClassInstance, Composite, Event, SlotValue, StackFrame},
     Runtime,
 };
 use pyo3::{
     exceptions::PyRuntimeError,
     pyclass, pyfunction, pymethods,
-    types::{PyAnyMethods, PyBool, PyFloat, PyInt, PyLong, PyModule, PyModuleMethods, PyString},
+    types::{PyAnyMethods, PyBool, PyFloat, PyInt, PyModule, PyModuleMethods, PyString},
     wrap_pyfunction, Bound, IntoPy, Py, PyAny, PyResult, Python, ToPyObject,
 };
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use crate::{analysis::Method, parse::AnalyzeObject};
 
@@ -47,10 +47,19 @@ impl DebuggableApp {
 #[pyfunction]
 #[pyo3(signature = (serial=None, adb_path=None))]
 pub fn list_debuggable_apps(
+    py: Python<'_>,
     serial: Option<&str>,
     adb_path: Option<&str>,
 ) -> PyResult<Vec<DebuggableApp>> {
-    coeus::coeus_parse::signing::list_debuggable_apps(serial, adb_path.map(Path::new))
+    let serial = serial.map(str::to_owned);
+    let adb_path = adb_path.map(str::to_owned);
+    let result = py.allow_threads(|| {
+        coeus::coeus_parse::signing::list_debuggable_apps(
+            serial.as_deref(),
+            adb_path.as_deref().map(Path::new),
+        )
+    });
+    result
         .map(|apps| {
             apps.into_iter()
                 .map(|app| DebuggableApp {
@@ -66,13 +75,23 @@ pub fn list_debuggable_apps(
 #[pyfunction]
 #[pyo3(signature = (pid, local_port, serial=None, adb_path=None))]
 pub fn forward_jdwp(
+    py: Python<'_>,
     pid: u32,
     local_port: u16,
     serial: Option<&str>,
     adb_path: Option<&str>,
 ) -> PyResult<()> {
-    coeus::coeus_parse::signing::forward_jdwp(pid, local_port, serial, adb_path.map(Path::new))
-        .map_err(PyRuntimeError::new_err)
+    let serial = serial.map(str::to_owned);
+    let adb_path = adb_path.map(str::to_owned);
+    py.allow_threads(|| {
+        coeus::coeus_parse::signing::forward_jdwp(
+            pid,
+            local_port,
+            serial.as_deref(),
+            adb_path.as_deref().map(Path::new),
+        )
+    })
+    .map_err(PyRuntimeError::new_err)
 }
 
 #[pyfunction]
@@ -318,13 +337,16 @@ impl DebuggerStackFrame {
     pub fn get_code(&self, debugger: &mut Debugger, ao: &AnalyzeObject) -> PyResult<String> {
         let class_name = self.get_class_name(debugger)?.replace('$', r"\$");
         let method_name = self.get_method_name(debugger)?;
+        let method_signature = self.get_method_signature(debugger)?;
         let code_index = self.get_code_index();
         let location_class = ao.find_classes(&class_name)?;
         if location_class.is_empty() {
             return Err(PyRuntimeError::new_err("No class found"));
         }
-        let location_class = &location_class[0];
-        let location_method = location_class.as_class()?.get_method(&method_name)?;
+        let location_class = location_class[0].as_class()?;
+        let location_method = location_class
+            .get_method_by_proto_type(&method_name, &method_signature)
+            .or_else(|_| location_class.get_method(&method_name))?;
         let code = location_method.code().replace(
             &format!("#{code_index:#x}"),
             &format!("#{code_index:#x} <==========="),
@@ -358,6 +380,23 @@ impl DebuggerStackFrame {
             .map_err(|e| PyRuntimeError::new_err(format!("Could not find method on class {e}")))?;
         Ok(method.name.clone())
     }
+    pub fn get_method_signature(&self, debugger: &mut Debugger) -> PyResult<String> {
+        let signature = debugger
+            .jdwp_client
+            .get_class_name(&debugger.rt, self.stack_frame.location.class_id)
+            .map_err(|e| PyRuntimeError::new_err(format!("Could not get signature: {e}")))?;
+        let classes = debugger
+            .jdwp_client
+            .get_class(&debugger.rt, &signature)
+            .map_err(|e| PyRuntimeError::new_err(format!("Could not get class: {e}")))?;
+        if classes.is_empty() {
+            return Err(PyRuntimeError::new_err("No class found"));
+        }
+        let method = classes[0]
+            .get_method(self.stack_frame.location.method_id)
+            .map_err(|e| PyRuntimeError::new_err(format!("Could not find method on class {e}")))?;
+        Ok(method.signature.clone())
+    }
     pub fn step(&self, debugger: &mut Debugger) -> PyResult<()> {
         let result = debugger
             .jdwp_client
@@ -368,11 +407,87 @@ impl DebuggerStackFrame {
     }
 }
 
+impl Debugger {
+    fn wait_for_package_inner(
+        &mut self,
+        py: Python<'_>,
+        timeout: Option<Duration>,
+    ) -> PyResult<Option<DebuggerStackFrame>> {
+        // The GUI calls this from a worker thread. Release Python's GIL while
+        // JDWP is waiting on the socket so the command loop stays responsive.
+        loop {
+            let cmd = if let Some(timeout) = timeout {
+                match py
+                    .allow_threads(|| self.jdwp_client.wait_for_event_timeout(&self.rt, timeout))
+                {
+                    Ok(Some(cmd)) => cmd,
+                    Ok(None) => return Ok(None),
+                    Err(error) => {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "JDWP event wait failed: {error}"
+                        )))
+                    }
+                }
+            } else {
+                let Some(cmd) =
+                    py.allow_threads(|| self.jdwp_client.wait_for_event_blocking(&self.rt))
+                else {
+                    return Err(PyRuntimeError::new_err(
+                        "JDWP connection closed while waiting for a debugger event",
+                    ));
+                };
+                cmd
+            };
+            let Ok(composite) = Composite::try_from(cmd) else {
+                // VM_START, VM_DEATH, and other non-breakpoint events may be
+                // queued by ART. They are not a stopped frame for this API;
+                // continue waiting for the requested breakpoint/step event.
+                continue;
+            };
+            let Some((bp, is_single_step)) =
+                composite.events.iter().find_map(|event| match event {
+                    Event::Breakpoint(bp) => Some((bp, false)),
+                    Event::SingleStep(bp) => Some((bp, true)),
+                    Event::VmStart(_) | Event::VmDeath => None,
+                })
+            else {
+                if composite
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::VmStart(_)))
+                {
+                    // VM_START is automatically generated and its suspend
+                    // policy is target-dependent. Resume defensively so an
+                    // initial suspended VM can reach the requested breakpoint.
+                    self.jdwp_client.resume(&self.rt, 1).map_err(|error| {
+                        PyRuntimeError::new_err(format!("Could not resume VM start: {error}"))
+                    })?;
+                }
+                continue;
+            };
+            if is_single_step {
+                if let Some(event_id) = self.last_step_id.take() {
+                    let _ = self.jdwp_client.clear_step(&self.rt, event_id);
+                }
+            }
+            let thread = bp.get_thread();
+            let stack_frame = thread
+                .get_top_frame(&mut self.jdwp_client, &self.rt)
+                .map_err(|error| {
+                    PyRuntimeError::new_err(format!("Could not get Stackframe: {error}"))
+                })?;
+
+            return Ok(Some(DebuggerStackFrame { stack_frame }));
+        }
+    }
+}
+
 #[pymethods]
 impl Debugger {
     #[new]
-    pub fn new(host: &str, port: u16) -> PyResult<Debugger> {
-        match coeus::coeus_debug::create_debugger(host, port) {
+    pub fn new(py: Python<'_>, host: &str, port: u16) -> PyResult<Debugger> {
+        let host = host.to_owned();
+        match py.allow_threads(|| coeus::coeus_debug::create_debugger(&host, port)) {
             Ok((jdwp_client, rt)) => Ok(Debugger {
                 jdwp_client,
                 rt,
@@ -433,36 +548,50 @@ impl Debugger {
         });
         Ok(())
     }
+    pub fn clear_breakpoint(&mut self, method: &Method, code_index: u64) -> PyResult<()> {
+        let class_name = method.get_class().name().to_string();
+        let name_and_sig = method.signature().replace(&format!("{class_name}->"), "");
+        let Some(request_id) = self
+            .break_points
+            .iter()
+            .find(|breakpoint| {
+                breakpoint.class_name == class_name
+                    && breakpoint.name_and_sig == name_and_sig
+                    && breakpoint.code_index == code_index
+            })
+            .map(|breakpoint| breakpoint.request_id)
+        else {
+            return Err(PyRuntimeError::new_err("Breakpoint not found"));
+        };
+        self.jdwp_client
+            .clear_breakpoint(&self.rt, request_id)
+            .map_err(|error| {
+                PyRuntimeError::new_err(format!("Could not clear breakpoint: {error}"))
+            })?;
+        self.break_points.retain(|breakpoint| {
+            !(breakpoint.request_id == request_id
+                && breakpoint.class_name == class_name
+                && breakpoint.name_and_sig == name_and_sig
+                && breakpoint.code_index == code_index)
+        });
+        Ok(())
+    }
     pub fn resume(&mut self) -> PyResult<()> {
         self.jdwp_client
             .resume(&self.rt, 1)
             .map_err(|e| PyRuntimeError::new_err(format!("{}", e)))
     }
     pub fn wait_for_package(&mut self, py: Python) -> PyResult<DebuggerStackFrame> {
-        // The GUI calls this from a worker thread. Release Python's GIL while
-        // JDWP is waiting on the socket so the command loop stays responsive.
-        let reply = py.allow_threads(|| self.jdwp_client.wait_for_package_blocking(&self.rt));
-        let Some(reply) = reply else {
-            return Err(PyRuntimeError::new_err("Nothing"));
-        };
-        let JdwpPacket::CommandPacket(cmd) = reply else {
-            return Err(PyRuntimeError::new_err("Nothing"));
-        };
-        let Ok(composite) = Composite::try_from(cmd) else {
-            return Err(PyRuntimeError::new_err("Not composite event"));
-        };
-        let (Event::Breakpoint(bp) | Event::SingleStep(bp)) = &composite.events[0];
-        if let Event::SingleStep(_) = &composite.events[0] {
-            if let Some(event_id) = self.last_step_id.take() {
-                let _ = self.jdwp_client.clear_step(&self.rt, event_id);
-            }
-        }
-        let thread = bp.get_thread();
-        let Ok(stack_frame) = thread.get_top_frame(&mut self.jdwp_client, &self.rt) else {
-            return Err(PyRuntimeError::new_err("Could not get Stackframe"));
-        };
-
-        Ok(DebuggerStackFrame { stack_frame })
+        self.wait_for_package_inner(py, None)?.ok_or_else(|| {
+            PyRuntimeError::new_err("JDWP connection closed while waiting for a debugger event")
+        })
+    }
+    pub fn poll_for_package(
+        &mut self,
+        py: Python,
+        timeout_millis: u64,
+    ) -> PyResult<Option<DebuggerStackFrame>> {
+        self.wait_for_package_inner(py, Some(Duration::from_millis(timeout_millis.max(1))))
     }
     pub fn get_code_indices(&self, method: &Method) -> PyResult<Vec<u32>> {
         let Some(code_item) = method.method_data.as_ref().and_then(|m| m.code.as_ref()) else {

@@ -15,10 +15,14 @@ class Debugger:
         """Close the JDWP connection and its background I/O tasks"""
     def set_breakpoint(self, method: Method, code_index: int):
         """Sets a breakpoint on the specified method at the specified code_index. The index is normally the instruction offset"""
+    def clear_breakpoint(self, method: Method, code_index: int):
+        """Clear a breakpoint previously set on this method and code index"""
     def resume(self):
         """Resume a stopped debugger"""
     def wait_for_package(self) -> DebuggerStackFrame:
         """Performs a blocking wait for a debugger package and tries to get the stackframe from it"""
+    def poll_for_package(self, timeout_millis: int = 250) -> Optional[DebuggerStackFrame]:
+        """Poll for a debugger event for up to timeout_millis without blocking indefinitely"""
     def new_string(self, string: str) -> StackValue:
         """Create a new string on the VM"""
     def get_code_indices(self, method: Method) -> list[int]:
@@ -65,6 +69,8 @@ class DebuggerStackFrame:
         """Return the class name of the current stackframe's location"""
     def get_method_name(self, debugger: Debugger) -> str:
         """Return the method name of the current stackframe's location"""
+    def get_method_signature(self, debugger: Debugger) -> str:
+        """Return the method prototype of the current stackframe's location"""
     def get_code_index(self) -> int:
         """Return the code index of the current stackframe"""
     def get_code(self, debugger: Debugger, ao: AnalyzeObject) -> str:
@@ -658,6 +664,8 @@ class AnalyzeObject:
         """Remove a non-DEX APK entry"""
     def write_apk(self, output: str):
         """Write the edited APK and remove invalidated signature entries"""
+    def save_state(self, path: str):
+        """Save the edited APK and high-level history to a .coeus archive"""
     def sign_apk(
         self,
         output: str,
