@@ -53,6 +53,34 @@ method.inject_load_library(apk, "frida-gadget", register)
 apk.write_apk("edited-unsigned.apk")
 ```
 
+For variable-width edits, use a transactional `MethodEditor`. Branch and
+switch targets remain symbolic until the edit is committed:
+
+```python
+editor = apk.edit_method(method)
+instructions = method.get_instructions()
+target = editor.label_before(instructions[-1])
+editor.insert_before(instructions[2], [DexInstruction.nop()])
+editor.replace(instructions[1], [DexInstruction.nop(), DexInstruction.nop()])
+editor.replace(instructions[0], [DexInstruction.if_eqz(0, target)])
+method = editor.commit(apk)
+```
+
+Switches can be created with
+`DexInstruction.switch(register, [(case_value, label), ...], default)`;
+the encoder creates and aligns the switch payload automatically.
+
+Use `DexInstruction.const_string_value(register, "replacement")` when editing
+a string reference by value. The commit adds a missing value to the DEX string
+pool and automatically selects `const-string` or `const-string/jumbo`; the
+existing numeric-index constructors remain available when exact IDs are
+needed.
+
+For a global pool edit, pass a `DexString` returned by
+`apk.get_strings_as_string()` to `apk.replace_string(string, "replacement")`.
+That operation keeps the string ID stable and changes the value seen by every
+reference to it in the DEX.
+
 `set_package_name()` changes the Android install identity in the manifest;
 it does not rename DEX descriptors or package-qualified component names.
 `set_manifest_xml()` replaces the manifest from text, so intent filters and
@@ -63,8 +91,9 @@ necessary, enables cleartext traffic, and trusts both the system and user CA
 stores. DEX injection emits `const-string` followed by
 `System.loadLibrary(String)`; choose an available local register. The writer
 produces a ZIP-aligned APK, including page-aligned native libraries, but it
-remains unsigned. Methods
-with try/catch or switch/array payloads are rejected for safe insertion.
+remains unsigned. Variable-width editing currently rejects methods with
+try/catch handlers; switch and array payloads are rebuilt by `MethodEditor`.
+Rewritten methods currently omit debug position/local-variable metadata.
 
 ## Split APKs, signing, and save states
 
@@ -96,11 +125,15 @@ the action history is not an automatic inverse for arbitrary edits.
 For a ready-made interactive workflow, run `python coeus_shell.py` from this
 directory (or `python coeus-python/coeus_shell.py` from the repository root).
 The shell supports `pull`, `load`, `open`, `use`, `manifest`, `debuggable`,
-`plaintext`, `add`, `xml`, `save`, `write`, `sign`, `verify`, `install`, and
+`debug`, `plaintext`, `add`, `xml`, `save`, `write`, `sign`, `verify`, `install`, and
 `launch`. `list [REGEX] [SERIAL]` filters installed package names from adb
-before choosing a package to pull. Its `python` command opens a normal Python
-console with every public `coeus_python` object preloaded, plus `state`, `apk`,
-and `shell`; no import statement is needed for full class/method and
+before choosing a package to pull. `debug list [SERIAL]` discovers JDWP-enabled
+app processes, and `debug connect INDEX [SERIAL] [PORT]` forwards one over USB
+and connects the existing Coeus debugger. `debug resume`, `debug wait`,
+`debug step`, and `debug breakpoints` provide common controls. The `python`
+command opens a normal Python console with every public `coeus_python` object
+preloaded, plus `state`, `apk`, `shell`, `debugger`, `debug_app`, and
+`debug_frame`; no import statement is needed for full class/method and
 instruction-object editing. Tab completes shell commands and common path
 arguments, and the embedded Python console enables Python identifier and
 attribute completion when readline is available.

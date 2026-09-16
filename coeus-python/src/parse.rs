@@ -12,9 +12,13 @@ use coeus::coeus_models::models::{AndroidManifest, DexFile, Files};
 use coeus::coeus_parse::dex::graph::information_graph::build_information_graph;
 use coeus::coeus_parse::dex::graph::Supergraph;
 use coeus::coeus_parse::dex::{
-    encode::{inject_load_library, prepend_method_code, replace_method_instruction_units},
-    parse_dex_buf,
-    ArrayView,
+    encode::{
+        editable_instruction_from_decoded, ensure_dex_strings, inject_load_library,
+        prepend_method_code, replace_dex_string, replace_method_instruction_units,
+        rewrite_method_code, CodeTarget, EditPosition, EditableInstruction, MethodEdit,
+        TargetPosition,
+    },
+    parse_dex_buf, ArrayView,
 };
 use pyo3::exceptions::{PyIOError, PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
@@ -28,8 +32,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::analysis::DexString;
-use crate::analysis::Method;
+use crate::analysis::{CodeLabel, DexInstruction, DexString, Method, SymbolicInstruction};
 
 #[pyclass]
 #[derive(Clone)]
@@ -46,6 +49,10 @@ pub struct Manifest {
 
 #[pymethods]
 impl Manifest {
+    pub fn get_package(&self) -> String {
+        self.manifest.package.clone()
+    }
+
     pub fn get_json(&self) -> String {
         serde_json::to_string(&self.manifest).unwrap()
     }
@@ -80,6 +87,306 @@ pub struct AnalyzeObject {
     pub(crate) history: Vec<String>,
 }
 
+#[derive(Clone)]
+struct PendingEdit {
+    anchor: u32,
+    position: EditPosition,
+    instructions: Vec<DexInstruction>,
+}
+
+#[pyclass]
+pub struct MethodEditor {
+    method: Method,
+    dex_name: String,
+    method_idx: u32,
+    entry_offset: u32,
+    edits: Vec<PendingEdit>,
+    committed: bool,
+}
+
+impl MethodEditor {
+    fn label(&self, instruction: &DexInstruction, position: TargetPosition) -> PyResult<CodeLabel> {
+        let Some(file) = &instruction.file else {
+            return Err(PyRuntimeError::new_err(
+                "labels can only target decoded method instructions",
+            ));
+        };
+        if file.identifier != self.method.file.identifier {
+            return Err(PyRuntimeError::new_err(
+                "instruction belongs to another DEX",
+            ));
+        }
+        let belongs_to_method = self
+            .method
+            .method_data
+            .as_ref()
+            .and_then(|method_data| method_data.code.as_ref())
+            .map(|code| {
+                code.insns.iter().any(|(_, offset, decoded)| {
+                    offset.0 == instruction.offset
+                        && !matches!(
+                            decoded,
+                            coeus::coeus_models::models::Instruction::ArrayData(..)
+                                | coeus::coeus_models::models::Instruction::PackedSwitchData(..)
+                                | coeus::coeus_models::models::Instruction::SparseSwitchData(..)
+                                | coeus::coeus_models::models::Instruction::SwitchData(..)
+                        )
+                })
+            })
+            .unwrap_or(false);
+        if !belongs_to_method {
+            return Err(PyRuntimeError::new_err(
+                "instruction does not belong to this method",
+            ));
+        }
+        Ok(CodeLabel {
+            dex_name: self.dex_name.clone(),
+            method_idx: self.method_idx,
+            target: CodeTarget {
+                offset: instruction.offset,
+                position,
+            },
+        })
+    }
+
+    fn editable_instruction(
+        dex: &DexFile,
+        method_idx: u32,
+        instruction: &DexInstruction,
+    ) -> PyResult<EditableInstruction> {
+        let resolve_label = |label: &CodeLabel| -> PyResult<CodeTarget> {
+            if label.dex_name != dex.get_dex_name() || label.method_idx != method_idx {
+                return Err(PyRuntimeError::new_err(
+                    "symbolic target belongs to another method or DEX",
+                ));
+            }
+            Ok(label.target)
+        };
+        match &instruction.symbolic {
+            Some(SymbolicInstruction::StringValue { register, value }) => {
+                let string_index = dex.find_string_index(value).ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "string value is not present in the edited DEX string pool: {value:?}"
+                    ))
+                })?;
+                if string_index <= u16::MAX as u32 {
+                    Ok(EditableInstruction::Concrete(
+                        coeus::coeus_models::models::Instruction::ConstString(
+                            *register,
+                            string_index as u16,
+                        ),
+                    ))
+                } else {
+                    Ok(EditableInstruction::Concrete(
+                        coeus::coeus_models::models::Instruction::ConstStringJumbo(
+                            *register,
+                            string_index,
+                        ),
+                    ))
+                }
+            }
+            Some(SymbolicInstruction::Branch(target)) => Ok(EditableInstruction::Branch {
+                instruction: instruction.instruction.clone(),
+                target: resolve_label(target)?,
+            }),
+            Some(SymbolicInstruction::Switch {
+                register,
+                cases,
+                default,
+                form,
+            }) => Ok(EditableInstruction::Switch {
+                register: *register,
+                cases: cases
+                    .iter()
+                    .map(|(key, label)| Ok((*key, resolve_label(label)?)))
+                    .collect::<PyResult<_>>()?,
+                default: default.as_ref().map(resolve_label).transpose()?,
+                form: *form,
+            }),
+            None => editable_instruction_from_decoded(
+                dex,
+                method_idx,
+                instruction.offset,
+                &instruction.instruction,
+            )
+            .map_err(|error| PyRuntimeError::new_err(error.to_string())),
+        }
+    }
+
+    fn refreshed_method(ao: &AnalyzeObject, dex_name: &str, method_idx: u32) -> PyResult<Method> {
+        let (_, _, dex) = ao
+            .files
+            .multi_dex
+            .iter()
+            .flat_map(|multi_dex| {
+                std::iter::once(&multi_dex.primary).chain(multi_dex.secondary.iter())
+            })
+            .find(|dex| dex.get_dex_name() == dex_name || dex.file_name == dex_name)
+            .map(|dex| (dex.get_dex_name().to_string(), method_idx, dex.clone()))
+            .ok_or_else(|| PyRuntimeError::new_err("DEX not found after edit"))?;
+        let method_data = dex
+            .get_method_by_idx(method_idx)
+            .ok_or_else(|| PyRuntimeError::new_err("method not found after edit"))?;
+        let method = dex
+            .methods
+            .iter()
+            .find(|method| method.method_idx as u32 == method_idx)
+            .cloned()
+            .ok_or_else(|| PyRuntimeError::new_err("method not found after edit"))?;
+        let class = dex
+            .get_class_by_type(method.class_idx)
+            .ok_or_else(|| PyRuntimeError::new_err("class not found after edit"))?;
+        Ok(Method {
+            method,
+            method_data: Some(method_data),
+            file: dex,
+            class,
+        })
+    }
+}
+
+#[pymethods]
+impl MethodEditor {
+    pub fn __repr__(&self) -> String {
+        format!("MethodEditor({})", self.method.signature())
+    }
+
+    pub fn label_before(&self, instruction: &DexInstruction) -> PyResult<CodeLabel> {
+        self.label(instruction, TargetPosition::Before)
+    }
+
+    pub fn label_after(&self, instruction: &DexInstruction) -> PyResult<CodeLabel> {
+        self.label(instruction, TargetPosition::After)
+    }
+
+    pub fn insert_before(
+        &mut self,
+        instruction: &DexInstruction,
+        instructions: Vec<DexInstruction>,
+    ) -> PyResult<()> {
+        if self.committed {
+            return Err(PyRuntimeError::new_err(
+                "method editor has already been committed",
+            ));
+        }
+        self.edits.push(PendingEdit {
+            anchor: instruction.offset,
+            position: EditPosition::Before,
+            instructions,
+        });
+        Ok(())
+    }
+
+    pub fn insert_after(
+        &mut self,
+        instruction: &DexInstruction,
+        instructions: Vec<DexInstruction>,
+    ) -> PyResult<()> {
+        if self.committed {
+            return Err(PyRuntimeError::new_err(
+                "method editor has already been committed",
+            ));
+        }
+        self.edits.push(PendingEdit {
+            anchor: instruction.offset,
+            position: EditPosition::After,
+            instructions,
+        });
+        Ok(())
+    }
+
+    pub fn replace(
+        &mut self,
+        instruction: &DexInstruction,
+        replacement: Vec<DexInstruction>,
+    ) -> PyResult<()> {
+        if self.committed {
+            return Err(PyRuntimeError::new_err(
+                "method editor has already been committed",
+            ));
+        }
+        self.edits.push(PendingEdit {
+            anchor: instruction.offset,
+            position: EditPosition::Replace,
+            instructions: replacement,
+        });
+        Ok(())
+    }
+
+    pub fn prepend(&mut self, instructions: Vec<DexInstruction>) -> PyResult<()> {
+        if self.committed {
+            return Err(PyRuntimeError::new_err(
+                "method editor has already been committed",
+            ));
+        }
+        self.edits.push(PendingEdit {
+            anchor: self.entry_offset,
+            position: EditPosition::Before,
+            instructions,
+        });
+        Ok(())
+    }
+
+    pub fn commit(&mut self, ao: &mut AnalyzeObject) -> PyResult<Method> {
+        if self.committed {
+            return Err(PyRuntimeError::new_err(
+                "method editor has already been committed",
+            ));
+        }
+        let (dex_name, method_idx, dex) = ao.loaded_dex_for_method(&self.method)?;
+        let string_values = self
+            .edits
+            .iter()
+            .flat_map(|edit| edit.instructions.iter())
+            .filter_map(|instruction| match &instruction.symbolic {
+                Some(SymbolicInstruction::StringValue { value, .. }) => Some(value.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let prepared_bytes = ensure_dex_strings(&dex, &string_values)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let editing_dex = if prepared_bytes == dex.raw_data() {
+            dex.clone()
+        } else {
+            Arc::new(
+                parse_dex_buf(&dex_name, &ArrayView::new(&prepared_bytes), false).ok_or_else(
+                    || PyRuntimeError::new_err("could not prepare edited string pool"),
+                )?,
+            )
+        };
+        let mut edits = Vec::with_capacity(self.edits.len());
+        for edit in &self.edits {
+            let instructions = edit
+                .instructions
+                .iter()
+                .map(|instruction| {
+                    if let Some(file) = &instruction.file {
+                        if file.get_dex_name() != editing_dex.get_dex_name()
+                            && file.file_name != editing_dex.file_name
+                        {
+                            return Err(PyRuntimeError::new_err(
+                                "edited instruction belongs to another DEX",
+                            ));
+                        }
+                    }
+                    MethodEditor::editable_instruction(&editing_dex, method_idx, instruction)
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            edits.push(MethodEdit {
+                anchor: edit.anchor,
+                position: edit.position,
+                instructions,
+            });
+        }
+        let bytes = rewrite_method_code(&editing_dex, method_idx, &edits)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        ao.replace_loaded_dex(&dex_name, bytes)?;
+        ao.record_action(format!("edit_method {}", self.method.signature()));
+        self.committed = true;
+        MethodEditor::refreshed_method(ao, &dex_name, method_idx)
+    }
+}
+
 impl AnalyzeObject {
     fn record_action(&mut self, action: impl Into<String>) {
         self.history.push(action.into());
@@ -94,7 +401,9 @@ impl SplitApkSet {
         max_depth: i64,
     ) -> PyResult<Self> {
         if paths.is_empty() {
-            return Err(PyRuntimeError::new_err("APK set must contain at least one APK"));
+            return Err(PyRuntimeError::new_err(
+                "APK set must contain at least one APK",
+            ));
         }
         let mut members = Vec::with_capacity(paths.len());
         let mut names = Vec::with_capacity(paths.len());
@@ -169,12 +478,12 @@ fn new_staging_directory(label: &str) -> PyResult<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "coeus-{label}-{}-{timestamp}",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("coeus-{label}-{}-{timestamp}", std::process::id()));
     fs::create_dir_all(&path).map_err(|error| {
-        PyIOError::new_err(format!("could not create temporary Coeus directory: {error}"))
+        PyIOError::new_err(format!(
+            "could not create temporary Coeus directory: {error}"
+        ))
     })?;
     Ok(path)
 }
@@ -250,7 +559,10 @@ impl AnalyzeObject {
                 dex.get_dex_name() == dex_name || dex.file_name == dex_name
             };
             if primary_matches {
-                let file_name = self.files.multi_dex[multi_dex_index].primary.file_name.clone();
+                let file_name = self.files.multi_dex[multi_dex_index]
+                    .primary
+                    .file_name
+                    .clone();
                 let archive_name = self.files.multi_dex[multi_dex_index]
                     .primary
                     .get_dex_name()
@@ -290,10 +602,7 @@ impl AnalyzeObject {
         )))
     }
 
-    fn loaded_dex_for_method(
-        &self,
-        method: &Method,
-    ) -> PyResult<(String, u32, Arc<DexFile>)> {
+    fn loaded_dex_for_method(&self, method: &Method) -> PyResult<(String, u32, Arc<DexFile>)> {
         let method_idx = method.method.method_idx as u32;
         let dex = self
             .files
@@ -303,8 +612,7 @@ impl AnalyzeObject {
                 std::iter::once(&multi_dex.primary).chain(multi_dex.secondary.iter())
             })
             .find(|dex| {
-                dex.identifier == method.file.identifier
-                    || dex.file_name == method.file.file_name
+                dex.identifier == method.file.identifier || dex.file_name == method.file.file_name
             })
             .cloned()
             .ok_or_else(|| {
@@ -411,8 +719,9 @@ impl SplitApkSet {
         build_graph: bool,
         max_depth: i64,
     ) -> PyResult<Self> {
-        let file = File::open(path)
-            .map_err(|error| PyIOError::new_err(format!("could not open state archive: {error}")))?;
+        let file = File::open(path).map_err(|error| {
+            PyIOError::new_err(format!("could not open state archive: {error}"))
+        })?;
         let mut archive = ZipArchive::new(file)
             .map_err(|error| PyRuntimeError::new_err(format!("invalid .coeus archive: {error}")))?;
         let mut metadata = None;
@@ -452,9 +761,8 @@ impl SplitApkSet {
                 }
             }
         }
-        let metadata = metadata.ok_or_else(|| {
-            PyRuntimeError::new_err(".coeus archive does not contain state.json")
-        })?;
+        let metadata = metadata
+            .ok_or_else(|| PyRuntimeError::new_err(".coeus archive does not contain state.json"))?;
         let metadata: serde_json::Value = serde_json::from_slice(&metadata)
             .map_err(|error| PyRuntimeError::new_err(format!("invalid state metadata: {error}")))?;
         let members = metadata
@@ -465,8 +773,12 @@ impl SplitApkSet {
         for member in members {
             let name = member
                 .as_str()
-                .filter(|name| !name.is_empty() && !name.contains('/') && *name != "." && *name != "..")
-                .ok_or_else(|| PyRuntimeError::new_err("state metadata contains an invalid member name"))?;
+                .filter(|name| {
+                    !name.is_empty() && !name.contains('/') && *name != "." && *name != ".."
+                })
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err("state metadata contains an invalid member name")
+                })?;
             if !apk_bytes.contains_key(name) {
                 return Err(PyRuntimeError::new_err(format!(
                     "state archive is missing APK member {name}"
@@ -480,12 +792,15 @@ impl SplitApkSet {
             let mut paths = Vec::with_capacity(member_names.len());
             for name in &member_names {
                 let member_path = staging.join(name);
-                fs::write(&member_path, apk_bytes.get(name).expect("validated state member"))
-                    .map_err(|error| {
-                        PyIOError::new_err(format!(
-                            "could not materialize state member {name}: {error}"
-                        ))
-                    })?;
+                fs::write(
+                    &member_path,
+                    apk_bytes.get(name).expect("validated state member"),
+                )
+                .map_err(|error| {
+                    PyIOError::new_err(format!(
+                        "could not materialize state member {name}: {error}"
+                    ))
+                })?;
                 paths.push(member_path);
             }
             let mut set = Self::from_paths_internal(py, paths, build_graph, max_depth)?;
@@ -594,11 +909,7 @@ impl SplitApkSet {
 
     /// Verify every signed member in an output directory.
     #[pyo3(signature = (output_dir, apksigner=None))]
-    pub fn verify_all(
-        &self,
-        output_dir: &str,
-        apksigner: Option<&str>,
-    ) -> PyResult<Vec<String>> {
+    pub fn verify_all(&self, output_dir: &str, apksigner: Option<&str>) -> PyResult<Vec<String>> {
         let paths = self.output_paths(Path::new(output_dir))?;
         let mut output = Vec::with_capacity(paths.len());
         for path in paths {
@@ -670,7 +981,9 @@ impl SplitApkSet {
         })?;
         writer
             .write_all(metadata.to_string().as_bytes())
-            .map_err(|error| PyIOError::new_err(format!("could not write state metadata: {error}")))?;
+            .map_err(|error| {
+                PyIOError::new_err(format!("could not write state metadata: {error}"))
+            })?;
 
         for (name, member) in self.names.iter().zip(&self.members) {
             let data = {
@@ -688,9 +1001,9 @@ impl SplitApkSet {
                 PyIOError::new_err(format!("could not write APK member {name}: {error}"))
             })?;
         }
-        writer
-            .finish()
-            .map_err(|error| PyIOError::new_err(format!("could not finish state archive: {error}")))?;
+        writer.finish().map_err(|error| {
+            PyIOError::new_err(format!("could not finish state archive: {error}"))
+        })?;
         self.history.push("save_state".to_string());
         Ok(())
     }
@@ -713,6 +1026,14 @@ impl AnalyzeObject {
         self.build_main_supergraph(&ignore_classes)
             .map_err(PyRuntimeError::new_err)?;
         Ok(())
+    }
+
+    /// Return the DOT representation of the currently built supergraph.
+    pub fn supergraph_to_dot(&self) -> PyResult<String> {
+        self.supergraph
+            .as_ref()
+            .map(|graph| graph.to_dot())
+            .ok_or_else(|| PyRuntimeError::new_err("Supergraph has not been built"))
     }
 
     pub fn get_runtime(&self, file: &Method) -> PyResult<Runtime> {
@@ -870,6 +1191,75 @@ impl AnalyzeObject {
     /// Return high-level edits made through the Python API since loading.
     pub fn get_history(&self) -> Vec<String> {
         self.history.clone()
+    }
+
+    /// Replace a DEX string-pool entry by index, changing every reference to
+    /// that string in the DEX. The supplied DexString keeps the original
+    /// string ID, so callers should fetch a fresh DexString after this call if
+    /// they need to inspect its new content.
+    pub fn replace_string(
+        &mut self,
+        string: &crate::analysis::DexString,
+        replacement: &str,
+    ) -> PyResult<()> {
+        let (string_index, source_dex) = match &string._place {
+            coeus::coeus_analysis::analysis::Location::DexString(index, dex) => (*index, dex),
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "string has no DEX string-pool location",
+                ))
+            }
+        };
+        let source_dex_name = source_dex.get_dex_name().to_string();
+        let (dex_name, dex) = self
+            .files
+            .multi_dex
+            .iter()
+            .flat_map(|multi_dex| {
+                std::iter::once(&multi_dex.primary).chain(multi_dex.secondary.iter())
+            })
+            .find(|dex| {
+                dex.get_dex_name() == source_dex_name || dex.file_name == source_dex.file_name
+            })
+            .map(|dex| (dex.get_dex_name().to_string(), dex.clone()))
+            .ok_or_else(|| PyRuntimeError::new_err("DEX not found for string"))?;
+        let bytes = replace_dex_string(&dex, string_index, replacement)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        self.replace_loaded_dex(&dex_name, bytes)?;
+        self.record_action(format!("replace_string {string_index}"));
+        Ok(())
+    }
+
+    /// Start a transactional symbolic edit of one method. The returned
+    /// editor recalculates branch offsets and payload locations on commit.
+    pub fn edit_method(&self, method: &Method) -> PyResult<MethodEditor> {
+        let (dex_name, method_idx, dex) = self.loaded_dex_for_method(method)?;
+        let entry_offset = dex
+            .get_method_by_idx(method_idx)
+            .and_then(|method_data| method_data.code.clone())
+            .and_then(|code| {
+                code.insns
+                    .into_iter()
+                    .find(|(_, _, instruction)| {
+                        !matches!(
+                            instruction,
+                            coeus::coeus_models::models::Instruction::ArrayData(..)
+                                | coeus::coeus_models::models::Instruction::PackedSwitchData(..)
+                                | coeus::coeus_models::models::Instruction::SparseSwitchData(..)
+                                | coeus::coeus_models::models::Instruction::SwitchData(..)
+                        )
+                    })
+                    .map(|(_, offset, _)| offset.0)
+            })
+            .unwrap_or(0);
+        Ok(MethodEditor {
+            method: method.clone(),
+            dex_name,
+            method_idx,
+            entry_offset,
+            edits: Vec::new(),
+            committed: false,
+        })
     }
 
     /// Replace an instruction selected from `method.get_instructions()` with
@@ -1430,6 +1820,7 @@ impl AnalyzeObject {
 
 pub(crate) fn register(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<AnalyzeObject>()?;
+    m.add_class::<MethodEditor>()?;
     m.add_class::<Manifest>()?;
     m.add_class::<SplitApkSet>()?;
     Ok(())

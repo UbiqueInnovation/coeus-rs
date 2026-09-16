@@ -1,21 +1,21 @@
 // Copyright (c) 2022 Ubique Innovation AG <https://www.ubique.ch>
-// 
+//
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{collections::HashMap, sync::Arc};
 
-use coeus_emulation::vm::{VM, runtime::StringClass};
-use coeus_models::models::{InstructionOffset, InstructionSize, Instruction, DexFile, Class, TestFunction};
+use base64::{engine::general_purpose, Engine as _};
+use coeus_emulation::vm::{runtime::StringClass, VM};
+use coeus_models::models::{
+    Class, DexFile, Instruction, InstructionOffset, InstructionSize, TestFunction,
+};
 use petgraph::graph::NodeIndex;
-use base64::{Engine as _, engine::{general_purpose}};
 
 use crate::dex::graph::{ChangeSet, InfoNode};
 
-use super::models::{StaticRegister, FunctionTransformation, StaticRegisterData};
-
-
+use super::models::{FunctionTransformation, StaticRegister, StaticRegisterData};
 
 /**
    After a branching instruction, a new branch is inserted. Each branch keeps track of the static registers encountered during that flow
@@ -118,7 +118,8 @@ impl<'a> Flow<'a> {
                     finished_branches.push(branch.id);
                     continue;
                 }
-                Instruction::PackedSwitch(_, table_offset) | Instruction::SparseSwitch(_, table_offset) => {
+                Instruction::PackedSwitch(_, table_offset)
+                | Instruction::SparseSwitch(_, table_offset) => {
                     if let Some((_, Instruction::PackedSwitchData(switch))) =
                         self.instructions.get(&(pc + table_offset))
                     {
@@ -276,14 +277,14 @@ impl<'a> Flow<'a> {
                                     origin: method_node_index,
                                     destination: other_node,
                                     node: InfoNode::StaticArgumentNode(stat, branch.id),
-                                    key: None
+                                    key: None,
                                 });
                             }
                         } else {
                             result.push(ChangeSet::AddNodeTo {
                                 origin: method_node_index,
                                 node: InfoNode::StaticArgumentNode(stat, branch.id),
-                                key: None
+                                key: None,
                             });
                         }
                     }
@@ -661,7 +662,7 @@ impl<'a> Flow<'a> {
                     nodes_to_add.extend(vec![ChangeSet::AddNodeFrom {
                         destination: field_node_index,
                         node: InfoNode::StaticArgumentNode(stat, branch.id),
-                        key: None
+                        key: None,
                     }]);
                 }
 
@@ -762,7 +763,7 @@ impl<'a> Flow<'a> {
                     nodes_to_add.extend(vec![ChangeSet::AddNodeTo {
                         origin: method_node_index,
                         node: InfoNode::ArrayNode(data.clone()),
-                        key: None
+                        key: None,
                     }]);
                 }
                 _ => {

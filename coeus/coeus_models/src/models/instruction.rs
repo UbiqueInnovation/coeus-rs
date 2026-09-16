@@ -281,7 +281,10 @@ impl Debug for Instruction {
             Self::PackedSwitchData(arg0) => f.debug_tuple("PackedSwitchData").field(arg0).finish(),
             Self::SparseSwitchData(arg0) => f.debug_tuple("SparseSwitchData").field(arg0).finish(),
             Self::NotImpl(arg0, arg1) => f.debug_tuple("NotImpl").field(arg0).field(arg1).finish(),
-            _ => f.debug_tuple("Instruction").field(&self.mnemonic_from_opcode()).finish(),
+            _ => f
+                .debug_tuple("Instruction")
+                .field(&self.mnemonic_from_opcode())
+                .finish(),
         }
     }
 }
@@ -489,19 +492,13 @@ impl Instruction {
                     (literal >> 48) as u16,
                 ]
             }
-            ConstWideLit16(dst, value) => vec![
-                u16::from_le_bytes([0x16, *dst]),
-                *value as u16,
-            ],
+            ConstWideLit16(dst, value) => vec![u16::from_le_bytes([0x16, *dst]), *value as u16],
             ConstWideLit32(dst, value) => vec![
                 u16::from_le_bytes([0x17, *dst]),
                 *value as u32 as u16,
                 (*value as u32 >> 16) as u16,
             ],
-            ConstWideHigh16(dst, value) => vec![
-                u16::from_le_bytes([0x19, *dst]),
-                *value as u16,
-            ],
+            ConstWideHigh16(dst, value) => vec![u16::from_le_bytes([0x19, *dst]), *value as u16],
             ConstString(dst, string_idx) => fmt22(0x1a, *dst, *string_idx),
             ConstStringJumbo(dst, string_idx) => {
                 vec![
@@ -589,7 +586,7 @@ impl Instruction {
             OrIntLit8(dst, src, value) => fmt22s(0xde, *dst, *src, *value as i16),
             OrIntLit16(dst, src, value) => fmt22s4(0xd6, dst, src, *value as i16),
 
-ShlInt(dst, src) => fmt12(0xb8, dst, src),
+            ShlInt(dst, src) => fmt12(0xb8, dst, src),
             ShrInt(dst, src) => fmt12(0xb9, dst, src),
             UShrInt(dst, src) => fmt12(0xba, dst, src),
             ShlIntDst(dst, a, b) => fmt23(0x98, *dst, *a, *b),
@@ -738,11 +735,9 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
             ],
             ConstMethodHandle(dst, idx) => fmt22(0xfc, *dst, *idx),
             ConstMethodType(dst, idx) => fmt22(0xfd, *dst, *idx),
-            ConstDynamic(dst, idx, extra) => vec![
-                u16::from_le_bytes([0xfe, *dst]),
-                *idx,
-                *extra as u16,
-            ],
+            ConstDynamic(dst, idx, extra) => {
+                vec![u16::from_le_bytes([0xfe, *dst]), *idx, *extra as u16]
+            }
 
             NotImpl(opcode, high) => one(*opcode, *high),
             ArrayData(width, data) => {
@@ -765,12 +760,7 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
             }
             PackedSwitchData(switch) => {
                 let entries = switch.targets.len() as u32;
-                let first_key = switch
-                    .targets
-                    .keys()
-                    .min()
-                    .copied()
-                    .unwrap_or(0);
+                let first_key = switch.targets.keys().min().copied().unwrap_or(0);
                 let mut result = vec![
                     u16::from_le_bytes([0x00, 0x01]),
                     entries as u16,
@@ -788,11 +778,8 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
             }
             SparseSwitchData(switch) => {
                 let entries = switch.targets.len() as u32;
-                let mut sorted: Vec<(i32, i32)> = switch
-                    .targets
-                    .iter()
-                    .map(|(&k, &v)| (k, v))
-                    .collect();
+                let mut sorted: Vec<(i32, i32)> =
+                    switch.targets.iter().map(|(&k, &v)| (k, v)).collect();
                 sorted.sort_by_key(|&(k, _)| k);
                 let mut result = vec![
                     u16::from_le_bytes([0x00, 0x02]),
@@ -809,11 +796,7 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
                 }
                 result
             }
-            InvokeType(_)
-            | Const
-            | NewInstanceType(_)
-            | Switch(_)
-            | SwitchData(_)
+            InvokeType(_) | Const | NewInstanceType(_) | Switch(_) | SwitchData(_)
             | ArbitraryData(_) => {
                 return Err("instruction is a decoder placeholder and cannot be encoded".to_string())
             }
@@ -1551,7 +1534,12 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
             Instruction::ConstLit4(dst, lit) => format!("{} v{}, {:#x}", MNEMONICS[44], dst, lit),
             Instruction::ConstLit16(dst, lit) => format!("{} v{}, {:#x}", MNEMONICS[45], dst, lit),
             Instruction::ConstLit32(dst, lit) => format!("{} v{}, {:#x}", MNEMONICS[46], dst, lit),
-            Instruction::ConstHigh16(dst, lit) => format!("{} v{}, {:#x}", "const/high16", dst, (i32::from(*lit) << 16)),
+            Instruction::ConstHigh16(dst, lit) => format!(
+                "{} v{}, {:#x}",
+                "const/high16",
+                dst,
+                (i32::from(*lit) << 16)
+            ),
             Instruction::ConstWide(dst, lit) => format!("{} v{}, {:#x}", "const-wide", dst, lit),
             Instruction::MoveResultObject(dst) => format!("{} v{}", MNEMONICS[47], dst),
             Instruction::ArrayLength(dst, array) => {
@@ -1741,13 +1729,17 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
 
             0x44 => Instruction::ArrayGetWide(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0x45 => Instruction::ArrayGetObject(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
-            0x46 => Instruction::ArrayGetBoolean(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x46 => {
+                Instruction::ArrayGetBoolean(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8)
+            }
             0x47 => Instruction::ArrayGetByte(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0x48 => Instruction::ArrayGetChar(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0x49 => Instruction::ArrayGetShort(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0x4a => Instruction::ArrayPutWide(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0x4b => Instruction::ArrayPutObject(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
-            0x4c => Instruction::ArrayPutBoolean(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
+            0x4c => {
+                Instruction::ArrayPutBoolean(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8)
+            }
             0x4d => Instruction::ArrayPutByte(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0x4e => Instruction::ArrayPutChar(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
             0x4f => Instruction::ArrayPutShort(high, (data[0] & 0xff) as u8, (data[0] >> 8) as u8),
@@ -1945,10 +1937,9 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
                 },
             ),
             0x13 => Instruction::ConstLit16(high, data[0] as i16),
-            0x14 => Instruction::ConstLit32(
-                high,
-                (data[0] as u32 | ((data[1] as u32) << 16)) as i32,
-            ),
+            0x14 => {
+                Instruction::ConstLit32(high, (data[0] as u32 | ((data[1] as u32) << 16)) as i32)
+            }
             0x15 => Instruction::ConstHigh16(high, data[0] as i16),
             0x16 => Instruction::ConstWideLit16(high, data[0] as i16),
             0x17 => Instruction::ConstWideLit32(
@@ -1964,10 +1955,7 @@ ShlInt(dst, src) => fmt12(0xb8, dst, src),
             ),
             0x19 => Instruction::ConstWideHigh16(high, data[0] as i16),
             0x1a => Instruction::ConstString(high, data[0]),
-            0x1b => Instruction::ConstStringJumbo(
-                high,
-                data[0] as u32 | ((data[1] as u32) << 16),
-            ),
+            0x1b => Instruction::ConstStringJumbo(high, data[0] as u32 | ((data[1] as u32) << 16)),
             0x1c => Instruction::ConstClass(high, data[0]),
             0x1f => Instruction::CheckCast(high, data[0]),
             0x20 => Instruction::InstanceOf(u4::new(high & 0b1111), u4::new(high >> 4), data[0]),

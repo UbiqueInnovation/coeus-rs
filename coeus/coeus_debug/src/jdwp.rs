@@ -88,7 +88,7 @@ impl JdwpClient {
     async fn get_methods(&mut self, reference_id: u64) -> anyhow::Result<Vec<Method>> {
         let get_methods = JdwpCommandPacket::get_methods(rand::random(), reference_id);
         self.send_cmd(JdwpPacket::CommandPacket(get_methods))?;
-        let Some(JdwpPacket::ReplyPacket(reply)) = self.rx.recv().await  else {
+        let Some(JdwpPacket::ReplyPacket(reply)) = self.rx.recv().await else {
             bail!("no reply");
         };
         if reply.is_error() {
@@ -238,7 +238,7 @@ impl JdwpClient {
         let cmd = JdwpCommandPacket::get_array_length(rand::random(), array_reference)?;
         self.send_cmd(JdwpPacket::CommandPacket(cmd))?;
         let Some(JdwpPacket::ReplyPacket(reply)) = self.rx.recv().await else {
-           bail!("Wrong packet"); 
+            bail!("Wrong packet");
         };
         let mut reader = Cursor::new(reply.get_data());
         reader
@@ -260,7 +260,7 @@ impl JdwpClient {
         )?;
         self.send_cmd(JdwpPacket::CommandPacket(cmd))?;
         let Some(JdwpPacket::ReplyPacket(reply)) = self.rx.recv().await else {
-           bail!("Wrong packet"); 
+            bail!("Wrong packet");
         };
         let mut reader = Cursor::new(reply.get_data());
         let type_tag = reader.read_u8()?;
@@ -375,7 +375,9 @@ impl JdwpClient {
                 match reply_packet.get_flags() {
                     0x80 => reader_tx.send(JdwpPacket::ReplyPacket(reply_packet))?,
                     _ => {
-                        let Ok(command_packet) = JdwpCommandPacket::from_bytes(&mut Cursor::new(&buf)) else {
+                        let Ok(command_packet) =
+                            JdwpCommandPacket::from_bytes(&mut Cursor::new(&buf))
+                        else {
                             continue;
                         };
 
@@ -421,7 +423,7 @@ impl JdwpClient {
         let version_package = JdwpCommandPacket::version(rand::random());
         self.send_cmd(JdwpPacket::CommandPacket(version_package))?;
         let Some(JdwpPacket::ReplyPacket(reply)) = self.wait_for_package().await else {
-                bail!("could not get version");
+            bail!("could not get version");
         };
 
         let mut data_cursor = Cursor::new(reply.get_data());
@@ -454,8 +456,8 @@ impl JdwpClient {
             self.send_cmd(JdwpPacket::CommandPacket(class_package))?;
             let pkg = self.wait_for_package().await;
             let Some(JdwpPacket::ReplyPacket(reply)) = pkg else {
-            bail!("Wrong packet: {:?}", pkg);
-        };
+                bail!("Wrong packet: {:?}", pkg);
+            };
             self.deserialize_class(reply).await
         })
     }
@@ -465,7 +467,7 @@ impl JdwpClient {
             let id_package = JdwpCommandPacket::all_classes(rand::random());
             self.send_cmd(JdwpPacket::CommandPacket(id_package))?;
             let Some(JdwpPacket::ReplyPacket(reply)) = self.wait_for_package().await else {
-            bail!("Wrong packet");
+                bail!("Wrong packet");
             };
             self.deserialize_class(reply).await
         })
@@ -551,7 +553,7 @@ impl JdwpClient {
             let cmd = JdwpCommandPacket::create_string(rand::random(), the_string)?;
             self.send_cmd(JdwpPacket::CommandPacket(cmd))?;
             let Some(JdwpPacket::ReplyPacket(reply)) = self.rx.recv().await else {
-               bail!("Wrong answer");
+                bail!("Wrong answer");
             };
             let mut reader = Cursor::new(reply.get_data());
             reader

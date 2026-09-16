@@ -169,13 +169,14 @@ impl Class {
         JdwpCommandPacket::set_breakpoint(rand::random(), &location)
     }
     pub fn get_method(&self, method_id: u64) -> anyhow::Result<&Method> {
-        let Some(m) = self.methods
+        let Some(m) = self
+            .methods
             .iter()
             .find(|(_, m)| m.method_id == method_id)
             .map(|(_, m)| m)
-            else {
-                bail!("Method not found");
-            };
+        else {
+            bail!("Method not found");
+        };
         Ok(m)
     }
 }
@@ -409,7 +410,8 @@ impl StackFrame {
                         &slots_in_scope,
                     )?;
                     client.send_cmd(JdwpPacket::CommandPacket(cmd))?;
-                    let Some(JdwpPacket::ReplyPacket(reply)) = client.wait_for_package().await else {
+                    let Some(JdwpPacket::ReplyPacket(reply)) = client.wait_for_package().await
+                    else {
                         bail!("Wrong answer");
                     };
                     error_code = reply.get_error();
@@ -422,10 +424,11 @@ impl StackFrame {
                     if number_of_values != 1 {
                         break;
                     }
-                    
-                    let Ok(val) = SlotValue::from_bytes(&mut reader) else {break;};
+
+                    let Ok(val) = SlotValue::from_bytes(&mut reader) else {
+                        break;
+                    };
                     slot_values.push(val);
-                    
                 }
             }
 

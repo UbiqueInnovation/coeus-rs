@@ -11,6 +11,8 @@ from xmlrpc.client import boolean
 class Debugger:
     def __init__(self, host: str, port: int):
         """Init a new Debugger and try to connect over TCP"""
+    def close(self):
+        """Close the JDWP connection and its background I/O tasks"""
     def set_breakpoint(self, method: Method, code_index: int):
         """Sets a breakpoint on the specified method at the specified code_index. The index is normally the instruction offset"""
     def resume(self):
@@ -23,6 +25,28 @@ class Debugger:
         """Get valid code indices from function"""
     def get_breakpoints(self) -> list[VmBreakpoint]:
         """Get all currently set breakpoints"""
+
+class DebuggableApp:
+    pid: int
+    process_name: str
+    package_name: Optional[str]
+
+def list_debuggable_apps(
+    serial: Optional[str] = None, adb_path: Optional[str] = None
+) -> list[DebuggableApp]: ...
+
+def forward_jdwp(
+    pid: int,
+    local_port: int,
+    serial: Optional[str] = None,
+    adb_path: Optional[str] = None,
+) -> None: ...
+
+def remove_jdwp_forward(
+    local_port: int,
+    serial: Optional[str] = None,
+    adb_path: Optional[str] = None,
+) -> None: ...
 
 class VmInstance:
     def to_string(self, debugger: Debugger) -> str:
@@ -88,6 +112,8 @@ class Branching:
         """Get the method the branching happens"""
 
 class Manifest:
+    def get_package(self) -> str:
+        """Return the manifest package name"""
     def get_xml(self) -> str:
         """Return the content of the AndroidManifest as found in the APK"""
     def get_json(self) -> str:
@@ -152,6 +178,8 @@ class Dex:
 class DexString:
     def content(self) -> str:
         """Return the content of this String"""
+    def get_dex_name(self) -> str:
+        """Return the DEX file containing this string"""
     def get_index(self) -> int:
         """Return the string-id used by DEX instructions"""
 
@@ -243,6 +271,8 @@ class DexInstruction:
     @staticmethod
     def const_string(register: int, string_index: int) -> DexInstruction: ...
     @staticmethod
+    def const_string_value(register: int, value: str) -> DexInstruction: ...
+    @staticmethod
     def const_string_from_string(register: int, string: DexString) -> DexInstruction: ...
     @staticmethod
     def const_string_jumbo(register: int, string_index: int) -> DexInstruction: ...
@@ -260,10 +290,57 @@ class DexInstruction:
     def invoke_static_range(
         register_count: int, method_index: int, first_register: int
     ) -> DexInstruction: ...
+    @staticmethod
+    def if_eq(left_register: int, right_register: int, target: CodeLabel) -> DexInstruction: ...
+    @staticmethod
+    def if_ne(left_register: int, right_register: int, target: CodeLabel) -> DexInstruction: ...
+    @staticmethod
+    def if_lt(left_register: int, right_register: int, target: CodeLabel) -> DexInstruction: ...
+    @staticmethod
+    def if_le(left_register: int, right_register: int, target: CodeLabel) -> DexInstruction: ...
+    @staticmethod
+    def if_gt(left_register: int, right_register: int, target: CodeLabel) -> DexInstruction: ...
+    @staticmethod
+    def if_ge(left_register: int, right_register: int, target: CodeLabel) -> DexInstruction: ...
+    @staticmethod
+    def if_eqz(register: int, target: CodeLabel) -> DexInstruction: ...
+    @staticmethod
+    def if_nez(register: int, target: CodeLabel) -> DexInstruction: ...
+    @staticmethod
+    def if_ltz(register: int, target: CodeLabel) -> DexInstruction: ...
+    @staticmethod
+    def if_lez(register: int, target: CodeLabel) -> DexInstruction: ...
+    @staticmethod
+    def if_gtz(register: int, target: CodeLabel) -> DexInstruction: ...
+    @staticmethod
+    def if_gez(register: int, target: CodeLabel) -> DexInstruction: ...
+    @staticmethod
+    def goto(target: CodeLabel) -> DexInstruction: ...
+    @staticmethod
+    def switch(
+        register: int,
+        cases: list[tuple[int, CodeLabel]],
+        default: Optional[CodeLabel] = None,
+    ) -> DexInstruction: ...
+
+class CodeLabel:
+    """A symbolic target resolved by MethodEditor.commit()."""
+
+class MethodEditor:
+    """Transactional structured editor for one method's decoded instruction graph."""
+    def label_before(self, instruction: DexInstruction) -> CodeLabel: ...
+    def label_after(self, instruction: DexInstruction) -> CodeLabel: ...
+    def insert_before(self, instruction: DexInstruction, instructions: list[DexInstruction]) -> None: ...
+    def insert_after(self, instruction: DexInstruction, instructions: list[DexInstruction]) -> None: ...
+    def replace(self, instruction: DexInstruction, replacement: list[DexInstruction]) -> None: ...
+    def prepend(self, instructions: list[DexInstruction]) -> None: ...
+    def commit(self, ao: AnalyzeObject) -> Method: ...
 
 class Graph:
     def to_dot(self) -> str:
         """Get dotfile of the graph"""
+    def to_supergraph_dot(self) -> str:
+        """Get dotfile of the complete supergraph used to derive this graph"""
 
 class Method:
     def name(self) -> str:
@@ -322,6 +399,8 @@ class Method:
 class Class:
     def name(self) -> str:
         """Returns the class name as used internally"""
+    def get_type_idx(self) -> int:
+        """Return the DEX type-pool index, relative to this class's DEX."""
     def code(self, ao: AnalyzeObject) -> str:
         """Return a best effort disassembly of the class"""
     def find_method_call(self, signature: str) -> list[Instruction]:
@@ -495,6 +574,12 @@ class AnalyzeObject:
         """
     def build_supergraph(self, excluded_classes: list[str]):
         """Build supergraph with additional excluded classes"""
+    def replace_string(self, string: DexString, replacement: str) -> None:
+        """Replace a DEX string-pool entry and update all references to it."""
+    def edit_method(self, method: Method) -> MethodEditor:
+        """Start a transactional structured edit for a decoded method."""
+    def supergraph_to_dot(self) -> str:
+        """Return the DOT representation of the currently built supergraph"""
     def get_runtime(self, method: Method) -> Runtime:
         """Get the runtime of dex files needed to run emulation."""
     def get_native_methods(self) -> list[Method]:

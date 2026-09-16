@@ -1,5 +1,5 @@
 // Copyright (c) 2022 Ubique Innovation AG <https://www.ubique.ch>
-// 
+//
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
@@ -17,7 +17,7 @@ use rhai::{module_resolvers::StaticModuleResolver, plugin::*};
 #[export_module]
 pub mod global {
 
-    use crate::dex::graph::{Subgraph, Supergraph, callgraph::callgraph_for_method};
+    use crate::dex::graph::{callgraph::callgraph_for_method, Subgraph, Supergraph};
 
     use petgraph::{dot::Dot, graph::NodeIndex};
     use rhai::{Array, ImmutableString};
@@ -67,7 +67,10 @@ pub mod global {
         supergraph: &mut Supergraph,
         function_name: ImmutableString,
     ) -> Result<Dynamic, Box<EvalAltResult>> {
-        if let Ok(strs) = crate::dex::graph::analysis::dynamic::get_dynamic_strings(&supergraph.super_graph, function_name.as_str()) {
+        if let Ok(strs) = crate::dex::graph::analysis::dynamic::get_dynamic_strings(
+            &supergraph.super_graph,
+            function_name.as_str(),
+        ) {
             Ok(Dynamic::from(strs))
         } else {
             Err("Something went wrong with finding dynamic strings".into())
@@ -199,7 +202,8 @@ pub mod dex_module {
         build_graph: bool,
         max_depth: i64,
     ) -> Result<Dynamic, Box<EvalAltResult>> {
-        let found_files = crate::extraction::load_file(path, build_graph, max_depth).expect("Could not load files");
+        let found_files = crate::extraction::load_file(path, build_graph, max_depth)
+            .expect("Could not load files");
         Ok(Dynamic::from(found_files))
     }
 

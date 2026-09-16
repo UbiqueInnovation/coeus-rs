@@ -7,7 +7,6 @@
 use coeus_debug::create_debugger;
 
 fn main() {
-  
     let (mut client, rt) = create_debugger("localhost", 8000).unwrap();
     println!("{}", client.get_version_info_blocking(&rt).unwrap());
 }

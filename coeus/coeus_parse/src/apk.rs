@@ -158,12 +158,7 @@ pub fn allow_plaintext_and_user_certificates(files: &mut Files) -> Result<(), St
     let raw = files
         .raw_file(&name)
         .ok_or_else(|| "AndroidManifest.xml has no raw bytes".to_string())?;
-    let binary = set_binary_xml_attribute(
-        raw,
-        "application",
-        "usesCleartextTraffic",
-        "true",
-    )?;
+    let binary = set_binary_xml_attribute(raw, "application", "usesCleartextTraffic", "true")?;
     let binary = set_binary_xml_attribute(
         &binary,
         "application",
@@ -462,7 +457,12 @@ fn append_xml_text(
     root: bool,
 ) {
     output.push('<');
-    append_xml_name(output, node.namespace.as_deref(), &node.local_name, namespaces);
+    append_xml_name(
+        output,
+        node.namespace.as_deref(),
+        &node.local_name,
+        namespaces,
+    );
     if root {
         for (prefix, uri) in namespaces {
             output.push(' ');
@@ -501,7 +501,12 @@ fn append_xml_text(
         }
     }
     output.push_str("</");
-    append_xml_name(output, node.namespace.as_deref(), &node.local_name, namespaces);
+    append_xml_name(
+        output,
+        node.namespace.as_deref(),
+        &node.local_name,
+        namespaces,
+    );
     output.push('>');
 }
 
@@ -630,8 +635,11 @@ impl XmlDocument {
                         }
                     }
                 }
-                XmlEvent::Whitespace(_) | XmlEvent::Comment(_) | XmlEvent::ProcessingInstruction { .. }
-                | XmlEvent::StartDocument { .. } | XmlEvent::EndDocument => {}
+                XmlEvent::Whitespace(_)
+                | XmlEvent::Comment(_)
+                | XmlEvent::ProcessingInstruction { .. }
+                | XmlEvent::StartDocument { .. }
+                | XmlEvent::EndDocument => {}
             }
         }
         if !stack.is_empty() {
@@ -930,8 +938,7 @@ where
             .ok_or_else(|| format!("invalid raw AXML value: {value}"))?;
         let data_type = parse_hex_byte(data_type)
             .ok_or_else(|| format!("invalid raw AXML type: {data_type}"))?;
-        let data = parse_hex_u32(data)
-            .ok_or_else(|| format!("invalid raw AXML data: {data}"))?;
+        let data = parse_hex_u32(data).ok_or_else(|| format!("invalid raw AXML data: {data}"))?;
         return Ok(EncodedAttributeValue {
             raw: u32::MAX,
             data_type,
@@ -1063,15 +1070,15 @@ fn lookup_resource_reference(files: &Files, reference: &str) -> Option<u32> {
             continue;
         };
         for config in &type_entry.configs {
-            if let Some(entry) = config
-                .resources
-                .resources
-                .iter()
-                .find(|entry| package.key_names.strings.get(entry.name_index).map(String::as_str) == Some(entry_name))
-            {
-                return Some(
-                    (package.id << 24) | ((type_id as u32) << 16) | entry.spec_id as u32,
-                );
+            if let Some(entry) = config.resources.resources.iter().find(|entry| {
+                package
+                    .key_names
+                    .strings
+                    .get(entry.name_index)
+                    .map(String::as_str)
+                    == Some(entry_name)
+            }) {
+                return Some((package.id << 24) | ((type_id as u32) << 16) | entry.spec_id as u32);
             }
         }
     }
@@ -1083,11 +1090,8 @@ fn ensure_xml_resource(files: &mut Files, name: &str, path: &str) -> Result<u32,
         return ensure_xml_resource_from_structured_arsc(files, name, path);
     }
 
-    let (bytes, resource_id) = add_xml_resource_to_binary_table(
-        &files.binary_resource_file,
-        name,
-        path,
-    )?;
+    let (bytes, resource_id) =
+        add_xml_resource_to_binary_table(&files.binary_resource_file, name, path)?;
     files.set_file("resources.arsc", bytes)?;
     Ok(resource_id)
 }
@@ -1146,14 +1150,20 @@ fn ensure_xml_resource_from_structured_arsc(
         index + 1
     } else {
         package.type_names.strings.push("xml".to_string());
-        package.types.push(arsc::Type::with_id(package.types.len() + 1));
+        package
+            .types
+            .push(arsc::Type::with_id(package.types.len() + 1));
         package.type_names.strings.len()
     };
     while package.types.len() < type_id {
-        package.types.push(arsc::Type::with_id(package.types.len() + 1));
+        package
+            .types
+            .push(arsc::Type::with_id(package.types.len() + 1));
     }
     package.last_public_type = package.last_public_type.max(type_id as u32);
-    package.last_public_key = package.last_public_key.max(package.key_names.strings.len() as u32);
+    package.last_public_key = package
+        .last_public_key
+        .max(package.key_names.strings.len() as u32);
 
     let type_entry = &mut package.types[type_id - 1];
     let existing_spec_id = type_entry.configs.iter_mut().find_map(|config| {
@@ -1413,7 +1423,10 @@ fn add_xml_resource_to_package(
 
     let type_names = parse_resource_string_pool(&input[type_pool_offset..type_pool_end])?;
     let key_names = parse_resource_string_pool(&input[key_pool_offset..key_pool_end])?;
-    let Some(xml_type_id) = type_names.iter().position(|value| value == "xml").map(|i| i + 1)
+    let Some(xml_type_id) = type_names
+        .iter()
+        .position(|value| value == "xml")
+        .map(|i| i + 1)
     else {
         return Err("resources.arsc has no XML resource type".to_string());
     };
@@ -1477,7 +1490,8 @@ fn add_xml_resource_to_package(
             if should_add {
                 default_config_seen = true;
             }
-            let patched = expand_resource_config(child, new_entry_id, key_index, path_index, should_add)?;
+            let patched =
+                expand_resource_config(child, new_entry_id, key_index, path_index, should_add)?;
             output.extend_from_slice(&patched);
         } else {
             output.extend_from_slice(child);
@@ -1507,7 +1521,10 @@ fn find_xml_resource_id(package: &[u8], name: &str) -> Result<Option<u32>, Strin
     let Some(key_index) = key_names.iter().position(|value| value == name) else {
         return Ok(None);
     };
-    let Some(xml_type_id) = type_names.iter().position(|value| value == "xml").map(|i| i + 1)
+    let Some(xml_type_id) = type_names
+        .iter()
+        .position(|value| value == "xml")
+        .map(|i| i + 1)
     else {
         return Ok(None);
     };
@@ -1523,7 +1540,11 @@ fn find_xml_resource_id(package: &[u8], name: &str) -> Result<Option<u32>, Strin
         let offsets_start = start + header_size;
         let sparse = checked_u8(package, start + 9, "resource type flags")? & 0x01 != 0;
         for entry_id in 0..count {
-            let raw_offset = checked_u32(package, offsets_start + entry_id * 4, "resource entry offset")?;
+            let raw_offset = checked_u32(
+                package,
+                offsets_start + entry_id * 4,
+                "resource entry offset",
+            )?;
             let (entry_id, entry_offset) = if sparse {
                 (((raw_offset & 0xffff) as usize), ((raw_offset >> 16) * 4))
             } else {
@@ -1537,7 +1558,9 @@ fn find_xml_resource_id(package: &[u8], name: &str) -> Result<Option<u32>, Strin
                 .and_then(|base| base.checked_add(entry_offset as usize))
                 .ok_or_else(|| "resource entry overflows package".to_string())?;
             if checked_u32(package, entry + 4, "resource entry name")? as usize == key_index {
-                return Ok(Some((package_id << 24) | ((xml_type_id as u32) << 16) | entry_id as u32));
+                return Ok(Some(
+                    (package_id << 24) | ((xml_type_id as u32) << 16) | entry_id as u32,
+                ));
             }
         }
         let _ = end;
@@ -1578,7 +1601,11 @@ fn expand_resource_config(
             return Err("new XML resource ID is already occupied".to_string());
         }
     }
-    let new_count = if sparse { old_count + 1 } else { old_count.max(entry_id + 1) };
+    let new_count = if sparse {
+        old_count + 1
+    } else {
+        old_count.max(entry_id + 1)
+    };
     let added_slots = new_count - old_count;
     let entry_data = &input[entry_start..];
     let delta = added_slots * 4;
@@ -1647,13 +1674,18 @@ fn append_string_pool_string(
     value: &str,
     description: &str,
 ) -> Result<(Vec<u8>, u32), String> {
-    let (strings, flags, string_start, style_start, style_count) = parse_string_pool_metadata(input, description)?;
+    let (strings, flags, string_start, style_start, style_count) =
+        parse_string_pool_metadata(input, description)?;
     if let Some(index) = strings.iter().position(|current| current == value) {
         return Ok((input.to_vec(), index as u32));
     }
     let utf8 = flags & 0x0000_0100 != 0;
     let encoded = encode_resource_string(value, utf8)?;
-    let old_string_data_end = if style_count == 0 { input.len() } else { style_start };
+    let old_string_data_end = if style_count == 0 {
+        input.len()
+    } else {
+        style_start
+    };
     if old_string_data_end < string_start || old_string_data_end > input.len() {
         return Err(format!("invalid {description} string data bounds"));
     }
@@ -1662,7 +1694,11 @@ fn append_string_pool_string(
     let old_style_offsets_start = offsets_start + old_count * 4;
     let old_string_data = &input[string_start..old_string_data_end];
     let style_offsets = &input[old_style_offsets_start..string_start];
-    let styles = if style_count == 0 { &input[input.len()..] } else { &input[style_start..] };
+    let styles = if style_count == 0 {
+        &input[input.len()..]
+    } else {
+        &input[style_start..]
+    };
     let mut output = Vec::with_capacity(input.len() + 4 + encoded.len() + 4);
     let mut header = input[..28].to_vec();
     write_u32(&mut header, 8, (old_count + 1) as u32);
@@ -1746,7 +1782,11 @@ fn parse_string_pool_metadata(
         .checked_add(count * 4)
         .and_then(|end| end.checked_add(style_count * 4))
         .ok_or_else(|| format!("{description} offsets overflow"))?;
-    let string_end = if style_count == 0 { input.len() } else { style_start };
+    let string_end = if style_count == 0 {
+        input.len()
+    } else {
+        style_start
+    };
     if offsets_end > input.len() || string_start < offsets_end || string_end > input.len() {
         return Err(format!("invalid {description} offsets"));
     }
@@ -1763,7 +1803,9 @@ fn parse_string_pool_metadata(
         let value = if utf8 {
             let _chars = read_resource_length(input, &mut cursor, string_end)?;
             let bytes = read_resource_length(input, &mut cursor, string_end)?;
-            let end = cursor.checked_add(bytes).ok_or_else(|| format!("{description} string overflow"))?;
+            let end = cursor
+                .checked_add(bytes)
+                .ok_or_else(|| format!("{description} string overflow"))?;
             if end >= string_end {
                 return Err(format!("invalid {description} UTF-8 string"));
             }
@@ -1777,7 +1819,9 @@ fn parse_string_pool_metadata(
         } else {
             let length = checked_u16(input, cursor, description)? as usize;
             cursor += 2;
-            let end = cursor.checked_add(length * 2).ok_or_else(|| format!("{description} UTF-16 string overflow"))?;
+            let end = cursor
+                .checked_add(length * 2)
+                .ok_or_else(|| format!("{description} UTF-16 string overflow"))?;
             if end + 2 > string_end {
                 return Err(format!("invalid {description} UTF-16 string"));
             }
@@ -1935,8 +1979,8 @@ impl ValueKind {
                 .ok_or_else(|| format!("invalid raw AXML value: {value}"))?;
             let data_type = parse_hex_byte(data_type)
                 .ok_or_else(|| format!("invalid raw AXML type: {data_type}"))?;
-            let data = parse_hex_u32(data)
-                .ok_or_else(|| format!("invalid raw AXML data: {data}"))?;
+            let data =
+                parse_hex_u32(data).ok_or_else(|| format!("invalid raw AXML data: {data}"))?;
             return Ok(Self::Raw { data_type, data });
         }
         match value {
@@ -2502,8 +2546,8 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let mut files = crate::extraction::load_file(path.to_str().unwrap(), false, -1)
-            .expect("load APK");
+        let mut files =
+            crate::extraction::load_file(path.to_str().unwrap(), false, -1).expect("load APK");
         set_manifest_attribute(&mut files, "application", "debuggable", "true")
             .expect("set debuggable");
         let manifest_text = files.manifest_content.clone();
@@ -2542,5 +2586,4 @@ mod tests {
         assert_eq!(library.compression(), CompressionMethod::Stored);
         assert_eq!(library.data_start() % 16_384, 0);
     }
-
 }

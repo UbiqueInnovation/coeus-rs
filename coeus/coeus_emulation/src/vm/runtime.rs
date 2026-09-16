@@ -4,8 +4,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+use base64::{engine::general_purpose, Engine as _};
 use std::{collections::HashMap, sync::Arc};
-use base64::{Engine as _, engine::{general_purpose}};
 
 use lazy_static::lazy_static;
 
@@ -1011,7 +1011,9 @@ impl AndroidBase64 {
                     builder_instance.internal_state.get("tmp_string")
                 {
                     log::debug!("Executing built in Base64->decode");
-                    let base64bytes = general_purpose::STANDARD.decode(content).expect("Could not decode");
+                    let base64bytes = general_purpose::STANDARD
+                        .decode(content)
+                        .expect("Could not decode");
                     let reg = vm.new_instance("[B".to_string(), Value::Array(base64bytes))?;
                     vm.current_state.return_reg = reg;
                 }

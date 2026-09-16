@@ -41,6 +41,13 @@ class CoeusShell(cmd.Cmd):
         self.state = state
         self.adb_path = adb_path
         self.member_index = 0
+        self.debug_apps = []
+        self.debug_apps_serial = None
+        self.debug_serial = None
+        self.debugger = None
+        self.debug_app = None
+        self.debug_frame = None
+        self.debug_port = None
 
     @property
     def apk(self):
@@ -318,6 +325,243 @@ class CoeusShell(cmd.Cmd):
         except Exception as error:
             print(f"launch failed: {error}")
 
+    def _manifest_packages(self) -> list[str]:
+        """Return package names from all currently loaded APK manifests."""
+        if self.state is None:
+            return []
+        packages = []
+        for index in range(len(self.state)):
+            for manifest in self.state[index].get_manifests():
+                package = manifest.get_package()
+                if package and package not in packages:
+                    packages.append(package)
+        return packages
+
+    def _discover_debug_apps(self, serial: str | None = None):
+        self.debug_apps = coeus_python.list_debuggable_apps(serial, self.adb_path)
+        self.debug_apps_serial = serial
+        return self.debug_apps
+
+    def _print_debug_apps(self, apps):
+        manifest_packages = self._manifest_packages()
+        if not apps:
+            print("no debuggable apps found")
+            return
+        for index, app in enumerate(apps):
+            package = app.package_name or "?"
+            matches = [
+                name
+                for name in manifest_packages
+                if name == package
+                or app.process_name == name
+                or app.process_name.startswith(f"{name}:")
+            ]
+            manifest = matches[0] if matches else "?"
+            print(
+                f"[{index}] pid={app.pid} process={app.process_name} "
+                f"package={package} manifest={manifest}"
+            )
+
+    def _debug_app_for_target(self, target: str | None, serial: str | None):
+        apps = self.debug_apps
+        if self.debug_apps_serial != serial or not apps:
+            apps = self._discover_debug_apps(serial)
+        if target is None:
+            manifest_packages = self._manifest_packages()
+            matches = [
+                app
+                for app in apps
+                if any(
+                    name == app.package_name
+                    or app.process_name == name
+                    or app.process_name.startswith(f"{name}:")
+                    for name in manifest_packages
+                )
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if len(apps) != 1:
+                self._print_debug_apps(apps)
+                if apps:
+                    print("choose an app with: debug connect INDEX [SERIAL] [PORT]")
+                return None
+            return apps[0]
+        if target.startswith("pid:"):
+            try:
+                pid = int(target[4:])
+            except ValueError:
+                return None
+            return next((app for app in apps if app.pid == pid), None)
+        try:
+            index = int(target)
+        except ValueError:
+            index = None
+        if index is not None:
+            if 0 <= index < len(apps):
+                return apps[index]
+            return None
+        return next(
+            (
+                app
+                for app in apps
+                if target in {app.package_name, app.process_name}
+            ),
+            None,
+        )
+
+    def _disconnect_debugger(self, quiet: bool = False):
+        if self.debugger is not None:
+            try:
+                self.debugger.close()
+            except Exception as error:
+                if not quiet:
+                    print(f"could not close debugger: {error}")
+        if self.debug_port is not None:
+            try:
+                coeus_python.remove_jdwp_forward(
+                    self.debug_port, self.debug_serial, self.adb_path
+                )
+            except Exception as error:
+                if not quiet:
+                    print(f"could not remove ADB forward: {error}")
+        self.debugger = None
+        self.debug_app = None
+        self.debug_frame = None
+        self.debug_port = None
+        self.debug_serial = None
+        self.debug_apps_serial = None
+
+    def _debug_connect(self, args: list[str]):
+        if len(args) > 3:
+            print("usage: debug connect [INDEX|PACKAGE|pid:PID] [SERIAL] [PORT]")
+            return
+        target = args[0] if args else None
+        serial = None
+        port = 8000
+        if len(args) == 2:
+            if args[1].isdigit() and 0 < int(args[1]) <= 65535:
+                port = int(args[1])
+            else:
+                serial = args[1]
+        elif len(args) == 3:
+            serial = args[1]
+            try:
+                port = int(args[2])
+            except ValueError:
+                print("PORT must be an integer between 1 and 65535")
+                return
+        if not 0 < port <= 65535:
+            print("PORT must be an integer between 1 and 65535")
+            return
+        try:
+            app = self._debug_app_for_target(target, serial)
+            if app is None:
+                if target is not None:
+                    self._print_debug_apps(self.debug_apps)
+                    print("debuggable app not found")
+                return
+            self._disconnect_debugger(quiet=True)
+            coeus_python.forward_jdwp(app.pid, port, serial, self.adb_path)
+            try:
+                debugger = coeus_python.Debugger("127.0.0.1", port)
+            except Exception:
+                try:
+                    coeus_python.remove_jdwp_forward(port, serial, self.adb_path)
+                except Exception:
+                    pass
+                raise
+            self.debugger = debugger
+            self.debug_app = app
+            self.debug_serial = serial
+            self.debug_port = port
+            print(
+                f"connected to {app.package_name or app.process_name} "
+                f"(pid {app.pid}) via 127.0.0.1:{port}"
+            )
+        except Exception as error:
+            print(f"debugger connection failed: {error}")
+
+    def do_debug(self, line: str):
+        """debug [list|connect|disconnect|resume|wait|step|breakpoints] -- discover or use a JDWP debugger."""
+        args = self._args(line)
+        action = args[0].lower() if args else "list"
+        if action in {"list", "apps"}:
+            if len(args) > 2:
+                print("usage: debug list [SERIAL]")
+                return
+            try:
+                self._print_debug_apps(self._discover_debug_apps(args[1] if len(args) == 2 else None))
+            except Exception as error:
+                print(f"debugger discovery failed: {error}")
+            return
+        if action == "connect":
+            self._debug_connect(args[1:])
+            return
+        if action == "disconnect":
+            if len(args) != 1:
+                print("usage: debug disconnect")
+                return
+            self._disconnect_debugger()
+            print("debugger disconnected")
+            return
+        if self.debugger is None:
+            print("no debugger connected; use 'debug list' and 'debug connect'")
+            return
+        if action == "resume":
+            if len(args) != 1:
+                print("usage: debug resume")
+                return
+            try:
+                self.debugger.resume()
+                print("debugger resumed")
+            except Exception as error:
+                print(f"resume failed: {error}")
+            return
+        if action == "wait":
+            if len(args) != 1:
+                print("usage: debug wait")
+                return
+            try:
+                self.debug_frame = self.debugger.wait_for_package()
+                class_name = self.debug_frame.get_class_name(self.debugger)
+                method_name = self.debug_frame.get_method_name(self.debugger)
+                print(
+                    f"stopped at {class_name}->{method_name} "
+                    f"@{self.debug_frame.get_code_index()}"
+                )
+            except Exception as error:
+                print(f"wait failed: {error}")
+            return
+        if action == "step":
+            if len(args) != 1:
+                print("usage: debug step")
+                return
+            if self.debug_frame is None:
+                print("no stopped frame; use 'debug wait' first")
+                return
+            try:
+                self.debug_frame.step(self.debugger)
+                print("single-step requested")
+            except Exception as error:
+                print(f"step failed: {error}")
+            return
+        if action == "breakpoints":
+            if len(args) != 1:
+                print("usage: debug breakpoints")
+                return
+            try:
+                breakpoints = self.debugger.get_breakpoints()
+                if breakpoints:
+                    print("\n".join(point.location() for point in breakpoints))
+                else:
+                    print("no breakpoints")
+            except Exception as error:
+                print(f"could not read breakpoints: {error}")
+            return
+        print("usage: debug list|connect|disconnect|resume|wait|step|breakpoints")
+
+    do_debugger = do_debug
+
     def do_history(self, line: str):
         """history -- show recorded high-level edits and lifecycle actions."""
         if self._need_state():
@@ -334,6 +578,10 @@ class CoeusShell(cmd.Cmd):
             state=self.state,
             apk=self.apk if self.state else None,
             shell=self,
+            debugger=self.debugger,
+            debug_app=self.debug_app,
+            debug_frame=self.debug_frame,
+            debug_apps=self.debug_apps,
             coeus_python=coeus_python,
         )
         console = InteractiveConsole(namespace)
@@ -360,6 +608,7 @@ class CoeusShell(cmd.Cmd):
 
     def do_quit(self, line: str):
         """quit -- leave the interactive session."""
+        self._disconnect_debugger(quiet=True)
         return True
 
     do_exit = do_quit

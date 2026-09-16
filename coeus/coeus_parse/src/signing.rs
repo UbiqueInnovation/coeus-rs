@@ -4,6 +4,7 @@
 //! the cryptographic implementation in the Android SDK's `apksigner` tool and
 //! exposes a small, platform-independent process wrapper here.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -126,10 +127,7 @@ pub fn sign_apk<P: AsRef<Path>>(
 }
 
 /// Verify one APK and return `apksigner`'s diagnostic output.
-pub fn verify_apk<P: AsRef<Path>>(
-    apk: P,
-    apksigner: Option<&Path>,
-) -> Result<String, String> {
+pub fn verify_apk<P: AsRef<Path>>(apk: P, apksigner: Option<&Path>) -> Result<String, String> {
     let tool = resolve_apksigner(apksigner);
     let mut command = Command::new(&tool);
     command.arg("verify").arg("--verbose").arg(apk.as_ref());
@@ -169,6 +167,194 @@ fn adb_command(adb: &Path, serial: Option<&str>, args: &[&str]) -> Command {
     }
     command.args(args);
     command
+}
+
+/// A process currently exposing a JDWP agent through `adb jdwp`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebuggableApp {
+    /// The Android process ID used by the `jdwp:<pid>` forward target.
+    pub pid: u32,
+    /// The process name reported by Android's `ps` command.
+    pub process_name: String,
+    /// The best package-name match for the process, if one could be found.
+    pub package_name: Option<String>,
+}
+
+fn parse_jdwp_pids(output: &[u8]) -> Vec<u32> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect()
+}
+
+fn parse_process_list(output: &[u8]) -> HashMap<u32, String> {
+    let mut processes = HashMap::new();
+    let mut pid_index = None;
+    let mut name_index = None;
+
+    for line in String::from_utf8_lossy(output).lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.is_empty() {
+            continue;
+        }
+
+        if pid_index.is_none() {
+            pid_index = fields.iter().position(|field| *field == "PID");
+            name_index = fields
+                .iter()
+                .position(|field| matches!(*field, "NAME" | "CMD" | "ARGS" | "COMMAND"));
+            if pid_index.is_some() {
+                continue;
+            }
+        }
+
+        let pid_index = pid_index.unwrap_or(1);
+        let Some(pid) = fields.get(pid_index).and_then(|field| field.parse().ok()) else {
+            continue;
+        };
+        let process = name_index
+            .and_then(|index| fields.get(index).copied())
+            .or_else(|| fields.last().copied())
+            .unwrap_or_default();
+        if !process.is_empty() {
+            processes.insert(pid, process.to_string());
+        }
+    }
+    processes
+}
+
+fn package_name_for_process(process_name: &str, packages: &[String]) -> Option<String> {
+    let process_package = process_name.split(':').next().unwrap_or(process_name);
+    packages
+        .iter()
+        .filter(|package| {
+            *package == process_package
+                || process_name.starts_with(&format!("{package}:"))
+                || process_name.starts_with(&format!("{package}."))
+        })
+        .max_by_key(|package| package.len())
+        .cloned()
+        .or_else(|| {
+            (!process_package.is_empty() && process_package.contains('.'))
+                .then(|| process_package.to_string())
+        })
+}
+
+fn process_name_from_cmdline(adb: &Path, serial: Option<&str>, pid: u32) -> Result<String, String> {
+    let proc_path = format!("/proc/{pid}/cmdline");
+    let mut command = adb_command(adb, serial, &["shell", "cat", &proc_path]);
+    let output = run_command(&mut command, "adb shell cat /proc/<pid>/cmdline")?;
+    if !output.status.success() {
+        return Err(command_failure(
+            "adb shell cat /proc/<pid>/cmdline",
+            &output,
+        ));
+    }
+    let process = String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if process.is_empty() {
+        Err(format!("adb returned no process name for PID {pid}"))
+    } else {
+        Ok(process)
+    }
+}
+
+/// Discover processes which expose a JDWP agent through ADB and best-effort
+/// match their process names to installed package names.
+pub fn list_debuggable_apps(
+    serial: Option<&str>,
+    adb_path: Option<&Path>,
+) -> Result<Vec<DebuggableApp>, String> {
+    let adb = adb_name(adb_path);
+    let mut command = adb_command(&adb, serial, &["jdwp"]);
+    let output = run_command(&mut command, "adb jdwp")?;
+    if !output.status.success() {
+        return Err(command_failure("adb jdwp", &output));
+    }
+    let pids = parse_jdwp_pids(&output.stdout);
+    if pids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let packages = list_installed_packages(None, serial, adb_path).unwrap_or_default();
+    let mut process_names = parse_process_list(
+        &run_command(
+            &mut adb_command(&adb, serial, &["shell", "ps", "-A", "-o", "PID,NAME"]),
+            "adb shell ps",
+        )
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| output.stdout)
+        .unwrap_or_default(),
+    );
+
+    let mut apps = Vec::with_capacity(pids.len());
+    for pid in pids {
+        let process_name = process_names
+            .remove(&pid)
+            .or_else(|| process_name_from_cmdline(&adb, serial, pid).ok())
+            .unwrap_or_else(|| format!("pid:{pid}"));
+        let package_name = package_name_for_process(&process_name, &packages);
+        apps.push(DebuggableApp {
+            pid,
+            process_name,
+            package_name,
+        });
+    }
+    apps.sort_by(|left, right| {
+        left.package_name
+            .cmp(&right.package_name)
+            .then_with(|| left.process_name.cmp(&right.process_name))
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+    Ok(apps)
+}
+
+/// Forward a local TCP port to a process' JDWP agent through ADB.
+pub fn forward_jdwp(
+    pid: u32,
+    local_port: u16,
+    serial: Option<&str>,
+    adb_path: Option<&Path>,
+) -> Result<(), String> {
+    if pid == 0 {
+        return Err("JDWP process ID must not be zero".to_string());
+    }
+    if local_port == 0 {
+        return Err("local debugger port must not be zero".to_string());
+    }
+    let adb = adb_name(adb_path);
+    let local = format!("tcp:{local_port}");
+    let remote = format!("jdwp:{pid}");
+    let mut command = adb_command(&adb, serial, &["forward", &local, &remote]);
+    let output = run_command(&mut command, "adb forward")?;
+    if !output.status.success() {
+        return Err(command_failure("adb forward", &output));
+    }
+    Ok(())
+}
+
+/// Remove a local JDWP port forward created with [`forward_jdwp`].
+pub fn remove_jdwp_forward(
+    local_port: u16,
+    serial: Option<&str>,
+    adb_path: Option<&Path>,
+) -> Result<(), String> {
+    if local_port == 0 {
+        return Err("local debugger port must not be zero".to_string());
+    }
+    let adb = adb_name(adb_path);
+    let local = format!("tcp:{local_port}");
+    let mut command = adb_command(&adb, serial, &["forward", "--remove", &local]);
+    let output = run_command(&mut command, "adb forward --remove")?;
+    if !output.status.success() {
+        return Err(command_failure("adb forward --remove", &output));
+    }
+    Ok(())
 }
 
 /// Return all APK paths reported by `pm path`, including the base and config
@@ -216,7 +402,11 @@ pub fn list_installed_packages(
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| line.trim().strip_prefix("package:"))
-        .filter(|package| matcher.as_ref().map_or(true, |regex| regex.is_match(package)))
+        .filter(|package| {
+            matcher
+                .as_ref()
+                .map_or(true, |regex| regex.is_match(package))
+        })
         .map(str::to_string)
         .collect())
 }
@@ -306,11 +496,7 @@ pub fn launch_package(
         return Err("package name must not be empty".to_string());
     }
     let adb = adb_name(adb_path);
-    let mut command = adb_command(
-        &adb,
-        serial,
-        &["shell", "monkey", "-p", package_name, "1"],
-    );
+    let mut command = adb_command(&adb, serial, &["shell", "monkey", "-p", package_name, "1"]);
     let output = run_command(&mut command, "adb shell monkey")?;
     if !output.status.success() {
         return Err(command_failure("adb shell monkey", &output));
@@ -325,11 +511,38 @@ pub fn launch_package(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pm_path_output;
+    use super::{
+        package_name_for_process, parse_jdwp_pids, parse_pm_path_output, parse_process_list,
+    };
+
+    #[test]
+    fn parses_jdwp_process_ids() {
+        assert_eq!(parse_jdwp_pids(b"123\nnot-a-pid\n456\n"), vec![123, 456]);
+    }
+
+    #[test]
+    fn parses_process_names_from_ps() {
+        let output =
+            b"USER PID PPID VSZ RSS WCHAN ADDR NAME\nu0_a1 123 1 0 0 0 0 com.example:worker\n";
+        assert_eq!(
+            parse_process_list(output).get(&123),
+            Some(&"com.example:worker".to_string())
+        );
+    }
+
+    #[test]
+    fn matches_processes_to_the_longest_installed_package() {
+        let packages = vec!["com.example".to_string(), "com.example.app".to_string()];
+        assert_eq!(
+            package_name_for_process("com.example.app:service", &packages),
+            Some("com.example.app".to_string())
+        );
+    }
 
     #[test]
     fn parses_base_and_split_paths() {
-        let output = b"package:/data/app/example/base.apk\npackage:/data/app/example/split_config.en.apk\n";
+        let output =
+            b"package:/data/app/example/base.apk\npackage:/data/app/example/split_config.en.apk\n";
         assert_eq!(
             parse_pm_path_output(output),
             vec![

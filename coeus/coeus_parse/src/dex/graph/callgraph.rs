@@ -100,7 +100,7 @@ pub fn callgraph_for_method(
                         | InfoNode::ArrayNode(..)
                         | InfoNode::DynamicArgumentNode(..) // | InfoNode::DynamicReturnNode(..)
                         | InfoNode::StaticArgumentNode(..)
-                ) && (!matches!(m, InfoNode::MethodNode(method, _) if ignore_methods.contains(&method.method_name) || ignore_methods.is_empty()) )
+                ) && (!matches!(m, InfoNode::MethodNode(method, _) if ignore_methods.contains(&method.method_name)))
             })
             .unwrap_or(false)
     });
@@ -111,7 +111,7 @@ pub fn callgraph_for_method(
                 matches!(
                     m,
                     InfoNode::MethodNode(..) | InfoNode::DynamicReturnNode(..) | InfoNode::StringNode(..) 
-                ) && (!matches!(m, InfoNode::MethodNode(method, _) if ignore_methods.contains(&method.method_name) || ignore_methods.is_empty()))
+                ) && (!matches!(m, InfoNode::MethodNode(method, _) if ignore_methods.contains(&method.method_name)))
             })
             .unwrap_or(false)
     });
@@ -127,7 +127,7 @@ pub fn callgraph_for_method(
                         | InfoNode::DynamicArgumentNode(..)
                         | InfoNode::DynamicReturnNode(..)
                         | InfoNode::StaticArgumentNode(..)
-                ) && (!matches!(m, InfoNode::MethodNode(method, _) if ignore_methods.contains(&method.method_name) || ignore_methods.is_empty()))
+                ) && (!matches!(m, InfoNode::MethodNode(method, _) if ignore_methods.contains(&method.method_name)))
             })
             .unwrap_or(false)
     });

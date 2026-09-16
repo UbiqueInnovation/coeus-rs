@@ -5,7 +5,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, BTreeMap, HashMap},
     hash::{Hash, Hasher},
     sync::{Arc, Mutex},
 };
@@ -20,13 +20,16 @@ use coeus::{
     coeus_emulation::vm::{runtime::StringClass, Register, Value, VM},
     coeus_models::models::{
         self, AccessFlags, BinaryObject, DexFile, EncodedItem, Instruction as DexInstructionModel,
-        InstructionOffset, InstructionSize, TestFunction,
+        InstructionOffset, TestFunction,
     },
-    coeus_parse::dex::graph::{callgraph::callgraph_for_method, Subgraph, Supergraph},
+    coeus_parse::dex::{
+        encode::{CodeTarget, SwitchForm},
+        graph::{callgraph::callgraph_for_method, Subgraph, Supergraph},
+    },
 };
 use pyo3::{
     exceptions::PyRuntimeError,
-    types::{PyBytes, PyDict, PyTuple},
+    types::{PyDict, PyTuple},
     IntoPyObjectExt,
 };
 use pyo3::{prelude::*, types::PyList};
@@ -500,11 +503,35 @@ impl Instruction {
 /// having to hand-encode code units.
 #[pyclass]
 #[derive(Clone)]
+pub struct CodeLabel {
+    pub(crate) dex_name: String,
+    pub(crate) method_idx: u32,
+    pub(crate) target: CodeTarget,
+}
+
+#[derive(Clone)]
+pub(crate) enum SymbolicInstruction {
+    StringValue {
+        register: u8,
+        value: String,
+    },
+    Branch(CodeLabel),
+    Switch {
+        register: u8,
+        cases: BTreeMap<i32, CodeLabel>,
+        default: Option<CodeLabel>,
+        form: SwitchForm,
+    },
+}
+
+#[pyclass]
+#[derive(Clone)]
 pub struct DexInstruction {
     pub(crate) instruction: DexInstructionModel,
     pub(crate) offset: u32,
     pub(crate) size: u32,
     pub(crate) file: Option<Arc<DexFile>>,
+    pub(crate) symbolic: Option<SymbolicInstruction>,
 }
 
 impl DexInstruction {
@@ -519,6 +546,7 @@ impl DexInstruction {
             offset,
             size,
             file,
+            symbolic: None,
         }
     }
 
@@ -528,6 +556,53 @@ impl DexInstruction {
             .map_err(PyRuntimeError::new_err)?
             .len() as u32;
         Ok(Self::from_instruction(instruction, 0, size, None))
+    }
+
+    fn from_symbolic(
+        instruction: DexInstructionModel,
+        symbolic: SymbolicInstruction,
+        size: u32,
+    ) -> Self {
+        Self {
+            instruction,
+            offset: 0,
+            size,
+            file: None,
+            symbolic: Some(symbolic),
+        }
+    }
+
+    fn symbolic_if(
+        function: TestFunction,
+        left_register: u8,
+        right_register: u8,
+        target: CodeLabel,
+    ) -> PyResult<Self> {
+        if left_register > 15 || right_register > 15 {
+            return Err(PyRuntimeError::new_err(
+                "if-* registers must fit in four bits",
+            ));
+        }
+        Ok(Self::from_symbolic(
+            DexInstructionModel::Test(
+                function,
+                ux::u4::new(left_register),
+                ux::u4::new(right_register),
+                0,
+            ),
+            SymbolicInstruction::Branch(target),
+            2,
+        ))
+    }
+}
+
+#[pymethods]
+impl CodeLabel {
+    pub fn __repr__(&self) -> String {
+        format!(
+            "CodeLabel({:?}, {})",
+            self.target.position, self.target.offset
+        )
     }
 }
 
@@ -558,13 +633,47 @@ impl DexInstruction {
     }
 
     pub fn mnemonic(&self) -> String {
-        self.instruction.mnemonic_from_opcode().to_string()
+        match &self.instruction {
+            DexInstructionModel::Test(function, ..) => match function {
+                TestFunction::Equal => "if-eq",
+                TestFunction::NotEqual => "if-ne",
+                TestFunction::LessThan => "if-lt",
+                TestFunction::LessEqual => "if-le",
+                TestFunction::GreaterThan => "if-gt",
+                TestFunction::GreaterEqual => "if-ge",
+            },
+            DexInstructionModel::TestZero(function, ..) => match function {
+                TestFunction::Equal => "if-eqz",
+                TestFunction::NotEqual => "if-nez",
+                TestFunction::LessThan => "if-ltz",
+                TestFunction::LessEqual => "if-lez",
+                TestFunction::GreaterThan => "if-gtz",
+                TestFunction::GreaterEqual => "if-gez",
+            },
+            DexInstructionModel::PackedSwitch(..) => "packed-switch",
+            DexInstructionModel::SparseSwitch(..) => "sparse-switch",
+            DexInstructionModel::FillArrayData(..) => "fill-array-data",
+            _ if matches!(
+                self.symbolic.as_ref(),
+                Some(SymbolicInstruction::Switch { .. })
+            ) =>
+            {
+                "switch"
+            }
+            _ => return self.instruction.mnemonic_from_opcode().to_string(),
+        }
+        .to_string()
     }
 
     /// Encode this instruction when a caller needs to inspect or serialize it.
     /// Editing methods accept this object directly and do not require callers
     /// to use this low-level representation.
     pub fn to_code_units(&self) -> PyResult<Vec<u16>> {
+        if self.symbolic.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "symbolic instructions can only be emitted by MethodEditor",
+            ));
+        }
         self.instruction
             .to_code_units()
             .map_err(PyRuntimeError::new_err)
@@ -595,6 +704,22 @@ impl DexInstruction {
         Self::from_factory(DexInstructionModel::ConstString(register, string_index))
     }
 
+    /// Construct a const-string from its value.  The string pool entry is
+    /// resolved when a MethodEditor is committed, so a missing value can be
+    /// added to the edited DEX and the instruction can be upgraded to
+    /// const-string/jumbo when necessary.
+    #[staticmethod]
+    pub fn const_string_value(register: u8, value: &str) -> Self {
+        Self::from_symbolic(
+            DexInstructionModel::ConstString(register, 0),
+            SymbolicInstruction::StringValue {
+                register,
+                value: value.to_string(),
+            },
+            2,
+        )
+    }
+
     #[staticmethod]
     pub fn const_string_from_string(register: u8, string: &DexString) -> PyResult<Self> {
         let string_index = string.get_index()?;
@@ -618,10 +743,7 @@ impl DexInstruction {
 
     #[staticmethod]
     pub fn move_from16(register: u8, source_register: u16) -> PyResult<Self> {
-        Self::from_factory(DexInstructionModel::MoveFrom16(
-            register,
-            source_register,
-        ))
+        Self::from_factory(DexInstructionModel::MoveFrom16(register, source_register))
     }
 
     #[staticmethod]
@@ -653,6 +775,156 @@ impl DexInstruction {
             register_count,
             method_index,
             first_register,
+        ))
+    }
+
+    /// Construct an if-eq instruction whose target is resolved by a
+    /// MethodEditor after all edits have been laid out.
+    #[staticmethod]
+    pub fn if_eq(left_register: u8, right_register: u8, target: CodeLabel) -> PyResult<Self> {
+        Self::symbolic_if(TestFunction::Equal, left_register, right_register, target)
+    }
+
+    #[staticmethod]
+    pub fn if_ne(left_register: u8, right_register: u8, target: CodeLabel) -> PyResult<Self> {
+        Self::symbolic_if(
+            TestFunction::NotEqual,
+            left_register,
+            right_register,
+            target,
+        )
+    }
+
+    #[staticmethod]
+    pub fn if_lt(left_register: u8, right_register: u8, target: CodeLabel) -> PyResult<Self> {
+        Self::symbolic_if(
+            TestFunction::LessThan,
+            left_register,
+            right_register,
+            target,
+        )
+    }
+
+    #[staticmethod]
+    pub fn if_le(left_register: u8, right_register: u8, target: CodeLabel) -> PyResult<Self> {
+        Self::symbolic_if(
+            TestFunction::LessEqual,
+            left_register,
+            right_register,
+            target,
+        )
+    }
+
+    #[staticmethod]
+    pub fn if_gt(left_register: u8, right_register: u8, target: CodeLabel) -> PyResult<Self> {
+        Self::symbolic_if(
+            TestFunction::GreaterThan,
+            left_register,
+            right_register,
+            target,
+        )
+    }
+
+    #[staticmethod]
+    pub fn if_ge(left_register: u8, right_register: u8, target: CodeLabel) -> PyResult<Self> {
+        Self::symbolic_if(
+            TestFunction::GreaterEqual,
+            left_register,
+            right_register,
+            target,
+        )
+    }
+
+    #[staticmethod]
+    pub fn if_eqz(register: u8, target: CodeLabel) -> Self {
+        Self::from_symbolic(
+            DexInstructionModel::TestZero(TestFunction::Equal, register, 0),
+            SymbolicInstruction::Branch(target),
+            2,
+        )
+    }
+
+    #[staticmethod]
+    pub fn if_nez(register: u8, target: CodeLabel) -> Self {
+        Self::from_symbolic(
+            DexInstructionModel::TestZero(TestFunction::NotEqual, register, 0),
+            SymbolicInstruction::Branch(target),
+            2,
+        )
+    }
+
+    #[staticmethod]
+    pub fn if_ltz(register: u8, target: CodeLabel) -> Self {
+        Self::from_symbolic(
+            DexInstructionModel::TestZero(TestFunction::LessThan, register, 0),
+            SymbolicInstruction::Branch(target),
+            2,
+        )
+    }
+
+    #[staticmethod]
+    pub fn if_lez(register: u8, target: CodeLabel) -> Self {
+        Self::from_symbolic(
+            DexInstructionModel::TestZero(TestFunction::LessEqual, register, 0),
+            SymbolicInstruction::Branch(target),
+            2,
+        )
+    }
+
+    #[staticmethod]
+    pub fn if_gtz(register: u8, target: CodeLabel) -> Self {
+        Self::from_symbolic(
+            DexInstructionModel::TestZero(TestFunction::GreaterThan, register, 0),
+            SymbolicInstruction::Branch(target),
+            2,
+        )
+    }
+
+    #[staticmethod]
+    pub fn if_gez(register: u8, target: CodeLabel) -> Self {
+        Self::from_symbolic(
+            DexInstructionModel::TestZero(TestFunction::GreaterEqual, register, 0),
+            SymbolicInstruction::Branch(target),
+            2,
+        )
+    }
+
+    #[staticmethod]
+    pub fn goto(target: CodeLabel) -> Self {
+        Self::from_symbolic(
+            DexInstructionModel::Goto32(0),
+            SymbolicInstruction::Branch(target),
+            3,
+        )
+    }
+
+    /// Construct a switch. `cases` is a list of `(case_value, CodeLabel)`
+    /// pairs; `default` is optional because DEX represents the default path
+    /// as fall-through.
+    #[staticmethod]
+    #[pyo3(signature = (register, cases, default=None))]
+    pub fn switch(
+        register: u8,
+        cases: Vec<(i32, CodeLabel)>,
+        default: Option<CodeLabel>,
+    ) -> PyResult<Self> {
+        let mut case_map = BTreeMap::new();
+        for (key, label) in cases {
+            if case_map.insert(key, label).is_some() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "duplicate switch case value: {key}"
+                )));
+            }
+        }
+        Ok(Self::from_symbolic(
+            DexInstructionModel::Nop,
+            SymbolicInstruction::Switch {
+                register,
+                cases: case_map,
+                default,
+                form: SwitchForm::Auto,
+            },
+            3,
         ))
     }
 }
@@ -1278,6 +1550,13 @@ impl DexString {
         self.string.clone()
     }
 
+    pub fn get_dex_name(&self) -> PyResult<String> {
+        match &self._place {
+            analysis::Location::DexString(_, dex) => Ok(dex.get_dex_name().to_string()),
+            _ => Err(PyRuntimeError::new_err("string has no DEX location")),
+        }
+    }
+
     pub fn get_index(&self) -> PyResult<u32> {
         match &self._place {
             analysis::Location::DexString(index, _) => Ok(*index),
@@ -1293,6 +1572,11 @@ impl Graph {
             return String::new();
         };
         s.to_dot()
+    }
+
+    /// Return the complete supergraph used to derive this graph.
+    pub fn to_supergraph_dot(&self) -> String {
+        self.supergraph.to_dot()
     }
 }
 
@@ -1416,11 +1700,24 @@ const {function_name} = {class_without_pkg}.{function_name}.overload({arguments}
 
     /// Return concrete decoded instructions suitable for object-based edits.
     pub fn get_instructions(&self) -> Vec<DexInstruction> {
-        let Some(code) = self.method_data.as_ref().and_then(|data| data.code.as_ref()) else {
+        let Some(code) = self
+            .method_data
+            .as_ref()
+            .and_then(|data| data.code.as_ref())
+        else {
             return vec![];
         };
         code.insns
             .iter()
+            .filter(|(_, _, instruction)| {
+                !matches!(
+                    instruction,
+                    DexInstructionModel::ArrayData(..)
+                        | DexInstructionModel::PackedSwitchData(..)
+                        | DexInstructionModel::SparseSwitchData(..)
+                        | DexInstructionModel::SwitchData(..)
+                )
+            })
             .map(|(size, offset, instruction)| {
                 let size_in_code_units = instruction
                     .to_code_units()
@@ -1933,6 +2230,13 @@ impl Class {
     pub fn name(&self) -> &str {
         &self.class.class_name
     }
+
+    /// Return the type-pool index used by instructions such as new-instance
+    /// and check-cast. This index is relative to the class's DEX file.
+    pub fn get_type_idx(&self) -> u32 {
+        self.class.class_idx
+    }
+
     pub fn friendly_name(&self) -> String {
         let without_prefix = self.name().strip_prefix('L').unwrap_or_default();
         let with_dots = without_prefix.replace('/', ".");
@@ -2238,6 +2542,7 @@ pub(crate) fn register(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<Method>()?;
     m.add_class::<Class>()?;
     m.add_class::<Instruction>()?;
+    m.add_class::<CodeLabel>()?;
     m.add_class::<DexInstruction>()?;
     m.add_class::<InstructionValue>()?;
     m.add_class::<Branching>()?;

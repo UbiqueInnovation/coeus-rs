@@ -838,19 +838,23 @@ pub fn find_string_matches_for_type_name(
     iterator!(files).for_each(|dex| {
         let types = dex.types();
         let type_matches: Vec<Evidence> = iterator!(types)
-            .filter(
-                |(dex_file,_index, type_idx)| match dex_file.strings.get((*type_idx) as usize) {
+            .filter(|(dex_file, _index, type_idx)| {
+                match dex_file.strings.get((*type_idx) as usize) {
                     Some(name) => reg.is_match(&name.to_str_lossy()),
                     None => false,
-                },
-            )
-            .filter_map(|(dex_file,index, type_idx)| {
+                }
+            })
+            .filter_map(|(dex_file, index, type_idx)| {
                 let type_name = dex_file.strings.get((*type_idx) as usize)?.to_str().ok()?;
 
                 Some(Evidence::String(StringEvidence {
                     content: type_name.to_owned(),
                     place: Location::Type(*index as u32, dex_file.clone()),
-                    context: Context::DexType(*index as u32, type_name.to_string(), dex_file.clone()),
+                    context: Context::DexType(
+                        *index as u32,
+                        type_name.to_string(),
+                        dex_file.clone(),
+                    ),
                     confidence_level: ConfidenceLevel::Medium,
                 }))
             })

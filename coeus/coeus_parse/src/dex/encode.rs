@@ -6,7 +6,11 @@
 //! patch a code item in place and repair the DEX checksum/signature.
 
 use super::{parse_dex_buf, ArrayView};
-use coeus_models::models::{DexFile, Instruction};
+use coeus_models::models::{DexFile, Instruction, TestFunction};
+use std::{
+    collections::{BTreeMap, HashMap},
+    convert::TryFrom,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DexEncodeError {
@@ -20,6 +24,12 @@ pub enum DexEncodeError {
     MethodClassDataNotFound,
     RegisterUnavailable { register: u8, available: u16 },
     InvalidCodeItem,
+    InvalidStringIndex(u32),
+    ConflictingEdits,
+    InvalidEditAnchor(u32),
+    BranchTargetNotFound(u32),
+    BranchOutOfRange,
+    UnsupportedEditInstruction,
 }
 
 impl std::fmt::Display for DexEncodeError {
@@ -42,11 +52,88 @@ impl std::fmt::Display for DexEncodeError {
                 available.saturating_sub(1)
             ),
             Self::InvalidCodeItem => write!(formatter, "invalid DEX code item"),
+            Self::InvalidStringIndex(index) => write!(formatter, "invalid DEX string index: {index}"),
+            Self::ConflictingEdits => write!(formatter, "conflicting edits at the same instruction"),
+            Self::InvalidEditAnchor(offset) => {
+                write!(formatter, "edit anchor is not an executable instruction: {offset}")
+            }
+            Self::BranchTargetNotFound(offset) => {
+                write!(formatter, "branch target is not an instruction boundary: {offset}")
+            }
+            Self::BranchOutOfRange => write!(formatter, "branch target is out of range"),
+            Self::UnsupportedEditInstruction => {
+                write!(formatter, "instruction cannot be used in a symbolic edit")
+            }
         }
     }
 }
 
 impl std::error::Error for DexEncodeError {}
+
+/// Which logical position an edit target refers to.
+///
+/// `Instruction` is the instruction itself, while `Before` and `After` are
+/// explicit insertion points. Keeping these distinct means that a branch to
+/// an existing instruction is not accidentally redirected in front of code
+/// inserted with `insert_before`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TargetPosition {
+    Before,
+    Instruction,
+    After,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CodeTarget {
+    pub offset: u32,
+    pub position: TargetPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditPosition {
+    Before,
+    After,
+    Replace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchForm {
+    Auto,
+    Packed,
+    Sparse,
+}
+
+/// An instruction used by the symbolic method rewriter.
+///
+/// The ordinary `Instruction` enum deliberately remains a low-level model
+/// whose branch operands are relative offsets. This separate type lets the
+/// editor express branches using logical targets until final layout is known.
+#[derive(Debug, Clone)]
+pub enum EditableInstruction {
+    Concrete(Instruction),
+    Branch {
+        instruction: Instruction,
+        target: CodeTarget,
+    },
+    Switch {
+        register: u8,
+        cases: BTreeMap<i32, CodeTarget>,
+        default: Option<CodeTarget>,
+        form: SwitchForm,
+    },
+    FillArray {
+        register: u8,
+        width: u16,
+        data: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct MethodEdit {
+    pub anchor: u32,
+    pub position: EditPosition,
+    pub instructions: Vec<EditableInstruction>,
+}
 
 /// Return a valid copy of the original DEX.
 pub fn encode_dex(dex: &DexFile) -> Result<Vec<u8>, DexEncodeError> {
@@ -136,12 +223,8 @@ pub fn inject_load_library(
 ) -> Result<Vec<u8>, DexEncodeError> {
     let (referenced_dex, string_idx, load_library_idx) =
         ensure_load_library_references(dex, library_name)?;
-    let edited = parse_dex_buf(
-        &dex.file_name,
-        &ArrayView::new(&referenced_dex),
-        false,
-    )
-    .ok_or(DexEncodeError::InvalidCodeItem)?;
+    let edited = parse_dex_buf(&dex.file_name, &ArrayView::new(&referenced_dex), false)
+        .ok_or(DexEncodeError::InvalidCodeItem)?;
     let code = edited
         .classes
         .iter()
@@ -151,7 +234,10 @@ pub fn inject_load_library(
         .ok_or(DexEncodeError::MethodHasNoCode(method_idx))?;
     let available = code.register_size.saturating_sub(code.ins_size);
     if register as u16 >= available {
-        return Err(DexEncodeError::RegisterUnavailable { register, available });
+        return Err(DexEncodeError::RegisterUnavailable {
+            register,
+            available,
+        });
     }
     let prefix = load_library_prefix(string_idx, load_library_idx, register);
     prepend_method_code(&edited, method_idx, &prefix)
@@ -203,11 +289,7 @@ fn ensure_load_library_references(
 
     let mut type_additions = Vec::<u32>::new();
     let ensure_type = |descriptor_idx: u32, dex: &DexFile, additions: &mut Vec<u32>| {
-        if let Some(index) = dex
-            .types
-            .iter()
-            .position(|index| *index == descriptor_idx)
-        {
+        if let Some(index) = dex.types.iter().position(|index| *index == descriptor_idx) {
             index as u32
         } else if let Some(index) = additions.iter().position(|index| *index == descriptor_idx) {
             dex.types.len() as u32 + index as u32
@@ -234,7 +316,11 @@ fn ensure_load_library_references(
             && method.name_idx == load_name_idx
     });
     if let Some(method_idx) = existing_method_idx {
-        return Ok((dex.raw_data().to_vec(), library_string_idx, method_idx as u32));
+        return Ok((
+            dex.raw_data().to_vec(),
+            library_string_idx,
+            method_idx as u32,
+        ));
     }
 
     let new_string_values = strings[old_string_count..].to_vec();
@@ -249,11 +335,61 @@ fn ensure_load_library_references(
         shorty_idx,
         void_type_idx,
         string_type_idx,
-        system_type_idx,
-        proto_idx,
-        load_name_idx,
+        Some((system_type_idx, proto_idx, load_name_idx)),
+        &[],
     )?;
     Ok((output, library_string_idx, new_method_idx))
+}
+
+/// Ensure that the supplied values have entries in the DEX string pool.
+///
+/// Existing string IDs remain stable. Missing values are appended to the
+/// string-id/string-data sections and all relocated data offsets are repaired.
+/// This is intentionally separate from method rewriting: callers can prepare
+/// the pool first, resolve the resulting string indices, and then let the
+/// method encoder account for any const-string/jumbo width changes.
+pub fn ensure_dex_strings(dex: &DexFile, values: &[String]) -> Result<Vec<u8>, DexEncodeError> {
+    if dex.raw_data().is_empty() {
+        return Err(DexEncodeError::MissingRawData);
+    }
+    let mut new_strings = Vec::new();
+    for value in values {
+        if dex.find_string_index(value).is_none() && !new_strings.iter().any(|item| item == value) {
+            new_strings.push(value.clone());
+        }
+    }
+    if new_strings.is_empty() {
+        return Ok(dex.raw_data().to_vec());
+    }
+    rebuild_dex_with_references(dex, &new_strings, &[], false, 0, 0, 0, None, &[])
+}
+
+/// Replace one string-id's data item while keeping its string index stable.
+/// Every existing instruction that references `string_index` therefore sees
+/// the replacement value after the edit.
+pub fn replace_dex_string(
+    dex: &DexFile,
+    string_index: u32,
+    replacement: &str,
+) -> Result<Vec<u8>, DexEncodeError> {
+    if string_index >= dex.header.string_ids_size || dex.get_string(string_index as usize).is_none()
+    {
+        return Err(DexEncodeError::InvalidStringIndex(string_index));
+    }
+    if dex.get_string(string_index as usize) == Some(replacement) {
+        return Ok(dex.raw_data().to_vec());
+    }
+    rebuild_dex_with_references(
+        dex,
+        &[],
+        &[],
+        false,
+        0,
+        0,
+        0,
+        None,
+        &[(string_index, replacement.to_string())],
+    )
 }
 
 fn append_dex_string_data(output: &mut Vec<u8>, value: &str) {
@@ -298,9 +434,8 @@ fn rebuild_dex_with_references(
     shorty_idx: u32,
     return_type_idx: u32,
     parameter_type_idx: u32,
-    method_class_idx: u32,
-    method_proto_idx: u32,
-    method_name_idx: u32,
+    new_method: Option<(u32, u32, u32)>,
+    string_replacements: &[(u32, String)],
 ) -> Result<Vec<u8>, DexEncodeError> {
     let raw = dex.raw_data();
     let old_map_off = dex.header.map_off as usize;
@@ -309,6 +444,11 @@ fn rebuild_dex_with_references(
         return Err(DexEncodeError::InvalidCodeItem);
     }
     let map_entries = read_map_entries(raw, old_map_off)?;
+    for (string_index, _) in string_replacements {
+        if *string_index >= dex.header.string_ids_size {
+            return Err(DexEncodeError::InvalidStringIndex(*string_index));
+        }
+    }
 
     let mut output = Vec::with_capacity(raw.len() + 256);
     let old_string_off = dex.header.string_ids_off as usize;
@@ -318,7 +458,13 @@ fn rebuild_dex_with_references(
     output.extend_from_slice(&raw[..old_string_off]);
 
     let string_ids_off = output.len() as u32;
-    append_raw_table(&mut output, raw, old_string_off, dex.header.string_ids_size, 4)?;
+    append_raw_table(
+        &mut output,
+        raw,
+        old_string_off,
+        dex.header.string_ids_size,
+        4,
+    )?;
     let new_string_slot_off = output.len();
     output.resize(output.len() + new_strings.len() * 4, 0);
 
@@ -362,20 +508,29 @@ fn rebuild_dex_with_references(
         offset
     };
 
-    if method_class_idx > u16::MAX as u32 || method_proto_idx > u16::MAX as u32 {
-        return Err(DexEncodeError::InvalidCodeItem);
-    }
-    let method_ids_off = output.len() as u32;
-    append_raw_table(
-        &mut output,
-        raw,
-        dex.header.method_ids_off as usize,
-        dex.header.method_ids_size,
-        8,
-    )?;
-    output.extend_from_slice(&(method_class_idx as u16).to_le_bytes());
-    output.extend_from_slice(&(method_proto_idx as u16).to_le_bytes());
-    output.extend_from_slice(&method_name_idx.to_le_bytes());
+    let method_ids_off = if dex.header.method_ids_size == 0 && new_method.is_none() {
+        0
+    } else {
+        if let Some((class_idx, proto_idx, _)) = new_method {
+            if class_idx > u16::MAX as u32 || proto_idx > u16::MAX as u32 {
+                return Err(DexEncodeError::InvalidCodeItem);
+            }
+        }
+        let offset = output.len() as u32;
+        append_raw_table(
+            &mut output,
+            raw,
+            dex.header.method_ids_off as usize,
+            dex.header.method_ids_size,
+            8,
+        )?;
+        if let Some((class_idx, proto_idx, name_idx)) = new_method {
+            output.extend_from_slice(&(class_idx as u16).to_le_bytes());
+            output.extend_from_slice(&(proto_idx as u16).to_le_bytes());
+            output.extend_from_slice(&name_idx.to_le_bytes());
+        }
+        offset
+    };
 
     align_vec(&mut output, 4);
     let class_defs_off = if dex.header.class_defs_size == 0 {
@@ -400,17 +555,35 @@ fn rebuild_dex_with_references(
     // Existing string/proto/class references into data now point at the
     // relocated copy.  New references are filled in after the new data items
     // have been assigned their final offsets.
-    patch_string_ids(&mut output, string_ids_off as usize, dex.header.string_ids_size, shift)?;
-    patch_proto_ids(&mut output, proto_ids_off as usize, dex.header.proto_ids_size, shift)?;
-    patch_class_defs(&mut output, class_defs_off as usize, dex.header.class_defs_size, shift)?;
+    patch_string_ids(
+        &mut output,
+        string_ids_off as usize,
+        dex.header.string_ids_size,
+        shift,
+    )?;
+    patch_proto_ids(
+        &mut output,
+        proto_ids_off as usize,
+        dex.header.proto_ids_size,
+        shift,
+    )?;
+    patch_class_defs(
+        &mut output,
+        class_defs_off as usize,
+        dex.header.class_defs_size,
+        shift,
+    )?;
 
     let old_data_copy_start = output.len();
     output.extend_from_slice(&raw[old_data_off..old_map_off]);
     let old_data_copy = &mut output[old_data_copy_start..];
     patch_data_offsets(old_data_copy, &map_entries, dex.header.data_off, shift)?;
 
-    let mut new_string_offsets = Vec::with_capacity(new_strings.len());
-    for value in new_strings {
+    let mut new_string_offsets = Vec::with_capacity(new_strings.len() + string_replacements.len());
+    for value in new_strings
+        .iter()
+        .chain(string_replacements.iter().map(|(_, value)| value))
+    {
         let offset = output.len() as u32;
         new_string_offsets.push(offset);
         append_dex_string_data(&mut output, value);
@@ -427,8 +600,18 @@ fn rebuild_dex_with_references(
     };
 
     for (index, offset) in new_string_offsets.iter().enumerate() {
+        if index >= new_strings.len() {
+            break;
+        }
         let position = new_string_slot_off + index * 4;
         write_u32_at(&mut output, position, *offset)?;
+    }
+    for (replacement_index, (string_index, _)) in string_replacements.iter().enumerate() {
+        let offset = *new_string_offsets
+            .get(new_strings.len() + replacement_index)
+            .ok_or(DexEncodeError::InvalidCodeItem)?;
+        let position = string_ids_off as usize + *string_index as usize * 4;
+        write_u32_at(&mut output, position, offset)?;
     }
     if let Some(parameters_off) = parameters_off {
         write_u32_at(
@@ -459,22 +642,38 @@ fn rebuild_dex_with_references(
                 proto_ids_off,
             ),
             0x0004 => (dex.header.fields_ids_size, field_ids_off),
-            0x0005 => (dex.header.method_ids_size + 1, method_ids_off),
+            0x0005 => (
+                dex.header.method_ids_size + u32::from(new_method.is_some()),
+                method_ids_off,
+            ),
             0x0006 => (dex.header.class_defs_size, class_defs_off),
             0x1001 => (
                 entry.count + u32::from(new_proto),
-                entry.offset.checked_add(shift).ok_or(DexEncodeError::InvalidCodeItem)?,
+                entry
+                    .offset
+                    .checked_add(shift)
+                    .ok_or(DexEncodeError::InvalidCodeItem)?,
             ),
             0x2002 => (
-                entry.count + new_strings.len() as u32,
-                entry.offset.checked_add(shift).ok_or(DexEncodeError::InvalidCodeItem)?,
+                entry.count + new_string_offsets.len() as u32,
+                entry
+                    .offset
+                    .checked_add(shift)
+                    .ok_or(DexEncodeError::InvalidCodeItem)?,
             ),
             _ => (
                 entry.count,
-                entry.offset.checked_add(shift).ok_or(DexEncodeError::InvalidCodeItem)?,
+                entry
+                    .offset
+                    .checked_add(shift)
+                    .ok_or(DexEncodeError::InvalidCodeItem)?,
             ),
         };
-        new_map.push(MapEntry { kind: entry.kind, count, offset });
+        new_map.push(MapEntry {
+            kind: entry.kind,
+            count,
+            offset,
+        });
     }
     if new_proto && !new_map.iter().any(|entry| entry.kind == 0x1001) {
         // The map can legally omit empty optional sections, but a new proto
@@ -485,11 +684,13 @@ fn rebuild_dex_with_references(
             offset: parameters_off.ok_or(DexEncodeError::InvalidCodeItem)?,
         });
     }
-    if !new_strings.is_empty() && !new_map.iter().any(|entry| entry.kind == 0x2002) {
+    if !new_string_offsets.is_empty() && !new_map.iter().any(|entry| entry.kind == 0x2002) {
         new_map.push(MapEntry {
             kind: 0x2002,
-            count: new_strings.len() as u32,
-            offset: *new_string_offsets.first().ok_or(DexEncodeError::InvalidCodeItem)?,
+            count: new_string_offsets.len() as u32,
+            offset: *new_string_offsets
+                .first()
+                .ok_or(DexEncodeError::InvalidCodeItem)?,
         });
     }
     new_map.sort_by_key(|entry| (entry.offset, entry.kind));
@@ -508,15 +709,31 @@ fn rebuild_dex_with_references(
     );
 
     write_u32_at(&mut output, 52, new_map_off)?;
-    write_u32_at(&mut output, 56, dex.header.string_ids_size + new_strings.len() as u32)?;
+    write_u32_at(
+        &mut output,
+        56,
+        dex.header.string_ids_size + new_strings.len() as u32,
+    )?;
     write_u32_at(&mut output, 60, string_ids_off)?;
-    write_u32_at(&mut output, 64, dex.header.type_ids_size + new_types.len() as u32)?;
+    write_u32_at(
+        &mut output,
+        64,
+        dex.header.type_ids_size + new_types.len() as u32,
+    )?;
     write_u32_at(&mut output, 68, type_ids_off)?;
-    write_u32_at(&mut output, 72, dex.header.proto_ids_size + u32::from(new_proto))?;
+    write_u32_at(
+        &mut output,
+        72,
+        dex.header.proto_ids_size + u32::from(new_proto),
+    )?;
     write_u32_at(&mut output, 76, proto_ids_off)?;
     write_u32_at(&mut output, 80, dex.header.fields_ids_size)?;
     write_u32_at(&mut output, 84, field_ids_off)?;
-    write_u32_at(&mut output, 88, dex.header.method_ids_size + 1)?;
+    write_u32_at(
+        &mut output,
+        88,
+        dex.header.method_ids_size + u32::from(new_method.is_some()),
+    )?;
     write_u32_at(&mut output, 92, method_ids_off)?;
     write_u32_at(&mut output, 96, dex.header.class_defs_size)?;
     write_u32_at(&mut output, 100, class_defs_off)?;
@@ -538,7 +755,9 @@ fn append_raw_table(
     let size = (count as usize)
         .checked_mul(item_size)
         .ok_or(DexEncodeError::InvalidCodeItem)?;
-    let end = offset.checked_add(size).ok_or(DexEncodeError::InvalidCodeItem)?;
+    let end = offset
+        .checked_add(size)
+        .ok_or(DexEncodeError::InvalidCodeItem)?;
     if end > raw.len() || (count != 0 && offset == 0) {
         return Err(DexEncodeError::InvalidCodeItem);
     }
@@ -876,8 +1095,7 @@ fn patch_data_offsets_relocated(
             0x2006 => {
                 let mut cursor = base;
                 for _ in 0..entry.count {
-                    cursor +=
-                        patch_annotations_directory_relocated(data, cursor, relocation)?;
+                    cursor += patch_annotations_directory_relocated(data, cursor, relocation)?;
                 }
             }
             _ => {}
@@ -887,7 +1105,9 @@ fn patch_data_offsets_relocated(
 }
 
 fn shift_offset(value: u32, shift: u32) -> Result<u32, DexEncodeError> {
-    value.checked_add(shift).ok_or(DexEncodeError::InvalidCodeItem)
+    value
+        .checked_add(shift)
+        .ok_or(DexEncodeError::InvalidCodeItem)
 }
 
 fn patch_u32_reference(data: &mut [u8], offset: usize, shift: u32) -> Result<(), DexEncodeError> {
@@ -1094,6 +1314,995 @@ fn write_u32_at(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), DexEn
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct OriginalInstruction {
+    offset: u32,
+    raw: Vec<u16>,
+    instruction: Instruction,
+}
+
+#[derive(Debug, Clone)]
+struct EditAtom {
+    id: usize,
+    instruction: EditableInstruction,
+    original: Option<OriginalInstruction>,
+}
+
+#[derive(Debug, Default)]
+struct AnchoredEdits {
+    before: Vec<EditableInstruction>,
+    after: Vec<EditableInstruction>,
+    replacement: Option<Vec<EditableInstruction>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AtomState {
+    conditional_expanded: bool,
+    goto_width: u8,
+}
+
+#[derive(Debug, Clone)]
+struct Segment {
+    offset: u32,
+    before: Vec<EditAtom>,
+    main: Vec<EditAtom>,
+    after: Vec<EditAtom>,
+}
+
+#[derive(Debug, Clone)]
+struct PlacedAtom {
+    atom: EditAtom,
+    start: u32,
+}
+
+#[derive(Debug)]
+struct Layout {
+    atoms: Vec<PlacedAtom>,
+    targets: BTreeMap<(u32, TargetPosition), u32>,
+    payload_offsets: HashMap<usize, u32>,
+    size: u32,
+}
+
+fn is_payload(instruction: &Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::ArrayData(..)
+            | Instruction::PackedSwitchData(..)
+            | Instruction::SparseSwitchData(..)
+            | Instruction::SwitchData(..)
+    )
+}
+
+fn add_relative_offset(source: u32, relative: i32) -> Result<u32, DexEncodeError> {
+    let target = source as i64 + relative as i64;
+    if target < 0 || target > u32::MAX as i64 {
+        return Err(DexEncodeError::InvalidCodeItem);
+    }
+    Ok(target as u32)
+}
+
+fn original_editable_instruction(
+    instruction: &Instruction,
+    offset: u32,
+    payloads: &HashMap<u32, Instruction>,
+) -> Result<EditableInstruction, DexEncodeError> {
+    let instruction_target = |relative: i32| {
+        Ok(CodeTarget {
+            offset: add_relative_offset(offset, relative)?,
+            position: TargetPosition::Instruction,
+        })
+    };
+
+    match instruction {
+        Instruction::Test(_, _, _, relative) => Ok(EditableInstruction::Branch {
+            instruction: instruction.clone(),
+            target: instruction_target(*relative as i32)?,
+        }),
+        Instruction::TestZero(_, _, relative) => Ok(EditableInstruction::Branch {
+            instruction: instruction.clone(),
+            target: instruction_target(*relative as i32)?,
+        }),
+        Instruction::Goto8(relative) => Ok(EditableInstruction::Branch {
+            instruction: instruction.clone(),
+            target: instruction_target(*relative as i32)?,
+        }),
+        Instruction::Goto16(relative) => Ok(EditableInstruction::Branch {
+            instruction: instruction.clone(),
+            target: instruction_target(*relative as i32)?,
+        }),
+        Instruction::Goto32(relative) => Ok(EditableInstruction::Branch {
+            instruction: instruction.clone(),
+            target: instruction_target(*relative)?,
+        }),
+        Instruction::PackedSwitch(register, payload_relative)
+        | Instruction::SparseSwitch(register, payload_relative) => {
+            let payload_offset = add_relative_offset(offset, *payload_relative)?;
+            let payload = payloads
+                .get(&payload_offset)
+                .ok_or(DexEncodeError::InvalidCodeItem)?;
+            let switch = match payload {
+                Instruction::PackedSwitchData(switch) | Instruction::SparseSwitchData(switch) => {
+                    switch
+                }
+                _ => return Err(DexEncodeError::InvalidCodeItem),
+            };
+            let cases = switch
+                .targets
+                .iter()
+                .map(|(&key, &relative)| {
+                    Ok((
+                        key,
+                        CodeTarget {
+                            offset: add_relative_offset(offset, relative)?,
+                            position: TargetPosition::Instruction,
+                        },
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, DexEncodeError>>()?;
+            Ok(EditableInstruction::Switch {
+                register: *register,
+                cases,
+                default: None,
+                form: if matches!(instruction, Instruction::PackedSwitch(..)) {
+                    SwitchForm::Packed
+                } else {
+                    SwitchForm::Sparse
+                },
+            })
+        }
+        Instruction::FillArrayData(register, payload_relative) => {
+            let payload_offset = add_relative_offset(offset, *payload_relative as i32)?;
+            let payload = payloads
+                .get(&payload_offset)
+                .ok_or(DexEncodeError::InvalidCodeItem)?;
+            let (width, data) = match payload {
+                Instruction::ArrayData(width, data) => (*width, data.clone()),
+                _ => return Err(DexEncodeError::InvalidCodeItem),
+            };
+            Ok(EditableInstruction::FillArray {
+                register: *register,
+                width,
+                data,
+            })
+        }
+        Instruction::Switch(..) | Instruction::SwitchData(..) => {
+            Err(DexEncodeError::UnsupportedEditInstruction)
+        }
+        _ => Ok(EditableInstruction::Concrete(instruction.clone())),
+    }
+}
+
+/// Convert a decoded instruction into the symbolic form used by the method
+/// rewriter. This is public for language bindings that already own a decoded
+/// instruction object.
+pub fn editable_instruction_from_decoded(
+    dex: &DexFile,
+    method_idx: u32,
+    offset: u32,
+    instruction: &Instruction,
+) -> Result<EditableInstruction, DexEncodeError> {
+    let payloads = dex
+        .classes
+        .iter()
+        .flat_map(|class| class.codes.iter())
+        .flat_map(|method| {
+            (method.method_idx == method_idx)
+                .then(|| method.code.as_ref())
+                .flatten()
+        })
+        .flat_map(|code| code.insns.iter())
+        .filter(|(_, _, instruction)| is_payload(instruction))
+        .map(|(_, offset, instruction)| (offset.0, instruction.clone()))
+        .collect::<HashMap<_, _>>();
+    original_editable_instruction(instruction, offset, &payloads)
+}
+
+fn instruction_units(atom: &EditAtom, state: AtomState) -> Result<usize, DexEncodeError> {
+    match &atom.instruction {
+        EditableInstruction::Concrete(instruction) => {
+            if let Some(original) = &atom.original {
+                Ok(original.raw.len())
+            } else {
+                instruction
+                    .to_code_units()
+                    .map(|units| units.len())
+                    .map_err(|_| DexEncodeError::UnsupportedEditInstruction)
+            }
+        }
+        EditableInstruction::Branch { instruction, .. } => {
+            if is_conditional(instruction) && state.conditional_expanded {
+                Ok(5)
+            } else if is_goto(instruction) {
+                Ok(if state.goto_width == 0 {
+                    goto_nominal_width(instruction) as usize
+                } else {
+                    state.goto_width as usize
+                })
+            } else {
+                instruction
+                    .to_code_units()
+                    .map(|units| units.len())
+                    .map_err(|_| DexEncodeError::UnsupportedEditInstruction)
+            }
+        }
+        EditableInstruction::Switch { default, .. } => {
+            Ok(3 + if default.is_some() { 3 } else { 0 })
+        }
+        EditableInstruction::FillArray { .. } => Ok(3),
+    }
+}
+
+fn is_conditional(instruction: &Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::Test(..) | Instruction::TestZero(..)
+    )
+}
+
+fn is_goto(instruction: &Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::Goto8(..) | Instruction::Goto16(..) | Instruction::Goto32(..)
+    )
+}
+
+fn goto_nominal_width(instruction: &Instruction) -> u8 {
+    match instruction {
+        Instruction::Goto8(..) => 1,
+        Instruction::Goto16(..) => 2,
+        Instruction::Goto32(..) => 3,
+        _ => 0,
+    }
+}
+
+fn switch_payload_units(form: SwitchForm, entries: usize) -> usize {
+    match form {
+        SwitchForm::Packed => 4 + entries * 2,
+        SwitchForm::Sparse => 2 + entries * 4,
+        SwitchForm::Auto => 2 + entries * 4,
+    }
+}
+
+fn switch_is_packed(cases: &BTreeMap<i32, CodeTarget>) -> bool {
+    let Some((&first, _)) = cases.first_key_value() else {
+        return true;
+    };
+    cases
+        .keys()
+        .enumerate()
+        .all(|(index, key)| *key == first.saturating_add(index as i32))
+}
+
+fn effective_switch_form(
+    form: SwitchForm,
+    cases: &BTreeMap<i32, CodeTarget>,
+) -> Result<SwitchForm, DexEncodeError> {
+    match form {
+        SwitchForm::Auto => Ok(if switch_is_packed(cases) {
+            SwitchForm::Packed
+        } else {
+            SwitchForm::Sparse
+        }),
+        SwitchForm::Packed if switch_is_packed(cases) => Ok(SwitchForm::Packed),
+        SwitchForm::Packed => Err(DexEncodeError::UnsupportedEditInstruction),
+        SwitchForm::Sparse => Ok(SwitchForm::Sparse),
+    }
+}
+
+fn resolve_target(
+    target: CodeTarget,
+    targets: &BTreeMap<(u32, TargetPosition), u32>,
+) -> Result<u32, DexEncodeError> {
+    targets
+        .get(&(target.offset, target.position))
+        .copied()
+        .ok_or(DexEncodeError::BranchTargetNotFound(target.offset))
+}
+
+fn layout_method(segments: &[Segment], states: &[AtomState]) -> Result<Layout, DexEncodeError> {
+    let mut atoms = Vec::new();
+    let mut targets = BTreeMap::new();
+    let mut pc = 0u32;
+
+    let place = |atom: &EditAtom,
+                 atoms: &mut Vec<PlacedAtom>,
+                 pc: &mut u32|
+     -> Result<(), DexEncodeError> {
+        let size = instruction_units(atom, states[atom.id])? as u32;
+        atoms.push(PlacedAtom {
+            atom: atom.clone(),
+            start: *pc,
+        });
+        *pc = pc
+            .checked_add(size)
+            .ok_or(DexEncodeError::InvalidCodeItem)?;
+        Ok(())
+    };
+
+    for segment in segments {
+        targets.insert((segment.offset, TargetPosition::Before), pc);
+        for atom in &segment.before {
+            place(atom, &mut atoms, &mut pc)?;
+        }
+        targets.insert((segment.offset, TargetPosition::Instruction), pc);
+        for atom in &segment.main {
+            place(atom, &mut atoms, &mut pc)?;
+        }
+        for atom in &segment.after {
+            place(atom, &mut atoms, &mut pc)?;
+        }
+        targets.insert((segment.offset, TargetPosition::After), pc);
+    }
+
+    let normal_end = pc;
+    let mut payload_offsets = HashMap::new();
+    for placed in &atoms {
+        let payload_size = match &placed.atom.instruction {
+            EditableInstruction::Switch { cases, form, .. } => {
+                let form = effective_switch_form(*form, cases)?;
+                Some(switch_payload_units(form, cases.len()))
+            }
+            EditableInstruction::FillArray { width, data, .. } => Some(
+                Instruction::ArrayData(*width, data.clone())
+                    .to_code_units()
+                    .map_err(|_| DexEncodeError::UnsupportedEditInstruction)?
+                    .len(),
+            ),
+            _ => None,
+        };
+        let Some(payload_size) = payload_size else {
+            continue;
+        };
+        if pc % 2 != 0 {
+            pc = pc.checked_add(1).ok_or(DexEncodeError::InvalidCodeItem)?;
+        }
+        payload_offsets.insert(placed.atom.id, pc);
+        pc = pc
+            .checked_add(payload_size as u32)
+            .ok_or(DexEncodeError::InvalidCodeItem)?;
+    }
+
+    if normal_end > i32::MAX as u32 || pc > i32::MAX as u32 {
+        return Err(DexEncodeError::InvalidCodeItem);
+    }
+    Ok(Layout {
+        atoms,
+        targets,
+        payload_offsets,
+        size: pc,
+    })
+}
+
+fn fits_i8(value: i64) -> bool {
+    (i8::MIN as i64..=i8::MAX as i64).contains(&value)
+}
+
+fn fits_i16(value: i64) -> bool {
+    (i16::MIN as i64..=i16::MAX as i64).contains(&value)
+}
+
+fn fits_i32(value: i64) -> bool {
+    (i32::MIN as i64..=i32::MAX as i64).contains(&value)
+}
+
+fn invert_test(function: TestFunction) -> TestFunction {
+    match function {
+        TestFunction::Equal => TestFunction::NotEqual,
+        TestFunction::NotEqual => TestFunction::Equal,
+        TestFunction::LessThan => TestFunction::GreaterEqual,
+        TestFunction::GreaterEqual => TestFunction::LessThan,
+        TestFunction::GreaterThan => TestFunction::LessEqual,
+        TestFunction::LessEqual => TestFunction::GreaterThan,
+    }
+}
+
+fn encode_branch(
+    instruction: &Instruction,
+    target: CodeTarget,
+    start: u32,
+    state: AtomState,
+    layout: &Layout,
+) -> Result<Vec<u16>, DexEncodeError> {
+    let target = resolve_target(target, &layout.targets)? as i64;
+    let start = start as i64;
+    match instruction {
+        Instruction::Test(function, a, b, _) => {
+            if state.conditional_expanded {
+                let condition = Instruction::Test(invert_test(*function), *a, *b, 5);
+                let goto_start = start + 2;
+                let goto_offset = target - goto_start;
+                if !fits_i32(goto_offset) {
+                    return Err(DexEncodeError::BranchOutOfRange);
+                }
+                let mut units = condition
+                    .to_code_units()
+                    .map_err(|_| DexEncodeError::UnsupportedEditInstruction)?;
+                units.extend(
+                    Instruction::Goto32(goto_offset as i32)
+                        .to_code_units()
+                        .map_err(|_| DexEncodeError::UnsupportedEditInstruction)?,
+                );
+                Ok(units)
+            } else {
+                let offset = target - start;
+                if !fits_i16(offset) {
+                    return Err(DexEncodeError::BranchOutOfRange);
+                }
+                Instruction::Test(*function, *a, *b, offset as i16)
+                    .to_code_units()
+                    .map_err(|_| DexEncodeError::UnsupportedEditInstruction)
+            }
+        }
+        Instruction::TestZero(function, register, _) => {
+            if state.conditional_expanded {
+                let condition = Instruction::TestZero(invert_test(*function), *register, 5);
+                let goto_start = start + 2;
+                let goto_offset = target - goto_start;
+                if !fits_i32(goto_offset) {
+                    return Err(DexEncodeError::BranchOutOfRange);
+                }
+                let mut units = condition
+                    .to_code_units()
+                    .map_err(|_| DexEncodeError::UnsupportedEditInstruction)?;
+                units.extend(
+                    Instruction::Goto32(goto_offset as i32)
+                        .to_code_units()
+                        .map_err(|_| DexEncodeError::UnsupportedEditInstruction)?,
+                );
+                Ok(units)
+            } else {
+                let offset = target - start;
+                if !fits_i16(offset) {
+                    return Err(DexEncodeError::BranchOutOfRange);
+                }
+                Instruction::TestZero(*function, *register, offset as i16)
+                    .to_code_units()
+                    .map_err(|_| DexEncodeError::UnsupportedEditInstruction)
+            }
+        }
+        Instruction::Goto8(_) | Instruction::Goto16(_) | Instruction::Goto32(_) => {
+            let offset = target - start;
+            let width = if state.goto_width == 0 {
+                goto_nominal_width(instruction)
+            } else {
+                state.goto_width
+            };
+            let instruction = match width {
+                1 if fits_i8(offset) => Instruction::Goto8(offset as i8),
+                2 if fits_i16(offset) => Instruction::Goto16(offset as i16),
+                3 if fits_i32(offset) => Instruction::Goto32(offset as i32),
+                1 if fits_i16(offset) => Instruction::Goto16(offset as i16),
+                1 | 2 if fits_i32(offset) => Instruction::Goto32(offset as i32),
+                _ => return Err(DexEncodeError::BranchOutOfRange),
+            };
+            instruction
+                .to_code_units()
+                .map_err(|_| DexEncodeError::UnsupportedEditInstruction)
+        }
+        _ => Err(DexEncodeError::UnsupportedEditInstruction),
+    }
+}
+
+fn encode_switch_payload(
+    form: SwitchForm,
+    cases: &BTreeMap<i32, CodeTarget>,
+    owner_start: u32,
+    layout: &Layout,
+) -> Result<Vec<u16>, DexEncodeError> {
+    let form = effective_switch_form(form, cases)?;
+    let mut resolved = Vec::with_capacity(cases.len());
+    for (&key, &target) in cases {
+        let target = resolve_target(target, &layout.targets)? as i64 - owner_start as i64;
+        if !fits_i32(target) {
+            return Err(DexEncodeError::BranchOutOfRange);
+        }
+        resolved.push((key, target as i32));
+    }
+    match form {
+        SwitchForm::Packed => {
+            let first_key = resolved.first().map(|(key, _)| *key).unwrap_or(0);
+            let mut units = vec![
+                u16::from_le_bytes([0x00, 0x01]),
+                u16::try_from(resolved.len())
+                    .map_err(|_| DexEncodeError::UnsupportedEditInstruction)?,
+                first_key as u32 as u16,
+                (first_key as u32 >> 16) as u16,
+            ];
+            for (_, target) in resolved {
+                units.push(target as u32 as u16);
+                units.push((target as u32 >> 16) as u16);
+            }
+            Ok(units)
+        }
+        SwitchForm::Sparse => {
+            let mut units = vec![
+                u16::from_le_bytes([0x00, 0x02]),
+                u16::try_from(resolved.len())
+                    .map_err(|_| DexEncodeError::UnsupportedEditInstruction)?,
+            ];
+            for (key, _) in &resolved {
+                units.push(*key as u32 as u16);
+                units.push((*key as u32 >> 16) as u16);
+            }
+            for (_, target) in resolved {
+                units.push(target as u32 as u16);
+                units.push((target as u32 >> 16) as u16);
+            }
+            Ok(units)
+        }
+        SwitchForm::Auto => unreachable!(),
+    }
+}
+
+fn encode_atom(
+    placed: &PlacedAtom,
+    states: &[AtomState],
+    layout: &Layout,
+) -> Result<Vec<u16>, DexEncodeError> {
+    match &placed.atom.instruction {
+        EditableInstruction::Concrete(instruction) => {
+            if let Some(original) = &placed.atom.original {
+                Ok(original.raw.clone())
+            } else {
+                instruction
+                    .to_code_units()
+                    .map_err(|_| DexEncodeError::UnsupportedEditInstruction)
+            }
+        }
+        EditableInstruction::Branch {
+            instruction,
+            target,
+        } => encode_branch(
+            instruction,
+            *target,
+            placed.start,
+            states[placed.atom.id],
+            layout,
+        ),
+        EditableInstruction::Switch {
+            register,
+            cases,
+            default,
+            form,
+        } => {
+            let payload_offset = layout
+                .payload_offsets
+                .get(&placed.atom.id)
+                .copied()
+                .ok_or(DexEncodeError::InvalidCodeItem)? as i64
+                - placed.start as i64;
+            if !fits_i32(payload_offset) {
+                return Err(DexEncodeError::BranchOutOfRange);
+            }
+            let switch = match effective_switch_form(*form, cases)? {
+                SwitchForm::Packed => Instruction::PackedSwitch(*register, payload_offset as i32),
+                SwitchForm::Sparse => Instruction::SparseSwitch(*register, payload_offset as i32),
+                SwitchForm::Auto => unreachable!(),
+            };
+            let mut units = switch
+                .to_code_units()
+                .map_err(|_| DexEncodeError::UnsupportedEditInstruction)?;
+            if let Some(default) = default {
+                let default_start = placed.start as i64 + 3;
+                let target = resolve_target(*default, &layout.targets)? as i64 - default_start;
+                if !fits_i32(target) {
+                    return Err(DexEncodeError::BranchOutOfRange);
+                }
+                units.extend(
+                    Instruction::Goto32(target as i32)
+                        .to_code_units()
+                        .map_err(|_| DexEncodeError::UnsupportedEditInstruction)?,
+                );
+            }
+            Ok(units)
+        }
+        EditableInstruction::FillArray {
+            register,
+            width,
+            data,
+        } => {
+            let payload_offset = layout
+                .payload_offsets
+                .get(&placed.atom.id)
+                .copied()
+                .ok_or(DexEncodeError::InvalidCodeItem)? as i64
+                - placed.start as i64;
+            if !fits_i32(payload_offset) {
+                return Err(DexEncodeError::BranchOutOfRange);
+            }
+            let mut units = Instruction::FillArrayData(*register, payload_offset as u32)
+                .to_code_units()
+                .map_err(|_| DexEncodeError::UnsupportedEditInstruction)?;
+            // Keep the payload attached to this instruction. It is emitted by
+            // the caller after all normal instructions and alignment padding.
+            let _ = (width, data);
+            Ok(std::mem::take(&mut units))
+        }
+    }
+}
+
+fn append_rewritten_code_item(
+    dex: &DexFile,
+    method_idx: u32,
+    class_idx: u32,
+    new_code: &[u8],
+) -> Result<Vec<u8>, DexEncodeError> {
+    let raw = dex.raw_data();
+    let old_map_off = dex.header.map_off as usize;
+    let map_entries = read_map_entries(raw, old_map_off)?;
+    let old_map_end = old_map_off
+        .checked_add(4 + map_entries.len() * 12)
+        .ok_or(DexEncodeError::InvalidCodeItem)?;
+    if old_map_end != raw.len() {
+        return Err(DexEncodeError::InvalidCodeItem);
+    }
+    let code_insert = section_content_end(raw, &map_entries, 0x2001)? as usize;
+    let class_data_insert = section_content_end(raw, &map_entries, 0x2000)? as usize;
+    let old_data_off = dex.header.data_off as usize;
+    if old_data_off > code_insert
+        || code_insert > class_data_insert
+        || class_data_insert > old_map_off
+    {
+        return Err(DexEncodeError::InvalidCodeItem);
+    }
+
+    let code_padding = (4 - code_insert % 4) % 4;
+    let code_insert_delta = code_padding
+        .checked_add(new_code.len())
+        .and_then(|size| size.checked_add((4 - size % 4) % 4))
+        .ok_or(DexEncodeError::InvalidCodeItem)? as u32;
+    let class_def_off = class_def_offset(dex, class_idx)?;
+    let original_class_data_off = class_data_offset(dex, class_def_off)?;
+    let class_data = rewrite_class_data(
+        &raw[original_class_data_off..],
+        method_idx,
+        code_insert as u32 + code_padding as u32,
+    )?;
+    let class_data_insert_delta = (class_data.len() + (4 - class_data.len() % 4) % 4) as u32;
+    let relocation = OffsetRelocation {
+        first_insert: code_insert as u32,
+        first_delta: code_insert_delta,
+        second_insert: class_data_insert as u32,
+        second_delta: class_data_insert_delta,
+    };
+
+    let mut output = Vec::with_capacity(
+        raw.len()
+            .checked_add(code_insert_delta as usize)
+            .and_then(|size| size.checked_add(class_data_insert_delta as usize))
+            .ok_or(DexEncodeError::InvalidCodeItem)?,
+    );
+    output.extend_from_slice(&raw[..code_insert]);
+    output.resize(output.len() + code_padding, 0);
+    let new_code_off = output.len() as u32;
+    output.extend_from_slice(new_code);
+    output.resize(
+        output.len() + (code_insert_delta as usize - code_padding - new_code.len()),
+        0,
+    );
+    output.extend_from_slice(&raw[code_insert..class_data_insert]);
+    let new_class_data_off = output.len() as u32;
+    output.extend_from_slice(&class_data);
+    output.resize(
+        output.len() + (class_data_insert_delta as usize - class_data.len()),
+        0,
+    );
+    output.extend_from_slice(&raw[class_data_insert..old_map_off]);
+    align_vec(&mut output, 4);
+    let new_map_off = output.len() as u32;
+
+    patch_string_ids_relocated(
+        &mut output,
+        dex.header.string_ids_off as usize,
+        dex.header.string_ids_size,
+        relocation,
+    )?;
+    patch_proto_ids_relocated(
+        &mut output,
+        dex.header.proto_ids_off as usize,
+        dex.header.proto_ids_size,
+        relocation,
+    )?;
+    patch_class_defs_relocated(
+        &mut output,
+        dex.header.class_defs_off as usize,
+        dex.header.class_defs_size,
+        relocation,
+    )?;
+    patch_data_offsets_relocated(
+        &mut output[old_data_off..new_map_off as usize],
+        &map_entries,
+        dex.header.data_off,
+        relocation,
+    )?;
+    patch_u32_reference_relocated(
+        &mut output[old_data_off..new_map_off as usize],
+        (new_code_off - dex.header.data_off) as usize + 8,
+        relocation,
+    )?;
+    if class_def_off + 32 > output.len() {
+        return Err(DexEncodeError::InvalidCodeItem);
+    }
+    output[class_def_off + 24..class_def_off + 28]
+        .copy_from_slice(&new_class_data_off.to_le_bytes());
+
+    let mut new_map = Vec::with_capacity(map_entries.len());
+    for mut entry in map_entries {
+        if entry.kind == 0x1000 {
+            continue;
+        }
+        entry.offset = relocation.apply(entry.offset)?;
+        if entry.kind == 0x2001 || entry.kind == 0x2000 {
+            entry.count = entry
+                .count
+                .checked_add(1)
+                .ok_or(DexEncodeError::InvalidCodeItem)?;
+        }
+        new_map.push(entry);
+    }
+    new_map.sort_by_key(|entry| (entry.offset, entry.kind));
+    output.extend_from_slice(&((new_map.len() + 1) as u32).to_le_bytes());
+    for entry in new_map {
+        append_map_entry(&mut output, entry);
+    }
+    append_map_entry(
+        &mut output,
+        MapEntry {
+            kind: 0x1000,
+            count: 1,
+            offset: new_map_off,
+        },
+    );
+    let file_size = output.len() as u32;
+    output[32..36].copy_from_slice(&file_size.to_le_bytes());
+    output[52..56].copy_from_slice(&new_map_off.to_le_bytes());
+    output[104..108].copy_from_slice(
+        &file_size
+            .checked_sub(dex.header.data_off)
+            .ok_or(DexEncodeError::InvalidCodeItem)?
+            .to_le_bytes(),
+    );
+    repair_checksums(&mut output)?;
+    Ok(output)
+}
+
+/// Rewrite a method using logical edit anchors. Branch offsets and switch
+/// payloads are regenerated after all insertions and replacements are known.
+pub fn rewrite_method_code(
+    dex: &DexFile,
+    method_idx: u32,
+    edits: &[MethodEdit],
+) -> Result<Vec<u8>, DexEncodeError> {
+    let (class_idx, code) = dex
+        .classes
+        .iter()
+        .flat_map(|class| {
+            class
+                .codes
+                .iter()
+                .map(move |method| (class.class_idx, method))
+        })
+        .find(|(_, method)| method.method_idx == method_idx)
+        .ok_or(DexEncodeError::MethodNotFound(method_idx))?;
+    let code = code
+        .code
+        .as_ref()
+        .ok_or(DexEncodeError::MethodHasNoCode(method_idx))?;
+    if code.tries_size != 0 {
+        return Err(DexEncodeError::MethodHasTryHandlers);
+    }
+
+    let raw = dex.raw_data();
+    let raw_start = code.code_off as usize + 16;
+    let payloads = code
+        .insns
+        .iter()
+        .filter(|(_, _, instruction)| is_payload(instruction))
+        .map(|(_, offset, instruction)| (offset.0, instruction.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut originals = Vec::new();
+    for (size, offset, instruction) in &code.insns {
+        if is_payload(instruction) {
+            continue;
+        }
+        let units = (size.0 / 2) as usize;
+        let start = raw_start
+            .checked_add(offset.0 as usize * 2)
+            .ok_or(DexEncodeError::InvalidCodeItem)?;
+        let end = start
+            .checked_add(units * 2)
+            .ok_or(DexEncodeError::InvalidCodeItem)?;
+        if end > raw.len() {
+            return Err(DexEncodeError::InvalidCodeItem);
+        }
+        let mut raw_units = Vec::with_capacity(units);
+        for bytes in raw[start..end].chunks_exact(2) {
+            raw_units.push(u16::from_le_bytes([bytes[0], bytes[1]]));
+        }
+        originals.push(OriginalInstruction {
+            offset: offset.0,
+            raw: raw_units,
+            instruction: instruction.clone(),
+        });
+    }
+    let original_offsets = originals
+        .iter()
+        .map(|instruction| instruction.offset)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut anchored = BTreeMap::<u32, AnchoredEdits>::new();
+    for edit in edits {
+        if !original_offsets.contains(&edit.anchor) {
+            return Err(DexEncodeError::InvalidEditAnchor(edit.anchor));
+        }
+        let entry = anchored.entry(edit.anchor).or_default();
+        match edit.position {
+            EditPosition::Before => entry.before.extend(edit.instructions.clone()),
+            EditPosition::After => entry.after.extend(edit.instructions.clone()),
+            EditPosition::Replace => {
+                if entry.replacement.is_some() {
+                    return Err(DexEncodeError::ConflictingEdits);
+                }
+                entry.replacement = Some(edit.instructions.clone());
+            }
+        }
+    }
+
+    let mut next_id = 0usize;
+    let mut make_atoms = |instructions: Vec<EditableInstruction>,
+                          original: Option<OriginalInstruction>|
+     -> Vec<EditAtom> {
+        instructions
+            .into_iter()
+            .map(|instruction| {
+                let atom = EditAtom {
+                    id: next_id,
+                    instruction,
+                    original: original.clone(),
+                };
+                next_id += 1;
+                atom
+            })
+            .collect()
+    };
+
+    let mut segments = Vec::new();
+    for original in originals {
+        let edit = anchored.remove(&original.offset).unwrap_or_default();
+        let original_instruction =
+            original_editable_instruction(&original.instruction, original.offset, &payloads)?;
+        let has_replacement = edit.replacement.is_some();
+        let main = edit
+            .replacement
+            .unwrap_or_else(|| vec![original_instruction]);
+        segments.push(Segment {
+            offset: original.offset,
+            before: make_atoms(edit.before, None),
+            main: if main.len() == 1 && !has_replacement {
+                make_atoms(main, Some(original))
+            } else {
+                make_atoms(main, None)
+            },
+            after: make_atoms(edit.after, None),
+        });
+    }
+    if !anchored.is_empty() {
+        return Err(DexEncodeError::InvalidEditAnchor(
+            *anchored.keys().next().unwrap(),
+        ));
+    }
+    if segments.is_empty() {
+        return Err(DexEncodeError::MethodHasNoCode(method_idx));
+    }
+
+    let mut states = vec![AtomState::default(); next_id];
+    for segment in &segments {
+        for atom in segment
+            .before
+            .iter()
+            .chain(segment.main.iter())
+            .chain(segment.after.iter())
+        {
+            states[atom.id].goto_width = match &atom.instruction {
+                EditableInstruction::Branch { instruction, .. } if is_goto(instruction) => {
+                    goto_nominal_width(instruction)
+                }
+                _ => 0,
+            };
+        }
+    }
+
+    let mut layout = layout_method(&segments, &states)?;
+    for _ in 0..next_id.saturating_add(2) {
+        let mut changed = false;
+        for placed in &layout.atoms {
+            let state = &mut states[placed.atom.id];
+            match &placed.atom.instruction {
+                EditableInstruction::Branch {
+                    instruction,
+                    target,
+                } if is_conditional(instruction) => {
+                    let target = resolve_target(*target, &layout.targets)? as i64;
+                    let offset = target - placed.start as i64;
+                    if !state.conditional_expanded && !fits_i16(offset) {
+                        state.conditional_expanded = true;
+                        changed = true;
+                    }
+                }
+                EditableInstruction::Branch {
+                    instruction,
+                    target,
+                } if is_goto(instruction) => {
+                    let target = resolve_target(*target, &layout.targets)? as i64;
+                    let offset = target - placed.start as i64;
+                    let current = state.goto_width;
+                    let desired = match instruction {
+                        Instruction::Goto8(..) if fits_i8(offset) => 1,
+                        Instruction::Goto8(..) if fits_i16(offset) => 2,
+                        Instruction::Goto8(..) if fits_i32(offset) => 3,
+                        Instruction::Goto16(..) if fits_i16(offset) => 2,
+                        Instruction::Goto16(..) if fits_i32(offset) => 3,
+                        Instruction::Goto32(..) if fits_i32(offset) => 3,
+                        _ => return Err(DexEncodeError::BranchOutOfRange),
+                    };
+                    if desired > current {
+                        state.goto_width = desired;
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !changed {
+            break;
+        }
+        layout = layout_method(&segments, &states)?;
+    }
+
+    let mut units = Vec::with_capacity(layout.size as usize);
+    for placed in &layout.atoms {
+        let encoded = encode_atom(placed, &states, &layout)?;
+        units.extend(encoded);
+    }
+    for placed in &layout.atoms {
+        let Some(payload_offset) = layout.payload_offsets.get(&placed.atom.id).copied() else {
+            continue;
+        };
+        while units.len() < payload_offset as usize {
+            units.push(0);
+        }
+        match &placed.atom.instruction {
+            EditableInstruction::Switch { cases, form, .. } => {
+                units.extend(encode_switch_payload(*form, cases, placed.start, &layout)?);
+            }
+            EditableInstruction::FillArray { width, data, .. } => {
+                units.extend(
+                    Instruction::ArrayData(*width, data.clone())
+                        .to_code_units()
+                        .map_err(|_| DexEncodeError::UnsupportedEditInstruction)?,
+                );
+            }
+            _ => return Err(DexEncodeError::InvalidCodeItem),
+        }
+    }
+    if units.len() != layout.size as usize {
+        return Err(DexEncodeError::InvalidCodeItem);
+    }
+
+    let mut new_code = Vec::with_capacity(16 + units.len() * 2);
+    new_code.extend_from_slice(&code.register_size.to_le_bytes());
+    new_code.extend_from_slice(&code.ins_size.to_le_bytes());
+    new_code.extend_from_slice(&code.outs_size.to_le_bytes());
+    new_code.extend_from_slice(&0u16.to_le_bytes());
+    // Debug positions are code-relative. Until debug-info rewriting is added,
+    // omit them from a variable-length rewrite instead of leaving stale PCs.
+    new_code.extend_from_slice(&0u32.to_le_bytes());
+    new_code.extend_from_slice(&(units.len() as u32).to_le_bytes());
+    for unit in units {
+        new_code.extend_from_slice(&unit.to_le_bytes());
+    }
+    append_rewritten_code_item(dex, method_idx, class_idx, &new_code)
+}
+
 /// Prepend code units to a method by inserting a new code_item at the end of
 /// the existing code_item section and a copied class_data_item at the end of
 /// the existing class_data_item section.
@@ -1114,10 +2323,18 @@ pub fn prepend_method_code(
     let (class_idx, code) = dex
         .classes
         .iter()
-        .flat_map(|class| class.codes.iter().map(move |method| (class.class_idx, method)))
+        .flat_map(|class| {
+            class
+                .codes
+                .iter()
+                .map(move |method| (class.class_idx, method))
+        })
         .find(|(_, method)| method.method_idx == method_idx)
         .ok_or(DexEncodeError::MethodNotFound(method_idx))?;
-    let code = code.code.as_ref().ok_or(DexEncodeError::MethodHasNoCode(method_idx))?;
+    let code = code
+        .code
+        .as_ref()
+        .ok_or(DexEncodeError::MethodHasNoCode(method_idx))?;
     if code.tries_size != 0 {
         return Err(DexEncodeError::MethodHasTryHandlers);
     }
@@ -1199,7 +2416,10 @@ pub fn prepend_method_code(
     output.resize(output.len() + code_padding, 0);
     let new_code_off = output.len() as u32;
     output.extend_from_slice(&new_code);
-    output.resize(output.len() + (code_insert_delta as usize - code_padding - new_code.len()), 0);
+    output.resize(
+        output.len() + (code_insert_delta as usize - code_padding - new_code.len()),
+        0,
+    );
     output.extend_from_slice(&raw[code_insert..class_data_insert]);
     let new_class_data_off = output.len() as u32;
     output.extend_from_slice(&class_data);
@@ -1297,11 +2517,7 @@ pub fn prepend_method_code(
     Ok(output)
 }
 
-fn section_content_end(
-    raw: &[u8],
-    entries: &[MapEntry],
-    kind: u16,
-) -> Result<u32, DexEncodeError> {
+fn section_content_end(raw: &[u8], entries: &[MapEntry], kind: u16) -> Result<u32, DexEncodeError> {
     let entry = entries
         .iter()
         .find(|entry| entry.kind == kind)
@@ -1358,12 +2574,18 @@ fn class_def_offset(dex: &DexFile, class_idx: u32) -> Result<usize, DexEncodeErr
         let offset = class_defs_off
             .checked_add(index * 32)
             .ok_or(DexEncodeError::InvalidCodeItem)?;
-        if offset + 4 > dex.raw_data().len() { break; }
+        if offset + 4 > dex.raw_data().len() {
+            break;
+        }
         let current = u32::from_le_bytes([
-            dex.raw_data()[offset], dex.raw_data()[offset + 1],
-            dex.raw_data()[offset + 2], dex.raw_data()[offset + 3],
+            dex.raw_data()[offset],
+            dex.raw_data()[offset + 1],
+            dex.raw_data()[offset + 2],
+            dex.raw_data()[offset + 3],
         ]);
-        if current == class_idx { return Ok(offset); }
+        if current == class_idx {
+            return Ok(offset);
+        }
     }
     Err(DexEncodeError::MethodClassDataNotFound)
 }
@@ -1376,8 +2598,10 @@ fn class_data_offset(dex: &DexFile, class_def_offset: usize) -> Result<usize, De
         return Err(DexEncodeError::InvalidCodeItem);
     }
     let class_data_off = u32::from_le_bytes([
-        dex.raw_data()[offset], dex.raw_data()[offset + 1],
-        dex.raw_data()[offset + 2], dex.raw_data()[offset + 3],
+        dex.raw_data()[offset],
+        dex.raw_data()[offset + 1],
+        dex.raw_data()[offset + 2],
+        dex.raw_data()[offset + 3],
     ]) as usize;
     if class_data_off == 0 || class_data_off >= dex.raw_data().len() {
         return Err(DexEncodeError::MethodClassDataNotFound);
@@ -1390,7 +2614,10 @@ fn rewrite_class_data(
     target_method_idx: u32,
     new_code_off: u32,
 ) -> Result<Vec<u8>, DexEncodeError> {
-    let mut reader = UlebReader { bytes: input, offset: 0 };
+    let mut reader = UlebReader {
+        bytes: input,
+        offset: 0,
+    };
     let static_fields = reader.read()?;
     let instance_fields = reader.read()?;
     let direct_methods = reader.read()?;
@@ -1451,7 +2678,9 @@ impl<'a> UlebReader<'a> {
             let byte = self.bytes[self.offset];
             self.offset += 1;
             value |= ((byte & 0x7f) as u32) << shift;
-            if byte & 0x80 == 0 { return Ok(value); }
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
             shift += 7;
         }
     }
@@ -1461,14 +2690,20 @@ fn write_uleb(output: &mut Vec<u8>, mut value: u32) {
     loop {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
-        if value != 0 { byte |= 0x80; }
+        if value != 0 {
+            byte |= 0x80;
+        }
         output.push(byte);
-        if value == 0 { break; }
+        if value == 0 {
+            break;
+        }
     }
 }
 
 fn align_vec(output: &mut Vec<u8>, alignment: usize) {
-    while output.len() % alignment != 0 { output.push(0); }
+    while output.len() % alignment != 0 {
+        output.push(0);
+    }
 }
 
 fn repair_checksums(data: &mut [u8]) -> Result<(), DexEncodeError> {
@@ -1573,8 +2808,8 @@ mod tests {
         let Ok(bytes) = fs::read(path) else {
             return;
         };
-        let dex = parse_dex_buf("classes.dex", &ArrayView::new(&bytes), false)
-            .expect("test DEX parses");
+        let dex =
+            parse_dex_buf("classes.dex", &ArrayView::new(&bytes), false).expect("test DEX parses");
         let (method_idx, register) = dex
             .classes
             .iter()
@@ -1591,11 +2826,9 @@ mod tests {
         let reparsed = parse_dex_buf("classes.dex", &ArrayView::new(&edited), false)
             .expect("edited DEX reparses");
         assert_eq!(reparsed.find_string_index("frida-gadget").is_some(), true);
-        assert!(reparsed.find_method_index(
-            "Ljava/lang/System;",
-            "loadLibrary",
-            "(Ljava/lang/String;)V"
-        ).is_some());
+        assert!(reparsed
+            .find_method_index("Ljava/lang/System;", "loadLibrary", "(Ljava/lang/String;)V")
+            .is_some());
         let code = reparsed
             .classes
             .iter()
@@ -1603,14 +2836,60 @@ mod tests {
             .find(|method| method.method_idx == method_idx)
             .and_then(|method| method.code.as_ref())
             .expect("injected method code");
-        assert_eq!(code.insns_size, 5 + dex
-            .classes
-            .iter()
-            .flat_map(|class| class.codes.iter())
-            .find(|method| method.method_idx == method_idx)
-            .and_then(|method| method.code.as_ref())
-            .map(|code| code.insns_size)
-            .unwrap());
+        assert_eq!(
+            code.insns_size,
+            5 + dex
+                .classes
+                .iter()
+                .flat_map(|class| class.codes.iter())
+                .find(|method| method.method_idx == method_idx)
+                .and_then(|method| method.code.as_ref())
+                .map(|code| code.insns_size)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn ensure_dex_strings_adds_pool_entries_and_reparses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/dead_branch/classes.dex");
+        let Ok(bytes) = fs::read(path) else {
+            return;
+        };
+        let dex =
+            parse_dex_buf("classes.dex", &ArrayView::new(&bytes), false).expect("test DEX parses");
+        let value = "coeus-string-edit".to_string();
+        assert!(dex.find_string_index(&value).is_none());
+        let edited =
+            ensure_dex_strings(&dex, std::slice::from_ref(&value)).expect("string pool rebuild");
+        let reparsed = parse_dex_buf("classes.dex", &ArrayView::new(&edited), false)
+            .expect("edited DEX reparses");
+        assert!(reparsed.find_string_index(&value).is_some());
+        assert_eq!(reparsed.methods.len(), dex.methods.len());
+    }
+
+    #[test]
+    fn replace_dex_string_keeps_string_index_and_reparses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/dead_branch/classes.dex");
+        let Ok(bytes) = fs::read(path) else {
+            return;
+        };
+        let dex =
+            parse_dex_buf("classes.dex", &ArrayView::new(&bytes), false).expect("test DEX parses");
+        let string_index = dex
+            .find_string_index("LDeadBranch;")
+            .expect("test DEX has a string to replace");
+        let replacement = "LReplacedString;";
+        let edited =
+            replace_dex_string(&dex, string_index, replacement).expect("string pool replacement");
+        let reparsed = parse_dex_buf("classes.dex", &ArrayView::new(&edited), false)
+            .expect("edited DEX reparses");
+        assert_eq!(
+            reparsed.get_string(string_index as usize),
+            Some(replacement)
+        );
+        assert_eq!(reparsed.methods.len(), dex.methods.len());
     }
 
     #[test]
@@ -1620,8 +2899,8 @@ mod tests {
         let Ok(bytes) = fs::read(path) else {
             return;
         };
-        let dex = parse_dex_buf("classes.dex", &ArrayView::new(&bytes), false)
-            .expect("test DEX parses");
+        let dex =
+            parse_dex_buf("classes.dex", &ArrayView::new(&bytes), false).expect("test DEX parses");
         let (method_idx, instruction_index) = dex
             .classes
             .iter()
@@ -1637,10 +2916,10 @@ mod tests {
             })
             .next()
             .expect("test DEX has a one-unit instruction");
-        let edited = replace_method_instruction(&dex, method_idx, instruction_index, &Instruction::Nop)
-            .expect("replace one-unit instruction");
-        parse_dex_buf("classes.dex", &ArrayView::new(&edited), false)
-            .expect("edited DEX reparses");
+        let edited =
+            replace_method_instruction(&dex, method_idx, instruction_index, &Instruction::Nop)
+                .expect("replace one-unit instruction");
+        parse_dex_buf("classes.dex", &ArrayView::new(&edited), false).expect("edited DEX reparses");
     }
 
     #[test]
@@ -1650,8 +2929,8 @@ mod tests {
         let Ok(bytes) = fs::read(path) else {
             return;
         };
-        let dex = parse_dex_buf("classes.dex", &ArrayView::new(&bytes), false)
-            .expect("test DEX parses");
+        let dex =
+            parse_dex_buf("classes.dex", &ArrayView::new(&bytes), false).expect("test DEX parses");
         let original_code_count = read_map_entries(
             &bytes,
             read_u32_at(&bytes, 52).expect("original map offset") as usize,
@@ -1667,18 +2946,15 @@ mod tests {
             .flat_map(|class| class.codes.iter())
             .filter_map(|method| {
                 let code = method.code.as_ref()?;
-                (code.tries_size == 0
-                    && code.array_data.is_empty()
-                    && code.switch_data.is_empty())
+                (code.tries_size == 0 && code.array_data.is_empty() && code.switch_data.is_empty())
                     .then_some(method.method_idx)
             })
             .next()
             .expect("test DEX has a method without payloads");
 
-        let edited = prepend_method_code(&dex, method_idx, &[0x0000])
-            .expect("prepend one-unit instruction");
-        parse_dex_buf("classes.dex", &ArrayView::new(&edited), false)
-            .expect("edited DEX reparses");
+        let edited =
+            prepend_method_code(&dex, method_idx, &[0x0000]).expect("prepend one-unit instruction");
+        parse_dex_buf("classes.dex", &ArrayView::new(&edited), false).expect("edited DEX reparses");
 
         let map_off = read_u32_at(&edited, 52).expect("map offset") as usize;
         let map_count = read_u32_at(&edited, map_off).expect("map count") as usize;
@@ -1696,5 +2972,173 @@ mod tests {
         }
         assert_eq!(map_list_count, Some(1));
         assert_eq!(code_item_count, Some(original_code_count + 1));
+    }
+
+    #[test]
+    fn rewrite_method_supports_variable_width_edits() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/dead_branch/classes.dex");
+        let Ok(bytes) = fs::read(path) else {
+            return;
+        };
+        let dex =
+            parse_dex_buf("classes.dex", &ArrayView::new(&bytes), false).expect("test DEX parses");
+        let (method_idx, anchor) = dex
+            .classes
+            .iter()
+            .flat_map(|class| class.codes.iter())
+            .filter_map(|method| {
+                let code = method.code.as_ref()?;
+                let first = code
+                    .insns
+                    .iter()
+                    .find(|(_, _, instruction)| !is_payload(instruction))?;
+                (code.tries_size == 0 && first.0 .0 / 2 == 1)
+                    .then_some((method.method_idx, first.1 .0))
+            })
+            .next()
+            .expect("test DEX has a one-unit method entry");
+        let edited = rewrite_method_code(
+            &dex,
+            method_idx,
+            &[MethodEdit {
+                anchor,
+                position: EditPosition::Replace,
+                instructions: vec![
+                    EditableInstruction::Concrete(Instruction::Nop),
+                    EditableInstruction::Concrete(Instruction::Nop),
+                ],
+            }],
+        )
+        .expect("rewrite method");
+        let reparsed = parse_dex_buf("classes.dex", &ArrayView::new(&edited), false)
+            .expect("edited DEX reparses");
+        let original_size = dex
+            .get_method_by_idx(method_idx)
+            .and_then(|method| method.code.as_ref().map(|code| code.insns_size))
+            .unwrap();
+        let edited_size = reparsed
+            .get_method_by_idx(method_idx)
+            .and_then(|method| method.code.as_ref().map(|code| code.insns_size))
+            .unwrap();
+        assert_eq!(edited_size, original_size + 1);
+    }
+
+    #[test]
+    fn rewrite_method_repairs_if_targets_after_insertion() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/dead_branch/classes.dex");
+        let Ok(bytes) = fs::read(path) else {
+            return;
+        };
+        let dex =
+            parse_dex_buf("classes.dex", &ArrayView::new(&bytes), false).expect("test DEX parses");
+        let candidate = dex
+            .classes
+            .iter()
+            .flat_map(|class| class.codes.iter())
+            .filter_map(|method| {
+                let code = method.code.as_ref()?;
+                if code.tries_size != 0 || code.array_data.len() != 0 || code.switch_data.len() != 0
+                {
+                    return None;
+                }
+                code.insns
+                    .iter()
+                    .find_map(|(_, offset, instruction)| match instruction {
+                        Instruction::Test(_, _, _, relative) => Some((
+                            method.method_idx,
+                            offset.0,
+                            offset.0 as i32 + *relative as i32,
+                        )),
+                        Instruction::TestZero(_, _, relative) => Some((
+                            method.method_idx,
+                            offset.0,
+                            offset.0 as i32 + *relative as i32,
+                        )),
+                        _ => None,
+                    })
+            })
+            .next();
+        let Some((method_idx, branch_offset, old_target)) = candidate else {
+            return;
+        };
+        let edited = rewrite_method_code(
+            &dex,
+            method_idx,
+            &[MethodEdit {
+                anchor: branch_offset,
+                position: EditPosition::Before,
+                instructions: vec![EditableInstruction::Concrete(Instruction::Nop)],
+            }],
+        )
+        .expect("rewrite branch method");
+        let reparsed = parse_dex_buf("classes.dex", &ArrayView::new(&edited), false)
+            .expect("edited branch DEX reparses");
+        let code = reparsed
+            .get_method_by_idx(method_idx)
+            .and_then(|method| method.code.as_ref().map(|code| code.clone()))
+            .unwrap();
+        let (_, new_offset, instruction) = code
+            .insns
+            .iter()
+            .find(|(_, offset, instruction)| {
+                offset.0 == branch_offset + 1
+                    && matches!(
+                        instruction,
+                        Instruction::Test(..) | Instruction::TestZero(..)
+                    )
+            })
+            .unwrap();
+        let new_target = match instruction {
+            Instruction::Test(_, _, _, relative) => new_offset.0 as i32 + *relative as i32,
+            Instruction::TestZero(_, _, relative) => new_offset.0 as i32 + *relative as i32,
+            _ => unreachable!(),
+        };
+        assert_eq!(new_target, old_target + 1);
+    }
+
+    #[test]
+    fn switch_payload_sizes_match_dex_layout() {
+        let targets = BTreeMap::from([
+            (
+                1,
+                CodeTarget {
+                    offset: 8,
+                    position: TargetPosition::Instruction,
+                },
+            ),
+            (
+                2,
+                CodeTarget {
+                    offset: 10,
+                    position: TargetPosition::Instruction,
+                },
+            ),
+            (
+                3,
+                CodeTarget {
+                    offset: 12,
+                    position: TargetPosition::Instruction,
+                },
+            ),
+        ]);
+        let layout = Layout {
+            atoms: vec![],
+            targets: BTreeMap::from([
+                ((8, TargetPosition::Instruction), 8),
+                ((10, TargetPosition::Instruction), 10),
+                ((12, TargetPosition::Instruction), 12),
+            ]),
+            payload_offsets: HashMap::new(),
+            size: 0,
+        };
+        let packed = encode_switch_payload(SwitchForm::Auto, &targets, 0, &layout)
+            .expect("packed switch payload");
+        assert_eq!(packed.len(), 10);
+        assert_eq!(packed[0], u16::from_le_bytes([0x00, 0x01]));
+        assert_eq!(packed[1], 3);
+        assert_eq!(switch_payload_units(SwitchForm::Packed, 3), 10);
+        assert_eq!(switch_payload_units(SwitchForm::Sparse, 3), 14);
     }
 }

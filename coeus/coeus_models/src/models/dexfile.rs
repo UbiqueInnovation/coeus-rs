@@ -97,15 +97,18 @@ impl DexFile {
         method_name: &str,
         proto_type: &str,
     ) -> Option<u32> {
-        self.methods.iter().position(|method| {
-            self.get_type_name(method.class_idx as usize) == Some(class_name)
-                && method.method_name == method_name
-                && self
-                    .protos
-                    .get(method.proto_idx as usize)
-                    .map(|proto| proto.to_string(self) == proto_type)
-                    .unwrap_or(false)
-        }).map(|index| index as u32)
+        self.methods
+            .iter()
+            .position(|method| {
+                self.get_type_name(method.class_idx as usize) == Some(class_name)
+                    && method.method_name == method_name
+                    && self
+                        .protos
+                        .get(method.proto_idx as usize)
+                        .map(|proto| proto.to_string(self) == proto_type)
+                        .unwrap_or(false)
+            })
+            .map(|index| index as u32)
     }
 
     pub fn get_dex_name(&self) -> &str {

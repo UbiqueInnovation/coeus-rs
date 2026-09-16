@@ -12,12 +12,79 @@ use coeus::coeus_debug::{
 };
 use pyo3::{
     exceptions::PyRuntimeError,
-    pyclass, pymethods,
+    pyclass, pyfunction, pymethods,
     types::{PyAnyMethods, PyBool, PyFloat, PyInt, PyLong, PyModule, PyModuleMethods, PyString},
-    Bound, IntoPy, Py, PyAny, PyResult, Python, ToPyObject,
+    wrap_pyfunction, Bound, IntoPy, Py, PyAny, PyResult, Python, ToPyObject,
 };
+use std::path::Path;
 
 use crate::{analysis::Method, parse::AnalyzeObject};
+
+#[pyclass]
+#[derive(Clone)]
+pub struct DebuggableApp {
+    #[pyo3(get)]
+    pub pid: u32,
+    #[pyo3(get)]
+    pub process_name: String,
+    #[pyo3(get)]
+    pub package_name: Option<String>,
+}
+
+#[pymethods]
+impl DebuggableApp {
+    pub fn __str__(&self) -> String {
+        match &self.package_name {
+            Some(package) if package == &self.process_name => {
+                format!("{} (pid {})", package, self.pid)
+            }
+            Some(package) => format!("{} [{}] (pid {})", package, self.process_name, self.pid),
+            None => format!("{} (pid {})", self.process_name, self.pid),
+        }
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (serial=None, adb_path=None))]
+pub fn list_debuggable_apps(
+    serial: Option<&str>,
+    adb_path: Option<&str>,
+) -> PyResult<Vec<DebuggableApp>> {
+    coeus::coeus_parse::signing::list_debuggable_apps(serial, adb_path.map(Path::new))
+        .map(|apps| {
+            apps.into_iter()
+                .map(|app| DebuggableApp {
+                    pid: app.pid,
+                    process_name: app.process_name,
+                    package_name: app.package_name,
+                })
+                .collect()
+        })
+        .map_err(PyRuntimeError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (pid, local_port, serial=None, adb_path=None))]
+pub fn forward_jdwp(
+    pid: u32,
+    local_port: u16,
+    serial: Option<&str>,
+    adb_path: Option<&str>,
+) -> PyResult<()> {
+    coeus::coeus_parse::signing::forward_jdwp(pid, local_port, serial, adb_path.map(Path::new))
+        .map_err(PyRuntimeError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (local_port, serial=None, adb_path=None))]
+pub fn remove_jdwp_forward(
+    local_port: u16,
+    serial: Option<&str>,
+    adb_path: Option<&str>,
+) -> PyResult<()> {
+    coeus::coeus_parse::signing::remove_jdwp_forward(local_port, serial, adb_path.map(Path::new))
+        .map_err(PyRuntimeError::new_err)
+}
 
 #[pyclass]
 #[derive(Clone)]
@@ -325,6 +392,10 @@ impl Debugger {
         Ok(StackValue { slot: slot_value })
     }
 
+    pub fn close(&mut self) {
+        self.jdwp_client.close();
+    }
+
     pub fn set_breakpoint(&mut self, method: &Method, code_index: u64) -> PyResult<()> {
         let class = method.get_class();
         let class_name = class.name();
@@ -341,7 +412,6 @@ impl Debugger {
         }
 
         let first = &class[0];
-        println!("{first:?}");
         let name_and_sig = method.signature().replace(&format!("{class_name}->"), "");
         let cmd = match first.set_breakpoint(&name_and_sig, code_index) {
             Ok(cmd) => cmd,
@@ -368,8 +438,11 @@ impl Debugger {
             .resume(&self.rt, 1)
             .map_err(|e| PyRuntimeError::new_err(format!("{}", e)))
     }
-    pub fn wait_for_package(&mut self) -> PyResult<DebuggerStackFrame> {
-        let Some(reply) = self.jdwp_client.wait_for_package_blocking(&self.rt) else {
+    pub fn wait_for_package(&mut self, py: Python) -> PyResult<DebuggerStackFrame> {
+        // The GUI calls this from a worker thread. Release Python's GIL while
+        // JDWP is waiting on the socket so the command loop stays responsive.
+        let reply = py.allow_threads(|| self.jdwp_client.wait_for_package_blocking(&self.rt));
+        let Some(reply) = reply else {
             return Err(PyRuntimeError::new_err("Nothing"));
         };
         let JdwpPacket::CommandPacket(cmd) = reply else {
@@ -402,10 +475,14 @@ impl Debugger {
     }
 }
 pub(crate) fn register(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
+    m.add_class::<DebuggableApp>()?;
     m.add_class::<Debugger>()?;
     m.add_class::<DebuggerStackFrame>()?;
     m.add_class::<StackValue>()?;
     m.add_class::<VmBreakpoint>()?;
     m.add_class::<VmInstance>()?;
+    m.add_function(wrap_pyfunction!(list_debuggable_apps, m)?)?;
+    m.add_function(wrap_pyfunction!(forward_jdwp, m)?)?;
+    m.add_function(wrap_pyfunction!(remove_jdwp_forward, m)?)?;
     Ok(())
 }

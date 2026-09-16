@@ -725,11 +725,13 @@ impl VM {
         T: Into<usize> + Copy,
     {
         let new_register = match (self.reg_float(a.into()), self.reg_float(b.into())) {
-            (Some(a), Some(b)) => Register::Literal(match a.partial_cmp(&b).unwrap_or(nan_result) {
-                std::cmp::Ordering::Less => -1,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            }),
+            (Some(a), Some(b)) => {
+                Register::Literal(match a.partial_cmp(&b).unwrap_or(nan_result) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                })
+            }
             _ => Register::Empty,
         };
         self.update_register(dst.into(), new_register)
@@ -745,11 +747,13 @@ impl VM {
         T: Into<usize> + Copy,
     {
         let new_register = match (self.reg_double(a.into()), self.reg_double(b.into())) {
-            (Some(a), Some(b)) => Register::Literal(match a.partial_cmp(&b).unwrap_or(nan_result) {
-                std::cmp::Ordering::Less => -1,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            }),
+            (Some(a), Some(b)) => {
+                Register::Literal(match a.partial_cmp(&b).unwrap_or(nan_result) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                })
+            }
             _ => Register::Empty,
         };
         self.update_register(dst.into(), new_register)
@@ -785,7 +789,8 @@ impl VM {
                 InstructionSize(current_instruction.0 .0 / 2);
             match &current_instruction.1 {
                 Instruction::ArbitraryData(_) => {}
-                Instruction::PackedSwitch(reg, table_offset) | Instruction::SparseSwitch(reg, table_offset) => {
+                Instruction::PackedSwitch(reg, table_offset)
+                | Instruction::SparseSwitch(reg, table_offset) => {
                     let reg_data = if let Some(Register::Literal(reg)) =
                         self.current_state.current_stackframe.get(*reg as usize)
                     {
@@ -1599,7 +1604,8 @@ impl VM {
                             heap_address,
                             Value::Object(ClassInstance::new(class.clone())),
                         );
-                        let new_register = Register::Reference(class.class_name.clone(), heap_address);
+                        let new_register =
+                            Register::Reference(class.class_name.clone(), heap_address);
                         self.update_register(dst, new_register)?;
                     } else {
                         return Err(VMException::OutOfMemory);
@@ -1743,14 +1749,20 @@ impl VM {
                     let dst: u8 = dst.into();
                     let src: u8 = src.into();
                     if let Some(val) = self.reg_wide(src as usize) {
-                        self.update_register(dst as usize, Register::LiteralWide(val.wrapping_neg()))?;
+                        self.update_register(
+                            dst as usize,
+                            Register::LiteralWide(val.wrapping_neg()),
+                        )?;
                     }
                 }
                 &Instruction::NegFloat(dst, src) => {
                     let dst: u8 = dst.into();
                     let src: u8 = src.into();
                     if let Some(val) = self.reg_literal(src as usize) {
-                        self.update_register(dst as usize, Register::Literal(val ^ 0x8000_0000u32 as i32))?;
+                        self.update_register(
+                            dst as usize,
+                            Register::Literal(val ^ 0x8000_0000u32 as i32),
+                        )?;
                     }
                 }
                 &Instruction::NegDouble(dst, src) => {
@@ -2739,9 +2751,7 @@ impl VM {
                                     class_instance.instances.get(&field_name)
                                 {
                                     if let Some(address) = self.malloc() {
-                                        self.heap
-                                            .entry(address)
-                                            .or_insert(Value::Int(*src_val));
+                                        self.heap.entry(address).or_insert(Value::Int(*src_val));
                                         if let Some(Value::Object(class_instance)) =
                                             self.heap.get_mut(instance)
                                         {
@@ -2783,7 +2793,8 @@ impl VM {
                     self.double_cmp(dst, a, b, std::cmp::Ordering::Greater)?;
                 }
                 &Instruction::CmpLong(dst, a, b) => {
-                    let new_register = match (self.reg_wide(a as usize), self.reg_wide(b as usize)) {
+                    let new_register = match (self.reg_wide(a as usize), self.reg_wide(b as usize))
+                    {
                         (Some(a), Some(b)) => Register::Literal(match a.partial_cmp(&b) {
                             Some(std::cmp::Ordering::Less) => -1,
                             Some(std::cmp::Ordering::Equal) => 0,
@@ -2876,7 +2887,9 @@ impl VM {
                 }
                 &Instruction::ArrayGetWide(dst, array_reference, index) => {
                     if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
-                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.current_state
+                            .current_stackframe
+                            .get(array_reference as usize),
                         self.reg_literal(index as usize),
                     ) {
                         if let Some(Value::Array(data)) = self.heap.get(array_reference) {
@@ -2895,7 +2908,9 @@ impl VM {
                 }
                 &Instruction::ArrayGetBoolean(dst, array_reference, index) => {
                     if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
-                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.current_state
+                            .current_stackframe
+                            .get(array_reference as usize),
                         self.reg_literal(index as usize),
                     ) {
                         if let Some(Value::Array(data)) = self.heap.get(array_reference) {
@@ -2908,7 +2923,9 @@ impl VM {
                 }
                 &Instruction::ArrayGetShort(dst, array_reference, index) => {
                     if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
-                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.current_state
+                            .current_stackframe
+                            .get(array_reference as usize),
                         self.reg_literal(index as usize),
                     ) {
                         if let Some(Value::Array(data)) = self.heap.get(array_reference) {
@@ -2919,15 +2936,16 @@ impl VM {
                                 .get(start..start + 2)
                                 .ok_or(VMException::IndexOutOfBounds)?;
                             let bytes = [window[0], window[1]];
-                            let new_register =
-                                Register::Literal(i16::from_le_bytes(bytes) as i32);
+                            let new_register = Register::Literal(i16::from_le_bytes(bytes) as i32);
                             self.update_register(dst, new_register)?;
                         }
                     }
                 }
                 &Instruction::ArrayGetObject(dst, array_reference, index) => {
                     if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
-                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.current_state
+                            .current_stackframe
+                            .get(array_reference as usize),
                         self.reg_literal(index as usize),
                     ) {
                         if let Some(Value::Array(data)) = self.heap.get(array_reference) {
@@ -2952,14 +2970,15 @@ impl VM {
                 }
                 &Instruction::ArrayPutWide(src, array_reference, index) => {
                     if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
-                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.current_state
+                            .current_stackframe
+                            .get(array_reference as usize),
                         self.reg_literal(index as usize),
                     ) {
                         let data = self.reg_wide(src as usize);
-                        if let (Some(Value::Array(data)), Some(val)) = (
-                            self.heap.get_mut(array_reference),
-                            data,
-                        ) {
+                        if let (Some(Value::Array(data)), Some(val)) =
+                            (self.heap.get_mut(array_reference), data)
+                        {
                             let start = (index as usize)
                                 .checked_mul(8)
                                 .ok_or(VMException::IndexOutOfBounds)?;
@@ -2972,12 +2991,13 @@ impl VM {
                 }
                 &Instruction::ArrayPutBoolean(src, array_reference, index) => {
                     if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
-                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.current_state
+                            .current_stackframe
+                            .get(array_reference as usize),
                         self.reg_literal(index as usize),
                     ) {
-                         let d =  self.reg_literal(src as usize);
+                        let d = self.reg_literal(src as usize);
                         if let Some(Value::Array(data)) = self.heap.get_mut(array_reference) {
-
                             if let Some(byte) = data.get_mut(index as usize) {
                                 if let Some(val) = d {
                                     *byte = (val != 0) as u8;
@@ -2990,14 +3010,15 @@ impl VM {
                 }
                 &Instruction::ArrayPutShort(src, array_reference, index) => {
                     if let (Some(Register::Reference(_, array_reference)), Some(index)) = (
-                        self.current_state.current_stackframe.get(array_reference as usize),
+                        self.current_state
+                            .current_stackframe
+                            .get(array_reference as usize),
                         self.reg_literal(index as usize),
                     ) {
                         let d = self.reg_literal(src as usize);
-                        if let (Some(Value::Array(data)), Some(val)) = (
-                            self.heap.get_mut(array_reference),
-                            d
-                        ) {
+                        if let (Some(Value::Array(data)), Some(val)) =
+                            (self.heap.get_mut(array_reference), d)
+                        {
                             let start = (index as usize)
                                 .checked_mul(2)
                                 .ok_or(VMException::IndexOutOfBounds)?;

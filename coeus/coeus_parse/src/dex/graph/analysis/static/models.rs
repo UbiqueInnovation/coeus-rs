@@ -1,16 +1,14 @@
 // Copyright (c) 2022 Ubique Innovation AG <https://www.ubique.ch>
-// 
+//
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+use base64::{engine::general_purpose, Engine as _};
 use std::sync::Arc;
-use base64::{Engine as _, engine::{general_purpose}};
 
-use coeus_emulation::vm::{VMException, VM, Value, runtime::StringClass, Register};
-use coeus_models::models::{Field, EncodedItem, DexFile, Method};
-
-
+use coeus_emulation::vm::{runtime::StringClass, Register, VMException, Value, VM};
+use coeus_models::models::{DexFile, EncodedItem, Field, Method};
 
 /// A type representing statically found data (by just inspecting the instructions)
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug, PartialEq)]
@@ -49,7 +47,11 @@ impl std::fmt::Display for StaticRegister {
                 }
             )?;
         } else if self.is_array {
-            write!(f, "base64decode({})", general_purpose::STANDARD.encode(&self.inner_data))?;
+            write!(
+                f,
+                "base64decode({})",
+                general_purpose::STANDARD.encode(&self.inner_data)
+            )?;
         } else {
             write!(f, "[{:?}]", self.ty)?;
         }
@@ -157,7 +159,9 @@ impl FunctionTransformation {
                 StaticRegisterData::Array { base64 } => vm.new_instance(
                     "[B".to_string(),
                     Value::Array(
-                        general_purpose::STANDARD.decode(&base64).map_err(|_| VMException::InvalidRegisterType)?,
+                        general_purpose::STANDARD
+                            .decode(&base64)
+                            .map_err(|_| VMException::InvalidRegisterType)?,
                     ),
                 )?,
                 StaticRegisterData::String { content } => vm.new_instance(

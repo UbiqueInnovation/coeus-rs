@@ -1,5 +1,5 @@
 // Copyright (c) 2022 Ubique Innovation AG <https://www.ubique.ch>
-// 
+//
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
@@ -13,7 +13,10 @@ pub mod global {
     use crate::analysis::{ClassEvidences, Context, Evidence};
     use coeus_models::models::{Class, DexFile, MultiDexFile};
     use coeus_parse::{
-        dex::graph::{InfoNode, Subgraph, Supergraph, callgraph::{callgraph, callgraph_for_method}},
+        dex::graph::{
+            callgraph::{callgraph, callgraph_for_method},
+            InfoNode, Subgraph, Supergraph,
+        },
         scripting::global::to_string_subgraph,
     };
     use rhai::Array;
@@ -118,18 +121,35 @@ pub mod global {
         if let Some(class_data) = &class.class_data {
             for field in &class_data.static_fields {
                 if let Some(item) = class.get_data_for_static_field(field.field_idx) {
-                    print!("{} = ", dex_file.get_field_name(field.field_idx).unwrap() );
+                    print!("{} = ", dex_file.get_field_name(field.field_idx).unwrap());
                     match item.value_type {
-                        coeus_models::models::ValueType::Byte => { let value : u8 = (item.to_owned()).try_into().unwrap(); println!("{:?}", value)} 
-                        coeus_models::models::ValueType::Short => { let value : u16 = (item.to_owned()).try_into().unwrap(); println!("{:?}", value)} 
-                        coeus_models::models::ValueType::Char => { let value : char = (item.to_owned()).try_into().unwrap(); println!("{:?}", value)} 
-                        coeus_models::models::ValueType::Int => { let value : u32 = (item.to_owned()).try_into().unwrap(); println!("{:?}", value)} 
-                        coeus_models::models::ValueType::Long => { let value : u64 = (item.to_owned()).try_into().unwrap(); println!("{:?}", value)} 
+                        coeus_models::models::ValueType::Byte => {
+                            let value: u8 = (item.to_owned()).try_into().unwrap();
+                            println!("{:?}", value)
+                        }
+                        coeus_models::models::ValueType::Short => {
+                            let value: u16 = (item.to_owned()).try_into().unwrap();
+                            println!("{:?}", value)
+                        }
+                        coeus_models::models::ValueType::Char => {
+                            let value: char = (item.to_owned()).try_into().unwrap();
+                            println!("{:?}", value)
+                        }
+                        coeus_models::models::ValueType::Int => {
+                            let value: u32 = (item.to_owned()).try_into().unwrap();
+                            println!("{:?}", value)
+                        }
+                        coeus_models::models::ValueType::Long => {
+                            let value: u64 = (item.to_owned()).try_into().unwrap();
+                            println!("{:?}", value)
+                        }
                         coeus_models::models::ValueType::Float => println!(""),
                         coeus_models::models::ValueType::Double => println!(""),
                         coeus_models::models::ValueType::MethodType => println!(""),
-                        coeus_models::models::ValueType::MethodHandle=> println!(""),
-                        coeus_models::models::ValueType::String => println!("{:?}", item.try_get_string(dex_file.as_ref())),
+                        coeus_models::models::ValueType::MethodHandle => println!(""),
+                        coeus_models::models::ValueType::String => {
+                            println!("{:?}", item.try_get_string(dex_file.as_ref()))
+                        }
                         coeus_models::models::ValueType::Type => println!(""),
                         coeus_models::models::ValueType::Field => println!(""),
                         coeus_models::models::ValueType::Method => println!(""),
@@ -137,7 +157,10 @@ pub mod global {
                         coeus_models::models::ValueType::Array => println!(""),
                         coeus_models::models::ValueType::Annotation => println!(""),
                         coeus_models::models::ValueType::Null => println!(""),
-                        coeus_models::models::ValueType::Boolean  => { let value : bool = (item.to_owned()).try_into().unwrap(); println!("{:?}", value)} 
+                        coeus_models::models::ValueType::Boolean => {
+                            let value: bool = (item.to_owned()).try_into().unwrap();
+                            println!("{:?}", value)
+                        }
                     };
                 }
             }
@@ -306,19 +329,20 @@ pub mod global {
         if let Some(Context::DexMethod(method, f)) = function_name.get_context() {
             let file = f.clone();
             let type_name = file.get_type_name(method.class_idx).unwrap_or("UNKNOWN");
-            let fqdn = format!("{}->{}_{}", type_name, method.method_name, method.proto_name);
+            let fqdn = format!(
+                "{}->{}_{}",
+                type_name, method.method_name, method.proto_name
+            );
             if let Some(method_key) = supergraph
                 .class_node_mapping
                 .keys()
                 .find(|k| k.contains(&fqdn))
             {
                 let node_index = supergraph.class_node_mapping[method_key];
-                Ok(Dynamic::from(
-                    callgraph_for_method(
-                        &supergraph.super_graph,
-                        node_index,
-                    ),
-                ))
+                Ok(Dynamic::from(callgraph_for_method(
+                    &supergraph.super_graph,
+                    node_index,
+                )))
             } else {
                 Err("No node found matching function_name".into())
             }
@@ -337,9 +361,10 @@ pub mod global {
             .find(|k| k.contains(function_name.as_str()))
         {
             let node_index = supergraph.class_node_mapping[method_key];
-            Ok(Dynamic::from(
-                callgraph_for_method(&supergraph.super_graph, node_index),
-            ))
+            Ok(Dynamic::from(callgraph_for_method(
+                &supergraph.super_graph,
+                node_index,
+            )))
         } else {
             Err(format!("No node found matching {}", function_name).into())
         }
@@ -434,7 +459,7 @@ pub mod dex_module {
     };
     use coeus_macros::iterator;
     use coeus_models::models::{BinaryObject, Files, MultiDexFile};
-    
+
     use coeus_parse::dex::graph::information_graph::build_information_graph;
     #[cfg(not(target_arch = "wasm32"))]
     use rayon::iter::ParallelIterator;
@@ -531,7 +556,7 @@ pub mod dex_module {
         "Lcom/google/android",
         "Lokhttp3/internal",
         "okio",
-        "Lorg/bouncycastle/"
+        "Lorg/bouncycastle/",
     ];
     pub fn get_non_interesting_classes() -> Array {
         DEFAULT_NON_INTERESTING_CLASSES
@@ -557,7 +582,7 @@ pub mod dex_module {
             Err("Could not generate supergraph".into())
         }
     }
-     #[rhai_fn(name = "build_super_graph_no_emulation", return_raw)]
+    #[rhai_fn(name = "build_super_graph_no_emulation", return_raw)]
     pub fn build_super_graph_no_emulation(
         dex: &mut MultiDexFile,
         files: Files,

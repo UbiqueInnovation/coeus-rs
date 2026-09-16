@@ -66,6 +66,35 @@ method.inject_load_library(apk, "frida-gadget", register)
 apk.write_apk("edited-unsigned.apk")
 ```
 
+For variable-width edits, use a transactional `MethodEditor`. Branch and
+switch targets remain symbolic until the edit is committed:
+
+```python
+editor = apk.edit_method(method)
+instructions = method.get_instructions()
+target = editor.label_before(instructions[-1])
+editor.insert_before(instructions[2], [DexInstruction.nop()])
+editor.replace(instructions[1], [DexInstruction.nop(), DexInstruction.nop()])
+editor.replace(instructions[0], [DexInstruction.if_eqz(0, target)])
+method = editor.commit(apk)
+```
+
+Switches can be created with
+`DexInstruction.switch(register, [(case_value, label), ...], default)`;
+payloads and their alignment are generated automatically.
+
+String values can be edited without manually managing string IDs:
+`DexInstruction.const_string_value(register, "replacement")`. On commit,
+missing values are added to the DEX string pool and the instruction is encoded
+as `const-string` or `const-string/jumbo` as required. The existing
+`const_string(register, string_index)` constructor remains available for
+explicit numeric-index edits.
+
+To change a string-pool entry globally, pass a `DexString` from
+`apk.get_strings_as_string()` to `apk.replace_string(string, "replacement")`.
+This keeps the string ID stable, so every DEX reference to that entry observes
+the replacement.
+
 `allow_plaintext_and_user_certificates()` creates
 `res/xml/coeus_network_security_config.xml` and its `resources.arsc` entry if
 the input APK does not have one, then wires the typed reference into the
@@ -78,9 +107,11 @@ aligned, including stored entries, `resources.arsc`, and page-aligned native
 libraries. Sign it with a test key before installing it; Android will not
 install an unsigned APK. Changing the package name changes the Android install
 identity, but does not rename DEX class descriptors or package-qualified
-component names. DEX insertion currently requires a method without
-try/catch handlers or packed/sparse-switch/fill-array payloads, and native
-code recompilation is not included—native libraries can be added or replaced.
+component names. Variable-width DEX editing currently requires a method
+without try/catch handlers; switch and fill-array payloads are rebuilt by
+`MethodEditor`. Rewritten methods currently omit debug position/local-variable
+metadata. Native code recompilation is not included—native libraries can be
+added or replaced.
 
 ## Split APKs and interactive sessions
 
@@ -122,6 +153,9 @@ coeus> save work.coeus
 coeus> sign signed debug.keystore androiddebugkey
 coeus> install signed DEVICE
 coeus> launch com.example.app DEVICE
+coeus> debug list DEVICE
+coeus> debug connect 0 DEVICE 8000
+coeus> debug wait
 ```
 
 The shell's `python` command opens a normal Python console with every public
@@ -131,6 +165,23 @@ editing. Tab completes shell commands and path arguments; the embedded Python
 console also enables identifier and attribute completion when readline is
 available.
 
+## Native GUI
+
+The repository also contains a native `egui` frontend in [coeus-gui](./coeus-gui).
+It uses a small JSON-line Python worker so the existing `coeus-python` API
+remains the source of truth while analysis runs off the UI thread. The GUI
+supports regex searches, syntax-highlighted smali inspection, cross-reference
+navigation, interactive callgraph/supergraph rendering, JDWP stepping and
+stack/register inspection, and structured method editing through typed nodes.
+It also includes direct DEX string-pool replacement, resizable and collapsible
+panes, typed code-reference navigation, and a force-directed graph canvas with
+node-type styling.
+
+The code pane deliberately does not accept arbitrary smali text. It exposes
+typed `DexInstruction` factories as instruction nodes and commits anchored
+replacements or insertions through `AnalyzeObject.edit_method()`. See
+[coeus-gui/README.md](./coeus-gui/README.md) for build instructions.
+
 Installed packages can be filtered before pulling one:
 
 ```text
@@ -139,6 +190,15 @@ coeus> list heidi DEVICE
 
 The expression is matched against the complete package name; omit it to list
 everything reported by `pm list packages`.
+
+`debug list` uses `adb jdwp` to find processes with a JDWP agent, resolves
+their process/package names, and displays any match against the package name
+from the currently loaded manifest. `debug connect` forwards the selected
+process over USB and creates a `coeus_python.Debugger` connected to
+`127.0.0.1:8000` (or the supplied port). Use `debug resume`, `debug wait`,
+`debug step`, and `debug breakpoints` for the common control operations. The
+`python` command exposes the live `debugger`, `debug_app`, and `debug_frame`
+objects for the rest of the debugger API.
 
 ## Contributions
 

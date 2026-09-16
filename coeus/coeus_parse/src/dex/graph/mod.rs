@@ -95,6 +95,14 @@ pub struct Supergraph {
     pub super_graph: Graph<InfoNode, i32>,
 }
 
+impl Supergraph {
+    /// Serialize the complete information graph in the same DOT format used
+    /// by [`Subgraph::to_dot`].
+    pub fn to_dot(&self) -> String {
+        format!("{:?}", Dot::new(&self.super_graph))
+    }
+}
+
 /// Get a subgraph starting from one NodeIndex
 pub fn subgraph_for_node(graph: &Graph<InfoNode, i32>, start: NodeIndex<u32>) -> Subgraph {
     let mut sub_graph: Graph<InfoNode, i32> = DiGraph::new();

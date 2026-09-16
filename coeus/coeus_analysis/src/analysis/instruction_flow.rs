@@ -1208,7 +1208,8 @@ impl InstructionFlow {
                             branches_to_add.lock().unwrap().push((b.pc, new_branch));
                         }
                     }
-                    Instruction::PackedSwitch(_, table_offset) | Instruction::SparseSwitch(_, table_offset) => {
+                    Instruction::PackedSwitch(_, table_offset)
+                    | Instruction::SparseSwitch(_, table_offset) => {
                         if let Some((_, Instruction::PackedSwitchData(switch))) =
                             method.get(&(b.pc + table_offset))
                         {

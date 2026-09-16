@@ -50,14 +50,14 @@ impl<'a> MultiDexFile {
         }
     }
 
-    pub fn get_implementations_for(&self, class: &Class) -> Vec<(Arc<DexFile>,Arc<Class>)> {
+    pub fn get_implementations_for(&self, class: &Class) -> Vec<(Arc<DexFile>, Arc<Class>)> {
         let mut impls = self.primary.get_implementations_for(class);
         for s in &self.secondary {
             impls.extend(s.get_implementations_for(class));
         }
         impls
     }
-     pub fn get_subclasses_for(&self, class: &Class) -> Vec<(Arc<DexFile>,Arc<Class>)> {
+    pub fn get_subclasses_for(&self, class: &Class) -> Vec<(Arc<DexFile>, Arc<Class>)> {
         let mut impls = self.primary.get_subclasses_for(class);
         for s in &self.secondary {
             impls.extend(s.get_subclasses_for(class));
