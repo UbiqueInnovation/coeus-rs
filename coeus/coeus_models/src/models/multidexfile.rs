@@ -244,13 +244,13 @@ impl<'a> MultiDexFile {
                 {
                     return df
                         .get_class_by_name(class_name)
-                        .map(|c| (c, self.primary.clone()));
+                        .map(|c| (c, df.clone()));
                 }
                 #[cfg(target_arch = "wasm32")]
                 if let Some(df) = self.secondary.iter().find(|a| &a.identifier == class) {
                     return df
                         .get_class_by_name(class_name)
-                        .map(|c| (c, self.primary.clone()));
+                        .map(|c| (c, df.clone()));
                 }
             }
         }
@@ -270,7 +270,7 @@ impl<'a> MultiDexFile {
                 .0
                 .write()
                 .unwrap()
-                .insert(f.0.identifier.clone(), class_name.to_string());
+                .insert(class_name.to_string(), f.0.identifier.clone());
             Some((f.1.clone(), f.0.clone()))
         } else {
             None
@@ -293,5 +293,68 @@ where
 impl<U, V> Default for DexLock<HashMap<U, V>> {
     fn default() -> Self {
         DexLock(RwLock::new(HashMap::new()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::{ClassData, DexHeader};
+
+    fn dex_file(identifier: &str, class: Class) -> DexFile {
+        DexFile {
+            identifier: identifier.to_string(),
+            raw_data: Vec::new(),
+            file_name: identifier.to_string(),
+            header: unsafe { std::mem::zeroed::<DexHeader>() },
+            strings: Vec::new(),
+            types: Vec::new(),
+            methods: Vec::new(),
+            protos: Vec::new(),
+            fields: Vec::new(),
+            classes: vec![Arc::new(class)],
+            interface_table: HashMap::new(),
+            superclass_table: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn cached_secondary_class_keeps_its_dex_file() {
+        let mut class = Class::new(
+            "secondary.dex".to_string(),
+            0,
+            "Lexample/Secondary;".to_string(),
+        );
+        class.class_data = Some(ClassData {
+            static_fields_size: 0,
+            instance_fields_size: 0,
+            direct_methods_size: 0,
+            virtual_methods_size: 0,
+            static_fields: Vec::new(),
+            instance_fields: Vec::new(),
+            direct_methods: Vec::new(),
+            virtual_methods: Vec::new(),
+        });
+
+        let multidex = MultiDexFile::new(
+            AndroidManifest::default(),
+            String::new(),
+            dex_file(
+                "classes.dex",
+                Class::new(
+                    "classes.dex".to_string(),
+                    0,
+                    "Lexample/Primary;".to_string(),
+                ),
+            ),
+            vec![dex_file("secondary.dex", class)],
+        );
+
+        let (_, file) = multidex.load_class("Lexample/Secondary;").unwrap();
+        assert_eq!(file.identifier, "secondary.dex");
+
+        // Exercise the cache path as well as the initial lookup path.
+        let (_, cached_file) = multidex.load_class("Lexample/Secondary;").unwrap();
+        assert_eq!(cached_file.identifier, "secondary.dex");
     }
 }

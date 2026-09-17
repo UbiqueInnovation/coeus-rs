@@ -2241,13 +2241,17 @@ impl VM {
                             return Err(VMException::ClassNotFound(field.class_idx as u16));
                         };
                     let field_name = format!("{}->{}", class_name, field.name);
-                    let Some((_, addr)) = self.instances.get(&field_name) else {
-                        return Err(VMException::LinkerError);
+                    let new_register = match self
+                        .instances
+                        .get(&field_name)
+                        .and_then(|(_, addr)| self.heap.get(addr))
+                    {
+                        Some(Value::Int(value)) => Register::Literal(*value),
+                        Some(Value::Short(value)) => Register::Literal(*value as i32),
+                        Some(Value::Byte(value)) => Register::Literal(*value as i32),
+                        Some(_) => return Err(VMException::InvalidRegisterType),
+                        None => Register::Literal(0),
                     };
-                    let Some(Value::Int(o)) = self.heap.get(addr) else {
-                        return Err(VMException::LinkerError);
-                    };
-                    let new_register = Register::Literal(*o);
                     self.update_register(dst, new_register)?;
                 }
                 &Instruction::StaticGetWide(dst, field_idx) => {
@@ -2259,15 +2263,20 @@ impl VM {
                     let class_name =
                         if let Some(c) = dex_file.get_type_name(field.class_idx as usize) {
                             c.to_string()
-                        } else {
-                            return Err(VMException::ClassNotFound(field.class_idx as u16));
-                        };
+                    } else {
+                        return Err(VMException::ClassNotFound(field.class_idx as u16));
+                    };
                     let field_name = format!("{}->{}", class_name, field.name);
-                    if let Some((_, addr)) = self.instances.get(&field_name) {
-                        if let Some(Value::Int(o)) = self.heap.get(addr) {
-                            self.update_register(dst, Register::LiteralWide(*o as i64))?;
-                        }
-                    }
+                    let value = self
+                        .instances
+                        .get(&field_name)
+                        .and_then(|(_, addr)| self.heap.get(addr));
+                    let new_register = match value {
+                        Some(Value::Int(value)) => Register::LiteralWide(*value as i64),
+                        Some(_) => return Err(VMException::InvalidRegisterType),
+                        None => Register::LiteralWide(0),
+                    };
+                    self.update_register(dst, new_register)?;
                 }
                 &Instruction::StaticGetObject(dst, field_idx) => {
                     let field = if let Some(field) = dex_file.fields.get(field_idx as usize) {
@@ -2436,29 +2445,48 @@ impl VM {
                                 self.update_register(dst, new_register)?;
                             }
                             _ => {
-                                return Err(VMException::InvalidMemoryAddress(*val));
+                                self.update_register(dst, Register::Null)?;
                             }
                         }
                     } else {
-                        return Err(VMException::StaticDataNotFound(field_idx as u32));
+                        self.update_register(dst, Register::Null)?;
                     }
                 }
-                Instruction::StaticGetBoolean(_, _) => {}
-                Instruction::StaticGetByte(_, _) => {}
-                Instruction::StaticGetChar(_, _) => {}
-                Instruction::StaticGetShort(_, _) => {}
+                &Instruction::StaticGetBoolean(dst, field_idx)
+                | &Instruction::StaticGetByte(dst, field_idx)
+                | &Instruction::StaticGetChar(dst, field_idx)
+                | &Instruction::StaticGetShort(dst, field_idx) => {
+                    let field = dex_file
+                        .fields
+                        .get(field_idx as usize)
+                        .ok_or(VMException::ClassNotFound(0))?;
+                    let class_name = dex_file
+                        .get_type_name(field.class_idx as usize)
+                        .ok_or(VMException::ClassNotFound(field.class_idx as u16))?;
+                    let field_name = format!("{}->{}", class_name, field.name);
+                    let value = self
+                        .instances
+                        .get(&field_name)
+                        .and_then(|(_, addr)| self.heap.get(addr));
+                    let new_register = match value {
+                        Some(Value::Int(value)) => Register::Literal(*value),
+                        Some(Value::Short(value)) => Register::Literal(*value as i32),
+                        Some(Value::Byte(value)) => Register::Literal(*value as i32),
+                        Some(_) => return Err(VMException::InvalidRegisterType),
+                        None => Register::Literal(0),
+                    };
+                    self.update_register(dst, new_register)?;
+                }
                 &Instruction::StaticPut(src, field_idx) => {
                     let field = if let Some(field) = dex_file.fields.get(field_idx as usize) {
                         field
                     } else {
                         return Err(VMException::ClassNotFound(0));
                     };
-                    let class_name =
-                        if let Some(c) = dex_file.get_class_by_type(field.class_idx as u32) {
-                            c.class_name.clone()
-                        } else {
-                            return Err(VMException::ClassNotFound(field.class_idx as u16));
-                        };
+                    let class_name = dex_file
+                        .get_type_name(field.class_idx as usize)
+                        .ok_or(VMException::ClassNotFound(field.class_idx as u16))?
+                        .to_string();
                     let field_name = format!("{}->{}", class_name, field.name);
                     if let Some(&Register::Literal(lit)) =
                         self.current_state.current_stackframe.get(src as usize)
@@ -2481,17 +2509,14 @@ impl VM {
                     } else {
                         return Err(VMException::ClassNotFound(0));
                     };
-                    let class_name =
-                        if let Some(c) = dex_file.get_class_by_type(field.class_idx as u32) {
-                            c.class_name.clone()
-                        } else {
-                            return Err(VMException::ClassNotFound(field.class_idx as u16));
-                        };
+                    let class_name = dex_file
+                        .get_type_name(field.class_idx as usize)
+                        .ok_or(VMException::ClassNotFound(field.class_idx as u16))?
+                        .to_string();
                     let field_name = format!("{}->{}", class_name, field.name);
 
-                    if let Some(&Register::Reference(_, address)) =
-                        self.current_state.current_stackframe.get(src as usize)
-                    {
+                    match self.current_state.current_stackframe.get(src as usize) {
+                        Some(&Register::Reference(_, address)) => {
                         let _class_resource = if let Some(cr) = self.heap.get(&address) {
                             cr
                         } else {
@@ -2534,14 +2559,40 @@ impl VM {
                                     .insert(field_name, (NodeIndex::new(0), address));
                             }
                         }
-                    } else {
-                        return Err(VMException::RegisterNotFound(src as usize));
+                        }
+                        Some(&Register::Null) => {
+                            self.instances.remove(&field_name);
+                        }
+                        Some(_) => return Err(VMException::InvalidRegisterType),
+                        None => return Err(VMException::RegisterNotFound(src as usize)),
                     }
                 }
-                Instruction::StaticPutBoolean(_, _) => {}
-                Instruction::StaticPutByte(_, _) => {}
-                Instruction::StaticPutChar(_, _) => {}
-                Instruction::StaticPutShort(_, _) => {}
+                &Instruction::StaticPutBoolean(src, field_idx)
+                | &Instruction::StaticPutByte(src, field_idx)
+                | &Instruction::StaticPutChar(src, field_idx)
+                | &Instruction::StaticPutShort(src, field_idx) => {
+                    let field = dex_file
+                        .fields
+                        .get(field_idx as usize)
+                        .ok_or(VMException::ClassNotFound(0))?;
+                    let class_name = dex_file
+                        .get_type_name(field.class_idx as usize)
+                        .ok_or(VMException::ClassNotFound(field.class_idx as u16))?;
+                    let field_name = format!("{}->{}", class_name, field.name);
+                    let Some(Register::Literal(value)) = self
+                        .current_state
+                        .current_stackframe
+                        .get(src as usize)
+                    else {
+                        return Err(VMException::InvalidRegisterType);
+                    };
+                    let address = self.new_instance("".to_string(), Value::Int(*value))?;
+                    let Register::Reference(_, address) = address else {
+                        return Err(VMException::LinkerError);
+                    };
+                    self.instances
+                        .insert(field_name, (NodeIndex::new(0), address));
+                }
                 Instruction::InstanceGet(dst, obj, field_id) => {
                     let dst: u8 = (*dst).into();
                     let obj: u8 = (*obj).into();
@@ -2552,12 +2603,10 @@ impl VM {
                     } else {
                         return Err(VMException::ClassNotFound(0));
                     };
-                    let class_name =
-                        if let Some(c) = dex_file.get_class_by_type(field.class_idx as u32) {
-                            c.class_name.clone()
-                        } else {
-                            return Err(VMException::ClassNotFound(field.class_idx as u16));
-                        };
+                    let class_name = dex_file
+                        .get_type_name(field.class_idx as usize)
+                        .ok_or(VMException::ClassNotFound(field.class_idx as u16))?
+                        .to_string();
                     let field_name = format!("{}->{}", class_name, field.name);
 
                     if let Some(Register::Reference(_, instance)) =
@@ -2584,14 +2633,44 @@ impl VM {
                                     )
                                 );
                                 self.update_register(dst, Register::Literal(0))?;
-                                return Err(VMException::InvalidRegisterType);
                             }
                         }
                     } else {
                         return Err(VMException::InvalidRegisterType);
                     }
                 }
-                Instruction::InstanceGetWide(_, _, _) => {}
+                &Instruction::InstanceGetWide(dst, instance, field_id) => {
+                    let dst: u8 = dst.into();
+                    let instance: u8 = instance.into();
+                    let field = dex_file
+                        .fields
+                        .get(field_id as usize)
+                        .ok_or(VMException::ClassNotFound(0))?;
+                    let class_name = dex_file
+                        .get_type_name(field.class_idx as usize)
+                        .ok_or(VMException::ClassNotFound(field.class_idx as u16))?;
+                    let field_name = format!("{}->{}", class_name, field.name);
+                    let Some(Register::Reference(_, instance)) = self
+                        .current_state
+                        .current_stackframe
+                        .get(instance as usize)
+                    else {
+                        return Err(VMException::InvalidRegisterType);
+                    };
+                    let Some(Value::Object(class_instance)) = self.heap.get(instance) else {
+                        return Err(VMException::InvalidRegisterType);
+                    };
+                    let value = class_instance
+                        .instances
+                        .get(&field_name)
+                        .and_then(|address| self.heap.get(address));
+                    let new_register = match value {
+                        Some(Value::Int(value)) => Register::LiteralWide(*value as i64),
+                        Some(_) => return Err(VMException::InvalidRegisterType),
+                        None => Register::LiteralWide(0),
+                    };
+                    self.update_register(dst, new_register)?;
+                }
                 &Instruction::InstanceGetObject(dst, instance, field_id) => {
                     let dst: u8 = dst.into();
                     let instance: u8 = instance.into();
@@ -2601,12 +2680,10 @@ impl VM {
                     } else {
                         return Err(VMException::ClassNotFound(0));
                     };
-                    let class_name =
-                        if let Some(c) = dex_file.get_class_by_type(field.class_idx as u32) {
-                            c.class_name.clone()
-                        } else {
-                            return Err(VMException::ClassNotFound(field.class_idx as u16));
-                        };
+                    let class_name = dex_file
+                        .get_type_name(field.class_idx as usize)
+                        .ok_or(VMException::ClassNotFound(field.class_idx as u16))?
+                        .to_string();
                     let field_name = format!("{}->{}", class_name, field.name);
 
                     if let Some(Register::Reference(_, instance)) =
@@ -2615,13 +2692,26 @@ impl VM {
                         if let Some(Value::Object(class_instance)) = self.heap.get(instance) {
                             if let Some(field_instance) = class_instance.instances.get(&field_name)
                             {
-                                let new_register = Register::Reference(
-                                    class_instance.class.class_name.to_string(),
-                                    *field_instance,
-                                );
+                                let new_register = match self.heap.get(field_instance) {
+                                    Some(Value::Object(field_value)) => Register::Reference(
+                                        field_value.class.class_name.to_string(),
+                                        *field_instance,
+                                    ),
+                                    Some(Value::Array(_)) => Register::Reference(
+                                        dex_file
+                                            .get_type_name(field.type_idx as usize)
+                                            .unwrap_or("[B")
+                                            .to_string(),
+                                        *field_instance,
+                                    ),
+                                    _ => Register::Null,
+                                };
                                 self.update_register(dst, new_register)?;
                             } else {
-                                return Err(VMException::InvalidRegisterType);
+                                // Instance fields have JVM/Dalvik defaults. A
+                                // reference field that has never been written
+                                // contains null, not an invalid register.
+                                self.update_register(dst, Register::Null)?;
                             }
                         } else {
                             return Err(VMException::InvalidRegisterType);
@@ -2642,12 +2732,10 @@ impl VM {
                     } else {
                         return Err(VMException::ClassNotFound(0));
                     };
-                    let class_name =
-                        if let Some(c) = dex_file.get_class_by_type(field.class_idx as u32) {
-                            c.class_name.clone()
-                        } else {
-                            return Err(VMException::ClassNotFound(field.class_idx as u16));
-                        };
+                    let class_name = dex_file
+                        .get_type_name(field.class_idx as usize)
+                        .ok_or(VMException::ClassNotFound(field.class_idx as u16))?
+                        .to_string();
                     let field_name = format!("{}->{}", class_name, field.name);
                     if let Some(Register::Reference(_, instance)) =
                         self.current_state.current_stackframe.get(instance as usize)
@@ -2657,9 +2745,17 @@ impl VM {
                             {
                                 if let Some(Value::Int(o)) = self.heap.get(field_instance) {
                                     self.update_register(dst as usize, Register::Literal(*o))?;
+                                } else {
+                                    self.update_register(dst as usize, Register::Literal(0))?;
                                 }
+                            } else {
+                                self.update_register(dst as usize, Register::Literal(0))?;
                             }
+                        } else {
+                            return Err(VMException::InvalidRegisterType);
                         }
+                    } else {
+                        return Err(VMException::InvalidRegisterType);
                     }
                 }
                 &Instruction::InstancePut(src, instance, field_id) => {
@@ -2671,12 +2767,10 @@ impl VM {
                     } else {
                         return Err(VMException::ClassNotFound(0));
                     };
-                    let class_name =
-                        if let Some(c) = dex_file.get_class_by_type(field.class_idx as u32) {
-                            c.class_name.clone()
-                        } else {
-                            return Err(VMException::ClassNotFound(field.class_idx as u16));
-                        };
+                    let class_name = dex_file
+                        .get_type_name(field.class_idx as usize)
+                        .ok_or(VMException::ClassNotFound(field.class_idx as u16))?
+                        .to_string();
                     let field_name = format!("{}->{}", class_name, field.name);
 
                     if let (Some(Register::Literal(src)), Some(Register::Reference(_, instance))) = (
@@ -2720,26 +2814,35 @@ impl VM {
                     } else {
                         return Err(VMException::ClassNotFound(0));
                     };
-                    let class_name =
-                        if let Some(c) = dex_file.get_class_by_type(field.class_idx as u32) {
-                            c.class_name.clone()
-                        } else {
-                            return Err(VMException::ClassNotFound(field.class_idx as u16));
-                        };
+                    let class_name = dex_file
+                        .get_type_name(field.class_idx as usize)
+                        .ok_or(VMException::ClassNotFound(field.class_idx as u16))?
+                        .to_string();
                     let field_name = format!("{}->{}", class_name, field.name);
 
-                    if let (
-                        Some(Register::Reference(_, src)),
-                        Some(Register::Reference(_, instance)),
-                    ) = (
-                        self.current_state.current_stackframe.get(src as usize),
-                        self.current_state.current_stackframe.get(instance as usize),
-                    ) {
+                    let source = self.current_state.current_stackframe.get(src as usize);
+                    let target = self
+                        .current_state
+                        .current_stackframe
+                        .get(instance as usize);
+                    if let Some(Register::Reference(_, instance)) = target {
                         if let Some(Value::Object(class_instance)) = self.heap.get_mut(instance) {
-                            let field_instance =
-                                class_instance.instances.entry(field_name).or_insert(0);
-                            *field_instance = *src;
+                            match source {
+                                Some(Register::Reference(_, src)) => {
+                                    class_instance.instances.insert(field_name, *src);
+                                }
+                                Some(Register::Null) => {
+                                    // Removing the entry restores the VM's
+                                    // default value for an object field: null.
+                                    class_instance.instances.remove(&field_name);
+                                }
+                                _ => return Err(VMException::InvalidRegisterType),
+                            }
+                        } else {
+                            return Err(VMException::InvalidRegisterType);
                         }
+                    } else {
+                        return Err(VMException::InvalidRegisterType);
                     }
                 }
                 Instruction::InstancePutBoolean(src, instance, field_id)
@@ -2754,12 +2857,10 @@ impl VM {
                     } else {
                         return Err(VMException::ClassNotFound(0));
                     };
-                    let class_name =
-                        if let Some(c) = dex_file.get_class_by_type(field.class_idx as u32) {
-                            c.class_name.clone()
-                        } else {
-                            return Err(VMException::ClassNotFound(field.class_idx as u16));
-                        };
+                    let class_name = dex_file
+                        .get_type_name(field.class_idx as usize)
+                        .ok_or(VMException::ClassNotFound(field.class_idx as u16))?
+                        .to_string();
                     let field_name = format!("{}->{}", class_name, field.name);
                     if let Some(Register::Literal(src_val)) =
                         self.current_state.current_stackframe.get(src as usize)
@@ -3221,7 +3322,7 @@ impl Register {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coeus_models::models::DexHeader;
+    use coeus_models::models::{CodeItem, DexHeader, Field, StringEntry};
 
     fn test_dex(class: Arc<Class>) -> Arc<DexFile> {
         Arc::new(DexFile {
@@ -3294,5 +3395,74 @@ mod tests {
             .unwrap();
         assert_eq!(vm.get_heap_ref().len(), heap_size);
         assert_eq!(vm.get_current_state().return_reg, object);
+    }
+
+    #[test]
+    fn unread_object_instance_fields_default_to_null() {
+        let receiver_class = Arc::new(Class::new(
+            "test.dex".to_string(),
+            0,
+            "Ltest/Receiver;".to_string(),
+        ));
+        let string = |value: &str| StringEntry {
+            utf16_size: value.len() as u32,
+            dat: value.as_bytes().to_vec(),
+        };
+        let dex = Arc::new(DexFile {
+            identifier: "test.dex".to_string(),
+            raw_data: Vec::new(),
+            file_name: "test.dex".to_string(),
+            header: unsafe { std::mem::zeroed::<DexHeader>() },
+            strings: vec![
+                string("Ltest/Receiver;"),
+                string("Ljava/lang/String;"),
+                string("b"),
+            ],
+            types: vec![0, 1],
+            methods: Vec::new(),
+            protos: Vec::new(),
+            fields: vec![Arc::new(Field {
+                class_idx: 0,
+                type_idx: 1,
+                name_idx: 2,
+                name: "b".to_string(),
+            })],
+            classes: vec![receiver_class.clone()],
+            interface_table: HashMap::new(),
+            superclass_table: HashMap::new(),
+        });
+        let mut vm = VM::new(dex, Vec::new(), Arc::new(HashMap::new()));
+        let receiver = vm
+            .new_instance(
+                receiver_class.class_name.clone(),
+                Value::Object(ClassInstance::new(receiver_class)),
+            )
+            .unwrap();
+        let code = CodeItem {
+            code_off: 0,
+            register_size: 1,
+            ins_size: 1,
+            outs_size: 0,
+            tries_size: 0,
+            debug_info_off: 0,
+            insns_size: 2,
+            insns: vec![
+                (
+                    InstructionSize(2),
+                    InstructionOffset(0),
+                    Instruction::InstanceGetObject(Default::default(), Default::default(), 0),
+                ),
+                (
+                    InstructionSize(2),
+                    InstructionOffset(1),
+                    Instruction::Return(0),
+                ),
+            ],
+            array_data: Vec::new(),
+            switch_data: Vec::new(),
+        };
+
+        vm.start(0, "test.dex", &code, vec![receiver]).unwrap();
+        assert!(matches!(vm.get_current_state().return_reg, Register::Null));
     }
 }

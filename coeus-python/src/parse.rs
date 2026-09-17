@@ -1078,14 +1078,28 @@ impl AnalyzeObject {
 
     pub fn get_runtime(&self, file: &Method) -> PyResult<Runtime> {
         let file_identifier = &file.file.identifier;
-        if let Some(runtime_files) = self.files.multi_dex.iter().find(|a| {
-            &a.primary.identifier == file_identifier
-                || a.secondary
-                    .iter()
-                    .any(|sec| &sec.identifier == file_identifier)
-        }) {
+        let all_dex_files = self
+            .files
+            .multi_dex
+            .iter()
+            .flat_map(|multi_dex| {
+                std::iter::once(multi_dex.primary.clone()).chain(multi_dex.secondary.clone())
+            })
+            .collect::<Vec<_>>();
+
+        if all_dex_files
+            .iter()
+            .any(|dex| dex.identifier == *file_identifier)
+        {
             Ok(Runtime {
-                runtime: runtime_files.secondary.to_vec(),
+                // DEX references are local to the DEX containing the method.
+                // Keep every other parsed DEX available for class/method
+                // resolution, including the primary DEX when the method is
+                // from a secondary DEX.
+                runtime: all_dex_files
+                    .into_iter()
+                    .filter(|dex| dex.identifier != *file_identifier)
+                    .collect(),
             })
         } else {
             Err(PyRuntimeError::new_err("runtime not found"))

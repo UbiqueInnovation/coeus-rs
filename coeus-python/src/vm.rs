@@ -263,11 +263,18 @@ impl DexClassObject {
 impl DexVm {
     #[new]
     pub fn new(ao: &AnalyzeObject) -> Self {
-        let vm = VM::new(
-            ao.files.multi_dex[0].primary.clone(),
-            ao.files.multi_dex[0].secondary.clone(),
-            Arc::new(HashMap::new()),
-        );
+        let primary = ao.files.multi_dex[0].primary.clone();
+        let primary_identifier = primary.identifier.clone();
+        let runtime = ao
+            .files
+            .multi_dex
+            .iter()
+            .flat_map(|multi_dex| {
+                std::iter::once(multi_dex.primary.clone()).chain(multi_dex.secondary.clone())
+            })
+            .filter(|dex| dex.identifier != primary_identifier)
+            .collect();
+        let vm = VM::new(primary, runtime, Arc::new(HashMap::new()));
         Self {
             vm: Arc::new(Mutex::new(vm)),
         }

@@ -435,6 +435,8 @@ struct GraphState {
     discover_dynamic_arguments: bool,
     dynamic_argument_classes: String,
     node_search: String,
+    node_search_cache_query: String,
+    node_search_results: Vec<(usize, String, String)>,
     focus_node: Option<usize>,
     last_edge_click: Option<(usize, usize, usize)>,
 }
@@ -468,6 +470,8 @@ impl Default for GraphState {
             discover_dynamic_arguments: false,
             dynamic_argument_classes: String::new(),
             node_search: String::new(),
+            node_search_cache_query: String::new(),
+            node_search_results: Vec::new(),
             focus_node: None,
             last_edge_click: None,
         }
@@ -1492,6 +1496,8 @@ impl CoeusApp {
                         self.graph.total_edges = total_edges;
                         self.graph.node_filters = all_graph_node_kinds().into_iter().collect();
                         self.graph.node_search.clear();
+                        self.graph.node_search_cache_query.clear();
+                        self.graph.node_search_results.clear();
                         self.graph.focus_node = None;
                         self.graph.last_edge_click = None;
                         self.rebuild_graph_layout();
@@ -5121,6 +5127,8 @@ impl CoeusApp {
         });
         if filters_changed {
             self.graph.node_filters = filters;
+            self.graph.node_search_cache_query.clear();
+            self.graph.node_search_results.clear();
             self.rebuild_graph_layout();
             self.graph.fit_to_view = true;
             self.session_dirty = true;
@@ -5140,8 +5148,15 @@ impl CoeusApp {
             )
             .on_hover_text("Search visible graph nodes; press Enter to center the first match");
         let search_query = self.graph.node_search.trim().to_string();
-        let search_matches =
-            graph_search_matches(&self.graph.nodes, &self.graph.node_filters, &search_query);
+        if search_query.is_empty() {
+            self.graph.node_search_cache_query.clear();
+            self.graph.node_search_results.clear();
+        } else if self.graph.node_search_cache_query != search_query {
+            self.graph.node_search_results =
+                graph_search_matches(&self.graph.nodes, &self.graph.node_filters, &search_query);
+            self.graph.node_search_cache_query = search_query.clone();
+        }
+        let search_matches = &self.graph.node_search_results;
         let activate_first =
             search_response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter));
         let mut focus_node = activate_first
