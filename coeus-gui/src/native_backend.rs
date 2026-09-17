@@ -45,6 +45,104 @@ type BackendResult = Result<Value, String>;
 
 const MAX_RESULTS: usize = 1000;
 
+const ANDROID_FRAMEWORK_CLASS_FILTERS: &[&str] = &[
+    "Landroid/app",
+    "Landroid/content",
+    "Landroid/graphics",
+    "Landroid/os",
+    "Landroid/text",
+    "Landroid/util",
+    "Landroid/view",
+    "Landroid/widget",
+    "Landroid/animation",
+    "Landroid/transition",
+];
+const LANGUAGE_RUNTIME_CLASS_FILTERS: &[&str] = &[
+    "Lj$/time",
+    "Lj$/util/",
+    "Lkotlin/",
+    "Lkotlinx/",
+    "Landroidx/",
+    "Lcom/sun",
+];
+const COMMON_LIBRARY_CLASS_FILTERS: &[&str] = &[
+    "Lcom/google/protobuf",
+    "Lcom/google/android",
+    "Lokhttp3/internal",
+    "Lokio/",
+    "Lmoshi/",
+    "Lorg/bouncycastle/",
+];
+
+struct SupergraphBuildOptions {
+    exclude_android_framework: bool,
+    exclude_language_runtime: bool,
+    exclude_common_libraries: bool,
+    additional_class_filters: Vec<String>,
+    discover_dynamic_arguments: bool,
+    dynamic_argument_classes: Vec<String>,
+}
+
+impl SupergraphBuildOptions {
+    fn from_request(request: &Value) -> Self {
+        let split = |key: &str| {
+            value_string(request, key)
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        Self {
+            exclude_android_framework: request
+                .get("exclude_android_framework")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            exclude_language_runtime: request
+                .get("exclude_language_runtime")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            exclude_common_libraries: request
+                .get("exclude_common_libraries")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            additional_class_filters: split("ignore"),
+            discover_dynamic_arguments: request
+                .get("discover_dynamic_arguments")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            dynamic_argument_classes: split("dynamic_argument_classes"),
+        }
+    }
+
+    fn excluded_classes(&self) -> Vec<String> {
+        let mut excluded = Vec::new();
+        if self.exclude_android_framework {
+            excluded.extend(
+                ANDROID_FRAMEWORK_CLASS_FILTERS
+                    .iter()
+                    .map(|value| (*value).to_string()),
+            );
+        }
+        if self.exclude_language_runtime {
+            excluded.extend(
+                LANGUAGE_RUNTIME_CLASS_FILTERS
+                    .iter()
+                    .map(|value| (*value).to_string()),
+            );
+        }
+        if self.exclude_common_libraries {
+            excluded.extend(
+                COMMON_LIBRARY_CLASS_FILTERS
+                    .iter()
+                    .map(|value| (*value).to_string()),
+            );
+        }
+        excluded.extend(self.additional_class_filters.iter().cloned());
+        excluded
+    }
+}
+
 #[derive(Clone)]
 struct NativeAnalysis {
     files: Files,
@@ -295,37 +393,26 @@ impl NativeAnalysis {
             .find(|method| method.signature() == signature)
     }
 
-    fn build_supergraph(&mut self, ignore: &[String]) -> Result<String, String> {
+    fn build_supergraph(&mut self, options: &SupergraphBuildOptions) -> Result<String, String> {
         let multi_dex = self
             .files
             .multi_dex
             .first()
             .ok_or_else(|| "the loaded APK contains no DEX files".to_string())?;
-        let mut excluded = vec![
-            "Lj$/time".to_string(),
-            "Lj$/util/".to_string(),
-            "Lkotlin/".to_string(),
-            "Lkotlinx/".to_string(),
-            "Landroidx/".to_string(),
-            "Lcom/sun".to_string(),
-            "Landroid/app".to_string(),
-            "Landroid/widget".to_string(),
-            "Landroid/content".to_string(),
-            "Landroid/graphics".to_string(),
-            "Lcom/google/protobuf".to_string(),
-            "Lcom/google/android".to_string(),
-            "Lokhttp3/internal".to_string(),
-            "okio".to_string(),
-            "moshi".to_string(),
-            "Lorg/bouncycastle/".to_string(),
-        ];
-        excluded.extend(ignore.iter().cloned());
+        let excluded = options.excluded_classes();
+        let emulate_classes = options.discover_dynamic_arguments.then(|| {
+            options
+                .dynamic_argument_classes
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        });
         let binaries = Arc::new(self.files.binaries.clone());
         let graph = coeus::coeus_parse::dex::graph::information_graph::build_information_graph(
             multi_dex,
             binaries,
             &excluded.iter().map(String::as_str).collect::<Vec<_>>(),
-            None,
+            emulate_classes.as_deref(),
             None,
         )
         .map_err(|error| format!("could not build graph: {error:?}"))?;
@@ -770,7 +857,7 @@ impl RustBackend {
             "generate_keystore" => self.generate_keystore(&request),
             "set_note" => self.set_note(&request),
             "set_alias" => self.set_alias(&request),
-            "save_project" => self.save_project(value_string(&request, "path")),
+            "save_project" => self.save_project(&request),
             "load_project" => self.load_project(value_string(&request, "path")),
             "export_script" => self.export_script(value_string(&request, "path")),
             "debug_connect" => self.debug_connect(
@@ -916,6 +1003,11 @@ impl RustBackend {
         }
         let state_metadata = state_metadata
             .ok_or_else(|| ".coeus archive does not contain state.json".to_string())?;
+        let saved_graph = gui_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("graph"))
+            .cloned()
+            .unwrap_or(Value::Null);
         let members = state_metadata
             .get("members")
             .and_then(Value::as_array)
@@ -1008,6 +1100,7 @@ impl RustBackend {
             data["notes"] = json!(self.notes);
             data["aliases"] = json!(self.aliases);
             data["split"] = json!(members.len() > 1);
+            data["graph"] = saved_graph;
             data["history"] = json!(self
                 .session
                 .as_ref()
@@ -1400,7 +1493,7 @@ impl RustBackend {
             runtime,
             Arc::new(analysis.files.binaries.clone()),
         );
-        let mut vm_arguments = Vec::with_capacity(descriptors.len() + 2);
+        let mut vm_arguments = Vec::with_capacity(descriptors.len() + 1);
         for (descriptor, argument) in descriptors.iter().zip(arguments.iter()) {
             let text = argument.as_str().unwrap_or_default();
             vm_arguments.push(native_emulation_argument(&mut vm, descriptor, text)?);
@@ -1411,8 +1504,10 @@ impl RustBackend {
             .map(|data| data.access_flags.contains(AccessFlags::STATIC))
             .unwrap_or(false)
         {
-            vm_arguments.insert(0, Register::Reference(String::new(), 0));
-            vm_arguments.insert(0, Register::Reference(String::new(), 0));
+            let receiver = vm
+                .new_class_instance(&method.class.class_name)
+                .map_err(|error| format!("could not allocate method receiver: {error:?}"))?;
+            vm_arguments.insert(0, receiver);
         }
         let Some(data) = method.data.as_ref() else {
             return Ok(json!({"success": false, "error": "No method definition found"}));
@@ -1681,13 +1776,8 @@ impl RustBackend {
             .unwrap_or("callgraph")
             .to_string();
         if kind == "supergraph" {
-            let ignore = value_string(request, "ignore")
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            let dot = self.analysis_mut()?.build_supergraph(&ignore)?;
+            let options = SupergraphBuildOptions::from_request(request);
+            let dot = self.analysis_mut()?.build_supergraph(&options)?;
             return Ok(json!({"kind": kind, "dot": dot}));
         }
         let id = value_string(request, "id");
@@ -1696,7 +1786,15 @@ impl RustBackend {
             return Err("call graphs start from a method result".to_string());
         };
         if self.analysis()?.supergraph.is_none() {
-            self.analysis_mut()?.build_supergraph(&[])?;
+            self.analysis_mut()?
+                .build_supergraph(&SupergraphBuildOptions {
+                    exclude_android_framework: true,
+                    exclude_language_runtime: true,
+                    exclude_common_libraries: true,
+                    additional_class_filters: Vec::new(),
+                    discover_dynamic_arguments: false,
+                    dynamic_argument_classes: Vec::new(),
+                })?;
         }
         let graph = self
             .analysis()?
@@ -2347,7 +2445,12 @@ impl RustBackend {
         Ok(paths)
     }
 
-    fn save_project(&mut self, path: String) -> BackendResult {
+    fn save_project(&mut self, request: &Value) -> BackendResult {
+        let path = value_string(request, "path");
+        if path.trim().is_empty() {
+            return Err("save project requires a path".to_string());
+        }
+        let graph = request.get("graph").cloned().unwrap_or(Value::Null);
         let (names, bytes) =
             match self.session.as_ref() {
                 Some(Session::Single(analysis)) => (
@@ -2384,6 +2487,7 @@ impl RustBackend {
             "history": self.session.as_ref().map(Session::history).unwrap_or_default(),
             "notes": self.notes,
             "aliases": self.aliases,
+            "graph": graph,
         });
         let script = self.session_script();
         let file = File::create(&path)
@@ -4532,7 +4636,8 @@ fn native_emulation_argument(
             if matches!(normalized.to_ascii_lowercase().as_str(), "null" | "nil") {
                 Ok(Register::Null)
             } else {
-                Err(format!("argument type {descriptor} is not supported yet"))
+                vm.new_class_instance(descriptor)
+                    .map_err(|error| format!("could not allocate object argument: {error:?}"))
             }
         }
         "F" | "D" => Err(format!("argument type {descriptor} is not supported yet")),

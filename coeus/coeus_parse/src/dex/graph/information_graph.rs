@@ -117,6 +117,11 @@ pub fn build_information_graph(
                     // let method_index = code.method.method_idx;
                     let method_name = &code.method.method_name;
                     let access_flags = code.access_flags.clone();
+                    let discover_dynamic = emulate_classes
+                        .map(|classes| {
+                            classes.is_empty() || classes.contains(&class.class_name.as_str())
+                        })
+                        .unwrap_or(false);
                     // let's search all instructions an connect various nodes with this method.
                     let mut discoveries = vec![];
                     // let mut add_nodes = vec![];
@@ -128,10 +133,7 @@ pub fn build_information_graph(
                         let the_proto = &f.protos[code.method.proto_idx as usize];
                         if let Some(proto) = method_proto {
                             // #[cfg(not(target_arch = "wasm32"))]
-                            if let Some(emulate_classes) = emulate_classes {
-                                if emulate_classes.is_empty()
-                                    || emulate_classes.contains(&class.class_name.as_str())
-                                {
+                            if discover_dynamic {
                                     // simulate the function and make a node for every array contained
                                     vm.reset();
 
@@ -191,13 +193,12 @@ pub fn build_information_graph(
                                         method_node_index,
                                         &all_mappings,
                                     );
-                                }
                             }
                         }
 
                         // TODO maybe control it with a switch?
 
-                        if method_name == "<clinit>" {
+                        if method_name == "<clinit>" && discover_dynamic {
                             if let Some(class_data) = class.class_data.as_ref() {
                                 for field in &class_data.static_fields {
                                     vm.set_breakpoint(Breakpoint::FieldSet(field.field_idx as u16));

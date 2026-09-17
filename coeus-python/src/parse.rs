@@ -533,13 +533,28 @@ impl AnalyzeObject {
         index: usize,
         excluded_classes: &[String],
     ) -> Result<Arc<Supergraph>, String> {
+        self.build_supergraph_for_multi_dex_with_emulation(index, excluded_classes, None, true)
+    }
+
+    fn build_supergraph_for_multi_dex_with_emulation(
+        &mut self,
+        index: usize,
+        excluded_classes: &[String],
+        emulate_classes: Option<&[&str]>,
+        include_default_exclusions: bool,
+    ) -> Result<Arc<Supergraph>, String> {
         let c = Arc::new(self.files.binaries.clone());
         if index >= self.files.multi_dex.len() {
             return Err("Index out of bounds".to_string());
         }
-        let mut new = NON_INTERESTING_CLASSES.to_vec();
+        let mut new = if include_default_exclusions {
+            NON_INTERESTING_CLASSES.to_vec()
+        } else {
+            Vec::new()
+        };
         new.extend(excluded_classes.iter().map(|s| s.as_str()));
-        let Ok(supergraph) = build_information_graph(&self.files.multi_dex[0], c, &new, None, None)
+        let Ok(supergraph) =
+            build_information_graph(&self.files.multi_dex[0], c, &new, emulate_classes, None)
         else {
             return Err("Failed to build the graph".to_string());
         };
@@ -1025,6 +1040,31 @@ impl AnalyzeObject {
     pub fn build_supergraph(&mut self, ignore_classes: Vec<String>) -> PyResult<()> {
         self.build_main_supergraph(&ignore_classes)
             .map_err(PyRuntimeError::new_err)?;
+        Ok(())
+    }
+
+    /// Build a supergraph with explicit class filters and optional dynamic
+    /// argument discovery. `dynamic_classes` is empty to emulate every class
+    /// not excluded by `excluded_classes`; otherwise it contains exact DEX
+    /// class descriptors to emulate.
+    pub fn build_supergraph_with_options(
+        &mut self,
+        excluded_classes: Vec<String>,
+        discover_dynamic_arguments: bool,
+        dynamic_classes: Vec<String>,
+    ) -> PyResult<()> {
+        let dynamic_class_names = dynamic_classes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let emulate_classes = discover_dynamic_arguments.then_some(dynamic_class_names.as_slice());
+        self.build_supergraph_for_multi_dex_with_emulation(
+            0,
+            &excluded_classes,
+            emulate_classes,
+            false,
+        )
+        .map_err(PyRuntimeError::new_err)?;
         Ok(())
     }
 

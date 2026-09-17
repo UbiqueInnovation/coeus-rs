@@ -38,6 +38,35 @@ ENABLE_EXPERIMENTAL_METHOD_EDITS = os.environ.get(
     "COEUS_GUI_ENABLE_METHOD_EDITS", "1"
 ).lower() in ("1", "true", "yes")
 
+ANDROID_FRAMEWORK_CLASS_FILTERS = (
+    "Landroid/app",
+    "Landroid/content",
+    "Landroid/graphics",
+    "Landroid/os",
+    "Landroid/text",
+    "Landroid/util",
+    "Landroid/view",
+    "Landroid/widget",
+    "Landroid/animation",
+    "Landroid/transition",
+)
+LANGUAGE_RUNTIME_CLASS_FILTERS = (
+    "Lj$/time",
+    "Lj$/util/",
+    "Lkotlin/",
+    "Lkotlinx/",
+    "Landroidx/",
+    "Lcom/sun",
+)
+COMMON_LIBRARY_CLASS_FILTERS = (
+    "Lcom/google/protobuf",
+    "Lcom/google/android",
+    "Lokhttp3/internal",
+    "Lokio/",
+    "Lmoshi/",
+    "Lorg/bouncycastle/",
+)
+
 
 class Backend:
     def __init__(self):
@@ -63,6 +92,7 @@ class Backend:
         self.session_script_override = None
         self.notes = {}
         self.aliases = {}
+        self.saved_graph = None
 
     def _refresh_method(self, object_id):
         """Refresh a method wrapper after Coeus reparses an edited DEX."""
@@ -190,6 +220,7 @@ class Backend:
     def load(self, path):
         self.ao = AnalyzeObject(path, False, -1)
         self.split_set = None
+        self.saved_graph = None
         self.session_origin = {"kind": "apk", "path": str(path)}
         self.session_events = []
         self.session_script_override = None
@@ -211,6 +242,7 @@ class Backend:
             "members": [],
             "notes": self.notes,
             "aliases": self.aliases,
+            "graph": self.saved_graph,
             "history": self._history(),
         }
 
@@ -220,6 +252,7 @@ class Backend:
             raise RuntimeError("select at least one APK for the split set")
         self.split_set = SplitApkSet(paths, False, -1)
         self.ao = self.split_set.get_base_apk()
+        self.saved_graph = None
         self.session_origin = {"kind": "split", "paths": paths}
         self.session_events = []
         self.session_script_override = None
@@ -241,6 +274,7 @@ class Backend:
             "members": self.split_set.get_names(),
             "notes": self.notes,
             "aliases": self.aliases,
+            "graph": self.saved_graph,
             "history": self._history(),
         }
 
@@ -256,6 +290,7 @@ class Backend:
             -1,
         )
         self.ao = self.split_set.get_base_apk()
+        self.saved_graph = None
         self.session_origin = {
             "kind": "adb",
             "package": package,
@@ -282,6 +317,7 @@ class Backend:
             "members": self.split_set.get_names(),
             "notes": self.notes,
             "aliases": self.aliases,
+            "graph": self.saved_graph,
             "history": self._history(),
         }
 
@@ -294,10 +330,14 @@ class Backend:
         self.session_script_override = None
         self.notes = {}
         self.aliases = {}
+        self.saved_graph = None
         try:
             with zipfile.ZipFile(path, "r") as archive:
                 metadata = json.loads(archive.read("gui/session.json").decode("utf-8"))
                 saved_script = archive.read("gui/session.py").decode("utf-8")
+            graph = metadata.get("graph")
+            if isinstance(graph, dict):
+                self.saved_graph = graph
             if saved_script.strip():
                 # The archive already contains the script for the edits that
                 # produced its embedded APK bytes. Replaying those events on
@@ -335,6 +375,7 @@ class Backend:
             "members": self.split_set.get_names(),
             "notes": self.notes,
             "aliases": self.aliases,
+            "graph": self.saved_graph,
             "history": self._history(),
         }
 
@@ -602,7 +643,7 @@ class Backend:
         ])
         return "\n".join(lines) + "\n"
 
-    def _write_project_metadata(self, path):
+    def _write_project_metadata(self, path, graph=None):
         metadata = {
             "format_version": 1,
             "origin": self.session_origin,
@@ -610,6 +651,7 @@ class Backend:
             "history": self._history(),
             "notes": self.notes,
             "aliases": self.aliases,
+            "graph": graph,
         }
         directory = str(Path(path).expanduser().resolve().parent)
         temporary = tempfile.NamedTemporaryFile(
@@ -635,7 +677,7 @@ class Backend:
             if os.path.exists(temporary_path):
                 os.unlink(temporary_path)
 
-    def save_project(self, path):
+    def save_project(self, path, graph=None):
         if self.ao is None:
             raise RuntimeError("load an APK before saving a project")
         path = str(path)
@@ -645,7 +687,7 @@ class Backend:
             self.ao.save_state(path)
         else:
             raise RuntimeError("the installed coeus_python wheel cannot save project state")
-        self._write_project_metadata(path)
+        self._write_project_metadata(path, graph)
         return {"path": path, "history": self._history(), "script": self.session_script()}
 
     def set_note(self, key, note):
@@ -1738,14 +1780,35 @@ class Backend:
             "count": len(found),
         }
 
-    def graph(self, object_id, graph_kind, ignore):
+    def _supergraph_class_filters(self, request_ignore, request):
+        filters = []
+        if request.get("exclude_android_framework", True):
+            filters.extend(ANDROID_FRAMEWORK_CLASS_FILTERS)
+        if request.get("exclude_language_runtime", True):
+            filters.extend(LANGUAGE_RUNTIME_CLASS_FILTERS)
+        if request.get("exclude_common_libraries", True):
+            filters.extend(COMMON_LIBRARY_CLASS_FILTERS)
+        filters.extend(
+            item.strip() for item in str(request_ignore).split(",") if item.strip()
+        )
+        return list(dict.fromkeys(filters))
+
+    def graph(self, object_id, graph_kind, ignore, request=None):
         if self.ao is None:
             raise RuntimeError("load an APK first")
         if graph_kind == "supergraph":
-            ignore_classes = [
-                item.strip() for item in ignore.split(",") if item.strip()
+            request = request or {}
+            ignore_classes = self._supergraph_class_filters(ignore, request)
+            dynamic_classes = [
+                item.strip()
+                for item in str(request.get("dynamic_argument_classes", "")).split(",")
+                if item.strip()
             ]
-            self.ao.build_supergraph(ignore_classes)
+            self.ao.build_supergraph_with_options(
+                ignore_classes,
+                bool(request.get("discover_dynamic_arguments", False)),
+                dynamic_classes,
+            )
             dot = self.ao.supergraph_to_dot()
         else:
             entry = self._entry(object_id)
@@ -2343,7 +2406,7 @@ class Backend:
         if op == "write":
             return self.write(request["path"])
         if op == "save_project":
-            return self.save_project(request["path"])
+            return self.save_project(request["path"], request.get("graph"))
         if op == "set_note":
             return self.set_note(request["key"], request.get("note", ""))
         if op == "set_alias":
@@ -2452,7 +2515,12 @@ class Backend:
         if op == "xrefs":
             return self.cross_references(request["id"])
         if op == "graph":
-            return self.graph(request.get("id"), request.get("kind", "callgraph"), request.get("ignore", ""))
+            return self.graph(
+                request.get("id"),
+                request.get("kind", "callgraph"),
+                request.get("ignore", ""),
+                request,
+            )
         if op == "graph_node_details":
             return self.graph_node_details(request.get("label", ""), request.get("node_id"))
         if op == "debug_connect":

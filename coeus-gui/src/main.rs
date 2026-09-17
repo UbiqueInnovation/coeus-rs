@@ -428,6 +428,15 @@ struct GraphState {
     zoom: f32,
     fit_to_view: bool,
     node_filters: HashSet<GraphNodeKind>,
+    exclude_android_framework: bool,
+    exclude_language_runtime: bool,
+    exclude_common_libraries: bool,
+    additional_class_filters: String,
+    discover_dynamic_arguments: bool,
+    dynamic_argument_classes: String,
+    node_search: String,
+    focus_node: Option<usize>,
+    last_edge_click: Option<(usize, usize, usize)>,
 }
 
 impl Default for GraphState {
@@ -452,6 +461,15 @@ impl Default for GraphState {
             zoom: 1.0,
             fit_to_view: true,
             node_filters: all_graph_node_kinds().into_iter().collect(),
+            exclude_android_framework: true,
+            exclude_language_runtime: true,
+            exclude_common_libraries: true,
+            additional_class_filters: String::new(),
+            discover_dynamic_arguments: false,
+            dynamic_argument_classes: String::new(),
+            node_search: String::new(),
+            focus_node: None,
+            last_edge_click: None,
         }
     }
 }
@@ -977,10 +995,8 @@ impl CoeusApp {
             .set_file_name("project.coeus")
             .save_file()
         {
-            self.request(
-                "save_project",
-                json!({"op": "save_project", "path": path.display().to_string()}),
-            );
+            let request = self.save_project_request(path.display().to_string());
+            self.request("save_project", request);
         }
     }
 
@@ -990,7 +1006,8 @@ impl CoeusApp {
             return;
         }
         let path = self.path.clone();
-        self.request("save_project", json!({"op": "save_project", "path": path}));
+        let request = self.save_project_request(path);
+        self.request("save_project", request);
     }
 
     fn session_save_path(&self) -> Option<String> {
@@ -1011,7 +1028,8 @@ impl CoeusApp {
             return;
         };
         self.pending_after_save = Some((operation.to_string(), request));
-        self.request("save_project", json!({"op": "save_project", "path": path}));
+        let request = self.save_project_request(path);
+        self.request("save_project", request);
         self.status = "Saving the current session before deployment…".to_string();
     }
 
@@ -1144,6 +1162,7 @@ impl CoeusApp {
                     "load" | "load_split" | "load_split_from_adb" | "load_project" => {
                         let package = value_string(&data, "package");
                         let manifest_xml = value_string(&data, "manifest");
+                        let saved_graph = data.get("graph").cloned();
                         let split_mode =
                             data.get("split").and_then(Value::as_bool).unwrap_or(false);
                         let split_members = data
@@ -1177,6 +1196,7 @@ impl CoeusApp {
                         self.described_result = None;
                         self.code = CodeState::default();
                         self.graph = GraphState::default();
+                        self.restore_saved_graph(saved_graph.as_ref());
                         self.string_editor = StringEditorState::default();
                         self.navigation_history.clear();
                         self.navigation_cursor = None;
@@ -1471,10 +1491,14 @@ impl CoeusApp {
                         self.graph.total_nodes = total_nodes;
                         self.graph.total_edges = total_edges;
                         self.graph.node_filters = all_graph_node_kinds().into_iter().collect();
+                        self.graph.node_search.clear();
+                        self.graph.focus_node = None;
+                        self.graph.last_edge_click = None;
                         self.rebuild_graph_layout();
                         self.graph_node_details = None;
                         self.graph.zoom = 1.0;
                         self.graph.fit_to_view = true;
+                        self.session_dirty = true;
                         self.status = format!(
                             "{} graph loaded ({} of {} nodes, {} edges)",
                             self.graph.kind,
@@ -2666,7 +2690,7 @@ impl CoeusApp {
                 ui.add(egui::Label::new(RichText::new(&editor.method_label).strong().monospace()).wrap());
                 ui.label(
                     RichText::new(
-                        "Enter primitive values, strings, or byte arrays (JSON, for example [1, 2] or hex:0011).",
+                        "Enter primitive values, strings, or byte arrays (JSON, for example [1, 2] or hex:0011). Object arguments are allocated as empty instances; use null when needed.",
                     )
                     .small()
                     .color(theme::MUTED),
@@ -2896,7 +2920,7 @@ impl CoeusApp {
         let (layout_min, layout_max) = layout_bounds(
             nodes.iter().map(|(id, _)| *id),
             &self.graph.layout,
-            Vec2::new(250.0, 72.0),
+            GRAPH_NODE_SIZE,
         );
         let (layout_edge_index, layout_long_edges) =
             graph_layout_edge_index(&edges, &self.graph.layout);
@@ -2936,6 +2960,128 @@ impl CoeusApp {
         self.graph.layout_long_edges = layout_long_edges;
         self.graph.minimap_nodes = minimap_nodes;
         self.graph.minimap_edges = minimap_edges;
+    }
+
+    fn supergraph_request(&self) -> Value {
+        json!({
+            "op": "graph",
+            "kind": "supergraph",
+            "ignore": self.graph.additional_class_filters,
+            "exclude_android_framework": self.graph.exclude_android_framework,
+            "exclude_language_runtime": self.graph.exclude_language_runtime,
+            "exclude_common_libraries": self.graph.exclude_common_libraries,
+            "discover_dynamic_arguments": self.graph.discover_dynamic_arguments,
+            "dynamic_argument_classes": self.graph.dynamic_argument_classes,
+        })
+    }
+
+    fn graph_session_data(&self) -> Value {
+        if self.graph.dot.is_empty() {
+            return Value::Null;
+        }
+        let node_filters = all_graph_node_kinds()
+            .into_iter()
+            .filter(|kind| self.graph.node_filters.contains(kind))
+            .map(|kind| kind.label())
+            .collect::<Vec<_>>();
+        json!({
+            "kind": self.graph.kind,
+            "dot": self.graph.dot,
+            "node_filters": node_filters,
+            "options": {
+                "exclude_android_framework": self.graph.exclude_android_framework,
+                "exclude_language_runtime": self.graph.exclude_language_runtime,
+                "exclude_common_libraries": self.graph.exclude_common_libraries,
+                "additional_class_filters": self.graph.additional_class_filters,
+                "discover_dynamic_arguments": self.graph.discover_dynamic_arguments,
+                "dynamic_argument_classes": self.graph.dynamic_argument_classes,
+            },
+        })
+    }
+
+    fn save_project_request(&self, path: String) -> Value {
+        json!({
+            "op": "save_project",
+            "path": path,
+            "graph": self.graph_session_data(),
+        })
+    }
+
+    fn restore_saved_graph(&mut self, saved_graph: Option<&Value>) {
+        let Some(saved_graph) = saved_graph.filter(|value| value.is_object()) else {
+            return;
+        };
+        let dot = value_string(saved_graph, "dot");
+        if dot.is_empty() {
+            return;
+        }
+        self.graph.kind = value_string(saved_graph, "kind");
+        self.graph.dot = dot;
+        let (nodes, edges, total_nodes, total_edges) = parse_dot(&self.graph.dot);
+        self.graph.nodes = nodes;
+        self.graph.node_index = self
+            .graph
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, (id, _))| (*id, index))
+            .collect();
+        self.graph.edges = edges;
+        self.graph.edge_index = graph_edge_index(&self.graph.edges);
+        self.graph.total_nodes = total_nodes;
+        self.graph.total_edges = total_edges;
+        if let Some(filters) = saved_graph.get("node_filters").and_then(Value::as_array) {
+            self.graph.node_filters = filters
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|label| {
+                    all_graph_node_kinds()
+                        .into_iter()
+                        .find(|kind| kind.label() == label)
+                })
+                .collect();
+        }
+        if let Some(options) = saved_graph.get("options") {
+            if let Some(value) = options
+                .get("exclude_android_framework")
+                .and_then(Value::as_bool)
+            {
+                self.graph.exclude_android_framework = value;
+            }
+            if let Some(value) = options
+                .get("exclude_language_runtime")
+                .and_then(Value::as_bool)
+            {
+                self.graph.exclude_language_runtime = value;
+            }
+            if let Some(value) = options
+                .get("exclude_common_libraries")
+                .and_then(Value::as_bool)
+            {
+                self.graph.exclude_common_libraries = value;
+            }
+            if let Some(value) = options
+                .get("additional_class_filters")
+                .and_then(Value::as_str)
+            {
+                self.graph.additional_class_filters = value.to_string();
+            }
+            if let Some(value) = options
+                .get("discover_dynamic_arguments")
+                .and_then(Value::as_bool)
+            {
+                self.graph.discover_dynamic_arguments = value;
+            }
+            if let Some(value) = options
+                .get("dynamic_argument_classes")
+                .and_then(Value::as_str)
+            {
+                self.graph.dynamic_argument_classes = value.to_string();
+            }
+        }
+        self.rebuild_graph_layout();
+        self.graph.zoom = 1.0;
+        self.graph.fit_to_view = true;
     }
 
     fn show_welcome(&mut self, ui: &mut egui::Ui) {
@@ -3093,10 +3239,7 @@ impl CoeusApp {
                                 .clicked()
                             {
                                 if let Some(path) = self.session_save_path() {
-                                    self.request(
-                                        "save_project",
-                                        json!({"op": "save_project", "path": path}),
-                                    );
+                                    self.request("save_project", self.save_project_request(path));
                                 }
                             }
                             ui.label(
@@ -3905,10 +4048,8 @@ impl CoeusApp {
                     self.instruction_pane_collapsed = !self.instruction_pane_collapsed;
                 }
                 if ui.button("Supergraph").clicked() && self.info.is_some() {
-                    self.request(
-                        "graph",
-                        json!({"op":"graph", "kind":"supergraph", "ignore":""}),
-                    );
+                    let request = self.supergraph_request();
+                    self.request("graph", request);
                     self.tab = Tab::Graph;
                 }
             });
@@ -4856,10 +4997,8 @@ impl CoeusApp {
                 )
                 .clicked()
             {
-                self.request(
-                    "graph",
-                    json!({"op":"graph", "kind":"supergraph", "ignore":""}),
-                );
+                let request = self.supergraph_request();
+                self.request("graph", request);
             }
             if ui
                 .add_enabled(
@@ -4876,6 +5015,78 @@ impl CoeusApp {
                 self.graph.fit_to_view = false;
             }
         });
+        let build_options_before = (
+            self.graph.exclude_android_framework,
+            self.graph.exclude_language_runtime,
+            self.graph.exclude_common_libraries,
+            self.graph.additional_class_filters.clone(),
+            self.graph.discover_dynamic_arguments,
+            self.graph.dynamic_argument_classes.clone(),
+        );
+        ui.collapsing("Supergraph build options", |ui| {
+            ui.label(
+                RichText::new(
+                    "These options are used the next time you build the supergraph. Class filters match DEX descriptors or package prefixes.",
+                )
+                .small()
+                .color(theme::MUTED),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(
+                    &mut self.graph.exclude_android_framework,
+                    "Filter Android UI/framework classes",
+                )
+                .on_hover_text(
+                    "Excludes common android.app/content/graphics/os/text/util/view/widget packages; java.security and javax.crypto remain available.",
+                );
+                ui.checkbox(
+                    &mut self.graph.exclude_language_runtime,
+                    "Filter language/runtime internals",
+                )
+                .on_hover_text("Filters Kotlin, desugared Java, AndroidX, and JDK implementation classes.");
+                ui.checkbox(
+                    &mut self.graph.exclude_common_libraries,
+                    "Filter common bundled libraries",
+                )
+                .on_hover_text("Filters generated/support-heavy protobuf, Google, OkHttp, Moshi, Okio, and Bouncy Castle packages.");
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Additional class filters");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.graph.additional_class_filters)
+                        .desired_width(360.0)
+                        .hint_text("comma-separated prefixes, e.g. Lcom/example/generated"),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(
+                    &mut self.graph.discover_dynamic_arguments,
+                    "Discover dynamic arguments and returns",
+                )
+                .on_hover_text(
+                    "Emulates included methods and class initializers to add runtime-discovered argument and return values; this can make graph building substantially slower.",
+                );
+                if self.graph.discover_dynamic_arguments {
+                    ui.label("Classes");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.graph.dynamic_argument_classes)
+                            .desired_width(300.0)
+                            .hint_text("blank = all included classes; otherwise exact descriptors"),
+                    );
+                }
+            });
+        });
+        let build_options_after = (
+            self.graph.exclude_android_framework,
+            self.graph.exclude_language_runtime,
+            self.graph.exclude_common_libraries,
+            self.graph.additional_class_filters.clone(),
+            self.graph.discover_dynamic_arguments,
+            self.graph.dynamic_argument_classes.clone(),
+        );
+        if build_options_before != build_options_after {
+            self.session_dirty = true;
+        }
         if self.graph.nodes.is_empty() {
             theme::empty_state(ui, "See how the pieces connect", "Build a supergraph to explore the application, or open a method from search and build its call graph.");
             return;
@@ -4912,6 +5123,7 @@ impl CoeusApp {
             self.graph.node_filters = filters;
             self.rebuild_graph_layout();
             self.graph.fit_to_view = true;
+            self.session_dirty = true;
         }
         if self.graph.dot.is_empty() {
             ui.add_space(20.0);
@@ -4919,6 +5131,60 @@ impl CoeusApp {
                 ui.label("Build a callgraph from Code or load the complete supergraph.")
             });
             return;
+        }
+        let search_response = ui
+            .add(
+                egui::TextEdit::singleline(&mut self.graph.node_search)
+                    .desired_width(ui.available_width().min(520.0))
+                    .hint_text("Find a node by class, method, field, string, or descriptor"),
+            )
+            .on_hover_text("Search visible graph nodes; press Enter to center the first match");
+        let search_query = self.graph.node_search.trim().to_string();
+        let search_matches =
+            graph_search_matches(&self.graph.nodes, &self.graph.node_filters, &search_query);
+        let activate_first =
+            search_response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+        let mut focus_node = activate_first
+            .then(|| search_matches.first().map(|(id, _, _)| *id))
+            .flatten();
+        if !search_matches.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{} matching visible node{}",
+                        search_matches.len(),
+                        if search_matches.len() == 1 { "" } else { "s" }
+                    ))
+                    .small()
+                    .color(theme::MUTED),
+                );
+                if ui.button("Center first").clicked() {
+                    focus_node = search_matches.first().map(|(id, _, _)| *id);
+                }
+            });
+            egui::ScrollArea::vertical()
+                .id_salt("graph-node-search-results")
+                .max_height(128.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (id, display, label) in search_matches.iter().take(100) {
+                        let response = ui
+                            .selectable_label(false, format!("#{id}  {}", shorten(display, 96)))
+                            .on_hover_text(label);
+                        if response.clicked() {
+                            focus_node = Some(*id);
+                        }
+                    }
+                });
+        } else if !search_query.is_empty() {
+            ui.label(
+                RichText::new("No visible nodes match that search")
+                    .small()
+                    .color(theme::WARNING),
+            );
+        }
+        if let Some(node_id) = focus_node {
+            self.graph.focus_node = Some(node_id);
         }
         ui.horizontal_wrapped(|ui| {
             ui.label(
@@ -4973,7 +5239,7 @@ impl CoeusApp {
 
     fn render_graph_canvas(&mut self, ui: &mut egui::Ui) {
         let viewport = ui.available_size();
-        let base_node_size = Vec2::new(250.0, 72.0);
+        let base_node_size = GRAPH_NODE_SIZE;
         let min = self.graph.layout_min;
         let max = self.graph.layout_max;
         let logical_size = (max - min).max(Vec2::new(1.0, 1.0));
@@ -5009,6 +5275,9 @@ impl CoeusApp {
         let graph_minimap_nodes = &self.graph.minimap_nodes;
         let graph_minimap_edges = &self.graph.minimap_edges;
         let mut clicked_node = None;
+        let focus_node = self.graph.focus_node.take();
+        let last_edge_click = self.graph.last_edge_click;
+        let mut next_edge_click = None;
         let mut cluster_zoom_requested = false;
         let mut minimap_target = None;
         egui::Frame::new()
@@ -5054,6 +5323,9 @@ impl CoeusApp {
                             .hover_pos()
                             .is_some_and(|point| minimap_rect.contains(point))
                     });
+                    let track_edge_click =
+                        !pointer_over_minimap && ui.input(|input| input.pointer.primary_clicked());
+                    let mut edge_hit_segments = Vec::new();
                     let origin = rect.left_top() + Vec2::new(40.0, 40.0) - min * zoom;
                     let clip_rect = ui.clip_rect().expand(24.0);
                     let node_rect = |id: usize| {
@@ -5102,6 +5374,11 @@ impl CoeusApp {
                             .collect::<Vec<_>>();
                         candidate_ids
                             .into_iter()
+                            // A dense supergraph can contain far more nodes than can
+                            // be meaningfully interacted with at this zoom level.
+                            // Keep the frame bounded while the minimap still exposes
+                            // the complete layout.
+                            .take(MAX_RENDERED_GRAPH_NODES)
                             .filter_map(|id| {
                                 let index = graph_node_index.get(&id)?;
                                 let (_, label) = graph_nodes.get(*index)?;
@@ -5184,7 +5461,7 @@ impl CoeusApp {
                             label,
                         });
                     }
-                    let mut edges = HashSet::new();
+                    let mut edges = HashSet::with_capacity(MAX_RENDERED_GRAPH_EDGES);
                     if !overview_mode {
                         let edge_query_min = logical_clip_min - base_node_size;
                         let edge_query_max = logical_clip_max + base_node_size;
@@ -5196,31 +5473,54 @@ impl CoeusApp {
                             (edge_query_max.x / GRAPH_LAYOUT_CELL_SIZE).floor() as i32,
                             (edge_query_max.y / GRAPH_LAYOUT_CELL_SIZE).floor() as i32,
                         );
-                        for cell_y in edge_min_cell.1..=edge_max_cell.1 {
+                        'edge_cells: for cell_y in edge_min_cell.1..=edge_max_cell.1 {
                             for cell_x in edge_min_cell.0..=edge_max_cell.0 {
+                                if edges.len() >= MAX_RENDERED_GRAPH_EDGES {
+                                    break 'edge_cells;
+                                }
                                 if let Some(cell_edges) =
                                     graph_layout_edge_index.get(&(cell_x, cell_y))
                                 {
-                                    edges.extend(cell_edges.iter().copied());
+                                    for edge in cell_edges {
+                                        if edges.len() >= MAX_RENDERED_GRAPH_EDGES {
+                                            break 'edge_cells;
+                                        }
+                                        edges.insert(*edge);
+                                    }
                                 }
                             }
                         }
-                        edges.extend(graph_layout_long_edges.iter().copied());
+                        if edges.len() < MAX_RENDERED_GRAPH_EDGES {
+                            edges.extend(
+                                graph_layout_long_edges
+                                    .iter()
+                                    .take(MAX_RENDERED_GRAPH_EDGES - edges.len())
+                                    .copied(),
+                            );
+                        }
                     }
                     let label_for = |id: usize| {
                         label_for_node(id, graph_node_index, graph_nodes).unwrap_or_default()
+                    };
+                    let edge_segment = |from_rect: Rect, to_rect: Rect| {
+                        let direction = to_rect.center() - from_rect.center();
+                        if direction.length_sq() <= f32::EPSILON {
+                            return None;
+                        }
+                        let unit = direction.normalized();
+                        Some((
+                            rect_boundary_point(from_rect, unit),
+                            rect_boundary_point(to_rect, -unit),
+                        ))
                     };
                     let draw_edge = |from_rect: Rect,
                                      to_rect: Rect,
                                      edge_kind: GraphEdgeKind,
                                      width_scale: f32| {
-                        let direction = to_rect.center() - from_rect.center();
-                        if direction.length_sq() <= f32::EPSILON {
+                        let Some((start, end)) = edge_segment(from_rect, to_rect) else {
                             return;
-                        }
-                        let unit = direction.normalized();
-                        let start = rect_boundary_point(from_rect, unit);
-                        let end = rect_boundary_point(to_rect, -unit);
+                        };
+                        let unit = (to_rect.center() - from_rect.center()).normalized();
                         if !Rect::from_two_pos(start, end)
                             .expand(4.0)
                             .intersects(clip_rect)
@@ -5261,7 +5561,7 @@ impl CoeusApp {
                     } else if let Some(cluster_size) = cluster_size {
                         let mut grouped_edges = HashMap::<
                             ((i32, i32), (i32, i32), GraphEdgeKind),
-                            (Vec2, Vec2, usize),
+                            (Vec2, Vec2, usize, usize, usize),
                         >::new();
                         for &(from, to) in &edges {
                             let (Some(from_rect), Some(to_rect)) = (node_rect(from), node_rect(to))
@@ -5287,22 +5587,28 @@ impl CoeusApp {
                             );
                             let entry = grouped_edges
                                 .entry((from_key, to_key, edge_kind))
-                                .or_insert((Vec2::ZERO, Vec2::ZERO, 0));
+                                .or_insert((Vec2::ZERO, Vec2::ZERO, 0, from, to));
                             entry.0 += from_center.to_vec2();
                             entry.1 += to_center.to_vec2();
                             entry.2 += 1;
                         }
-                        for ((_, _, edge_kind), (from_sum, to_sum, count)) in grouped_edges {
+                        for ((_, _, edge_kind), (from_sum, to_sum, count, from, to)) in
+                            grouped_edges
+                        {
                             let from_center = from_sum / count as f32;
                             let to_center = to_sum / count as f32;
                             let endpoint_size = Vec2::splat(cluster_size.min(24.0));
                             let width_scale = (1.0 + (count as f32).log2() * 0.15).min(2.0);
-                            draw_edge(
-                                Rect::from_center_size(from_center.to_pos2(), endpoint_size),
-                                Rect::from_center_size(to_center.to_pos2(), endpoint_size),
-                                edge_kind,
-                                width_scale,
-                            );
+                            let from_rect =
+                                Rect::from_center_size(from_center.to_pos2(), endpoint_size);
+                            let to_rect =
+                                Rect::from_center_size(to_center.to_pos2(), endpoint_size);
+                            if track_edge_click {
+                                if let Some((start, end)) = edge_segment(from_rect, to_rect) {
+                                    edge_hit_segments.push((start, end, from, to));
+                                }
+                            }
+                            draw_edge(from_rect, to_rect, edge_kind, width_scale);
                         }
                     } else {
                         for &(from, to) in &edges {
@@ -5311,6 +5617,11 @@ impl CoeusApp {
                                 continue;
                             };
                             let edge_kind = graph_edge_kind(label_for(from), label_for(to));
+                            if track_edge_click {
+                                if let Some((start, end)) = edge_segment(from_rect, to_rect) {
+                                    edge_hit_segments.push((start, end, from, to));
+                                }
+                            }
                             draw_edge(from_rect, to_rect, edge_kind, 1.0);
                         }
                     }
@@ -5321,32 +5632,35 @@ impl CoeusApp {
                         let group_size = render_node.ids.len();
                         let (fill, stroke) = graph_node_colors(kind);
                         paint_graph_node(&painter, node_rect, kind, fill, stroke);
-                        let node_text = if group_size > 1 {
-                            format!("{}\n{}", group_size, shorten(label, 24))
-                        } else if zoom < 0.45 {
-                            format!("#{}", render_node.ids[0])
-                        } else {
-                            let max_chars = if zoom < 0.7 { 28 } else { 58 };
-                            let display = graph_display_label(label, kind, zoom < 0.7);
-                            format!("{}\n{}", kind.label(), shorten(&display, max_chars))
-                        };
-                        let font_size = (12.0 * zoom).clamp(7.0, 14.0);
-                        let text_width = match kind {
-                            GraphNodeKind::Class => node_rect.width() * 0.55,
-                            GraphNodeKind::String => node_rect.width() * 0.65,
-                            _ => node_rect.width() - 14.0 * zoom,
-                        };
-                        let galley = painter.layout(
-                            node_text,
-                            FontId::monospace(font_size),
-                            Color32::WHITE,
-                            text_width.max(24.0),
-                        );
-                        painter.galley(
-                            node_rect.center() - galley.size() / 2.0,
-                            galley,
-                            Color32::WHITE,
-                        );
+                        // At overview zoom the node shapes still provide useful
+                        // structure, but laying out thousands of labels dominates
+                        // frame time and gives the GPU very little to do.
+                        if zoom >= 0.45 || group_size > 1 {
+                            let node_text = if group_size > 1 {
+                                format!("{}\n{}", group_size, shorten(label, 24))
+                            } else {
+                                let max_chars = if zoom < 0.7 { 28 } else { 58 };
+                                let display = graph_display_label(label, kind, zoom < 0.7);
+                                format!("{}\n{}", kind.label(), shorten(&display, max_chars))
+                            };
+                            let font_size = (12.0 * zoom).clamp(7.0, 14.0);
+                            let text_width = match kind {
+                                GraphNodeKind::Class => node_rect.width() * 0.55,
+                                GraphNodeKind::String => node_rect.width() * 0.65,
+                                _ => node_rect.width() - 14.0 * zoom,
+                            };
+                            let galley = painter.layout(
+                                node_text,
+                                FontId::monospace(font_size),
+                                Color32::WHITE,
+                                text_width.max(24.0),
+                            );
+                            painter.galley(
+                                node_rect.center() - galley.size() / 2.0,
+                                galley,
+                                Color32::WHITE,
+                            );
+                        }
                         let node_id = render_node.ids[0];
                         let response = ui.interact(
                             node_rect,
@@ -5363,6 +5677,63 @@ impl CoeusApp {
                             response.on_hover_text(label.as_str());
                             if clicked {
                                 clicked_node = Some((node_id, label.clone()));
+                            }
+                        }
+                    }
+                    if track_edge_click && clicked_node.is_none() && !cluster_zoom_requested {
+                        if let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) {
+                            let mut best = None;
+                            for (start, end, from, to) in edge_hit_segments {
+                                let distance = distance_to_segment(pointer, start, end);
+                                if distance > 10.0 {
+                                    continue;
+                                }
+                                if best.map_or(true, |(best_distance, _, _, _, _)| {
+                                    distance < best_distance
+                                }) {
+                                    best = Some((distance, from, to, start, end));
+                                }
+                            }
+                            if let Some((_, from, to, start, end)) = best {
+                                let from_position = graph_layout
+                                    .get(&from)
+                                    .map(|position| origin + *position * zoom)
+                                    .unwrap_or(start);
+                                let to_position = graph_layout
+                                    .get(&to)
+                                    .map(|position| origin + *position * zoom)
+                                    .unwrap_or(end);
+                                // Select the endpoint farther from the click. This makes
+                                // an edge click move across the relationship instead of
+                                // reopening the node immediately beside the pointer.
+                                let farther_target = if pointer.distance_sq(from_position)
+                                    >= pointer.distance_sq(to_position)
+                                {
+                                    from
+                                } else {
+                                    to
+                                };
+                                let target = if last_edge_click.is_some_and(
+                                    |(last_from, last_to, last_target)| {
+                                        last_from == from
+                                            && last_to == to
+                                            && last_target == farther_target
+                                    },
+                                ) {
+                                    if farther_target == from {
+                                        to
+                                    } else {
+                                        from
+                                    }
+                                } else {
+                                    farther_target
+                                };
+                                next_edge_click = Some((from, to, target));
+                                if let Some(label) =
+                                    label_for_node(target, graph_node_index, graph_nodes)
+                                {
+                                    clicked_node = Some((target, label.to_string()));
+                                }
                             }
                         }
                     }
@@ -5437,7 +5808,9 @@ impl CoeusApp {
                         );
                     }
                 });
-                if let Some(target) = minimap_target {
+                let focus_target =
+                    focus_node.and_then(|node_id| graph_layout.get(&node_id).copied());
+                if let Some(target) = minimap_target.or(focus_target) {
                     output.state.offset = graph_center_offset(
                         target,
                         min,
@@ -5449,6 +5822,12 @@ impl CoeusApp {
                     ui.ctx().request_repaint();
                 }
             });
+        if let Some(edge_click) = next_edge_click {
+            self.graph.last_edge_click = Some(edge_click);
+            self.graph.focus_node = Some(edge_click.2);
+        } else if clicked_node.is_some() {
+            self.graph.last_edge_click = None;
+        }
         if cluster_zoom_requested {
             self.graph.zoom = (zoom * 1.6).clamp(0.03, 3.0);
             self.graph.fit_to_view = false;
@@ -6834,6 +7213,7 @@ fn emulation_default_value(descriptor: &str) -> String {
         "Z" => "false".to_string(),
         "Ljava/lang/String;" => String::new(),
         d if d.starts_with('[') => "[]".to_string(),
+        d if d.starts_with('L') => "new".to_string(),
         _ => "0".to_string(),
     }
 }
@@ -7562,6 +7942,9 @@ fn label_for_node<'a>(
 }
 
 const GRAPH_LAYOUT_CELL_SIZE: f32 = 800.0;
+const GRAPH_NODE_SIZE: Vec2 = Vec2::new(280.0, 84.0);
+const MAX_RENDERED_GRAPH_NODES: usize = 5_000;
+const MAX_RENDERED_GRAPH_EDGES: usize = 12_000;
 
 fn graph_layout_index(
     nodes: &[(usize, String)],
@@ -7835,6 +8218,48 @@ fn graph_display_label(label: &str, kind: GraphNodeKind, compact: bool) -> Strin
     }
 }
 
+fn graph_search_matches(
+    nodes: &[(usize, String)],
+    filters: &HashSet<GraphNodeKind>,
+    query: &str,
+) -> Vec<(usize, String, String)> {
+    let query = query.to_ascii_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = nodes
+        .iter()
+        .filter_map(|(id, label)| {
+            let kind = graph_node_kind(label);
+            if !filters.contains(&kind) {
+                return None;
+            }
+            let display = graph_display_label(label, kind, false);
+            let compact = graph_display_label(label, kind, true);
+            let display_lower = display.to_ascii_lowercase();
+            let compact_lower = compact.to_ascii_lowercase();
+            let label_lower = label.to_ascii_lowercase();
+            let score = if display_lower == query || compact_lower == query {
+                0
+            } else if display_lower.starts_with(&query) || compact_lower.starts_with(&query) {
+                1
+            } else if display_lower.contains(&query) || compact_lower.contains(&query) {
+                2
+            } else if label_lower.contains(&query) {
+                3
+            } else {
+                return None;
+            };
+            Some((score, *id, display, label.clone()))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(score, id, _, _)| (*score, *id));
+    matches
+        .into_iter()
+        .map(|(_, id, display, label)| (id, display, label))
+        .collect()
+}
+
 fn is_argument_node(label: &str) -> bool {
     label.contains("static_argument:")
         || label.contains("dynamic_argument:")
@@ -8002,6 +8427,16 @@ fn rect_boundary_point(rect: Rect, direction: Vec2) -> egui::Pos2 {
     rect.center() + direction * horizontal.min(vertical)
 }
 
+fn distance_to_segment(point: egui::Pos2, start: egui::Pos2, end: egui::Pos2) -> f32 {
+    let segment = end - start;
+    let length_sq = segment.length_sq();
+    if length_sq <= f32::EPSILON {
+        return point.distance(start);
+    }
+    let fraction = ((point - start).dot(segment) / length_sq).clamp(0.0, 1.0);
+    point.distance(start + segment * fraction)
+}
+
 fn graph_scroll_zoom(input: &mut egui::InputState, viewport: Rect) -> f32 {
     if !input.modifiers.command
         || !input
@@ -8116,11 +8551,11 @@ fn layout_clustered_graph(
             // Chord distance, rather than arc length, preserves the gap even
             // in small rings. Each ring must also clear the previous ring.
             let required_radius = if count > 1 {
-                440.0 / (2.0 * (pi / count as f32).sin())
+                300.0 / (2.0 * (pi / count as f32).sin())
             } else {
                 0.0
             };
-            let radius = (previous_radius + 420.0).max(600.0).max(required_radius);
+            let radius = (previous_radius + 300.0).max(360.0).max(required_radius);
             previous_radius = radius;
             let offset = if distance % 2 == 0 {
                 0.0
@@ -8164,18 +8599,21 @@ fn layout_clustered_graph(
     let mut cursor = Vec2::ZERO;
     let mut row_height: f32 = 0.0;
     let max_row_width = 6000.0;
-    let component_gap = 440.0;
+    let component_gap = 80.0;
     for (_, component, min, max) in components {
         let size = max - min;
-        let width = size.x + 280.0;
-        let height = size.y + 280.0;
+        // `min` and `max` describe node centers. Add exactly one node's
+        // extent here so packed components clear one another without the
+        // large double-padding that previously made the graph feel sparse.
+        let width = size.x + GRAPH_NODE_SIZE.x;
+        let height = size.y + GRAPH_NODE_SIZE.y;
         if cursor.x > 0.0 && cursor.x + width > max_row_width {
             cursor.x = 0.0;
             cursor.y += row_height + component_gap;
             row_height = 0.0;
         }
         for (id, position) in component {
-            positions.insert(id, cursor + position - min + Vec2::splat(140.0));
+            positions.insert(id, cursor + position - min + GRAPH_NODE_SIZE / 2.0);
         }
         cursor.x += width + component_gap;
         row_height = row_height.max(height);
@@ -8251,8 +8689,8 @@ fn layout_graph(nodes: &[(usize, String)], edges: &[(usize, usize)]) -> HashMap<
         layers[rank].push(index);
     }
 
-    let horizontal_spacing = 440.0;
-    let vertical_spacing = 240.0;
+    let horizontal_spacing = 320.0;
+    let vertical_spacing = 150.0;
     let mut positions = vec![Vec2::ZERO; node_count];
     for (rank, layer) in layers.iter().enumerate() {
         let width = layer.len().saturating_sub(1) as f32 * horizontal_spacing;
@@ -8290,6 +8728,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([950.0, 650.0]),
+        hardware_acceleration: eframe::HardwareAcceleration::Preferred,
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     eframe::run_native(
@@ -8409,10 +8849,10 @@ mod tests {
         let center = layout[&0];
         let first_radius = (layout[&1] - center).length();
         let second_radius = (layout[&31] - center).length();
-        assert!(second_radius >= first_radius + 419.0);
+        assert!(second_radius >= first_radius + 299.0);
         for left in 0..32 {
             for right in left + 1..32 {
-                assert!((layout[&left] - layout[&right]).length() >= 419.0);
+                assert!((layout[&left] - layout[&right]).length() >= 299.0);
             }
         }
     }

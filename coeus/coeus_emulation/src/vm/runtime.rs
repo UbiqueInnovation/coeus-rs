@@ -16,10 +16,16 @@ use super::{ClassInstance, InternalObject, Register, VMException, Value, VM};
 pub trait JavaObject {
     fn class_name() -> String;
     fn call(fn_name: &str, vm: &mut VM, args: &[Register]) -> Result<(), VMException>;
-    fn init(vm: &mut VM, _args: &[Register]) -> Result<(), VMException> {
-        let instance = ClassInstance::new(VM_BUILTINS[&Self::class_name()].clone());
-        let register = vm.new_instance(Self::class_name(), Value::Object(instance))?;
-        vm.current_state.return_reg = register;
+    fn init(vm: &mut VM, args: &[Register]) -> Result<(), VMException> {
+        let Some(Register::Reference(_, address)) = args.first() else {
+            return Err(VMException::WrongNumberOfArguments);
+        };
+        if !matches!(vm.heap.get(address), Some(Value::Object(_))) {
+            return Err(VMException::InvalidRegisterType);
+        }
+        // `<init>` initializes the object allocated by `new-instance`; it must
+        // not replace that object with a second allocation.
+        vm.current_state.return_reg = args[0].clone();
         Ok(())
     }
     fn cinit(_vm: &mut VM, _args: &[Register]) -> Result<(), VMException> {

@@ -346,6 +346,28 @@ impl VM {
             Err(VMException::OutOfMemory)
         }
     }
+    /// Allocate an object for a class known to the VM.
+    ///
+    /// The returned reference is suitable for use as the receiver (`this`) of
+    /// an instance method. Constructors are invoked separately, just like
+    /// they are in dex bytecode (`new-instance` followed by `invoke-direct`).
+    pub fn new_class_instance(&mut self, class_name: &str) -> Result<Register, VMException> {
+        let class = self
+            .dex_file
+            .get_class_by_name(class_name)
+            .or_else(|| {
+                self.runtime
+                    .iter()
+                    .find_map(|dex| dex.get_class_by_name(class_name))
+            })
+            .or_else(|| self.builtins.get(class_name).cloned())
+            .ok_or(VMException::ClassNotFound(0))?;
+
+        self.new_instance(
+            class_name.to_string(),
+            Value::Object(ClassInstance::new(class)),
+        )
+    }
     pub fn get_registers(&self) -> Vec<Register> {
         self.current_state.current_stackframe.clone()
     }
@@ -1902,8 +1924,8 @@ impl VM {
                     return Err(VMException::LinkerError);
                 }
 
-                Instruction::InvokeSuper(_, _, _) => {}
                 Instruction::InvokeVirtual(_, method_ref, argument_registers)
+                | Instruction::InvokeSuper(_, method_ref, argument_registers)
                 | Instruction::InvokeDirect(_, method_ref, argument_registers) => {
                     if self.stack_frames.len() > 50 {
                         return Err(VMException::StackOverflow);
@@ -3193,5 +3215,84 @@ impl Register {
             Register::Null => 0,
             _ => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coeus_models::models::DexHeader;
+
+    fn test_dex(class: Arc<Class>) -> Arc<DexFile> {
+        Arc::new(DexFile {
+            identifier: "test.dex".to_string(),
+            raw_data: Vec::new(),
+            file_name: "test.dex".to_string(),
+            // The VM only needs the parsed class table for this test.
+            header: unsafe { std::mem::zeroed::<DexHeader>() },
+            strings: Vec::new(),
+            types: Vec::new(),
+            methods: Vec::new(),
+            protos: Vec::new(),
+            fields: Vec::new(),
+            classes: vec![class],
+            interface_table: HashMap::new(),
+            superclass_table: HashMap::new(),
+        })
+    }
+
+    #[test]
+    fn class_instances_can_be_used_as_instance_method_receivers() {
+        let class = Arc::new(Class::new(
+            "test.dex".to_string(),
+            0,
+            "Ltest/Receiver;".to_string(),
+        ));
+        let dex = test_dex(class.clone());
+        let mut vm = VM::new(dex, Vec::new(), Arc::new(HashMap::new()));
+
+        let receiver = vm.new_class_instance(&class.class_name).unwrap();
+        let Register::Reference(_, address) = receiver.clone() else {
+            panic!("class instance did not return a reference");
+        };
+        assert!(
+            matches!(vm.get_heap_ref().get(&address), Some(Value::Object(instance))
+                if instance.class.class_name == class.class_name)
+        );
+
+        let code = CodeItem {
+            code_off: 0,
+            register_size: 1,
+            ins_size: 1,
+            outs_size: 0,
+            tries_size: 0,
+            debug_info_off: 0,
+            insns_size: 1,
+            insns: vec![(
+                InstructionSize(1),
+                InstructionOffset(0),
+                Instruction::Return(0),
+            )],
+            array_data: Vec::new(),
+            switch_data: Vec::new(),
+        };
+        vm.start(0, "test.dex", &code, vec![receiver.clone()])
+            .unwrap();
+        assert_eq!(vm.get_current_state().return_reg, receiver);
+
+        let object = vm.new_class_instance("Ljava/lang/Object;").unwrap();
+        let constructor = Arc::new(Method {
+            class_idx: 0,
+            method_idx: 0,
+            proto_idx: 0,
+            name_idx: 0,
+            method_name: "<init>".to_string(),
+            proto_name: "()V".to_string(),
+        });
+        let heap_size = vm.get_heap_ref().len();
+        vm.invoke_runtime_with_method("Ljava/lang/Object;", constructor, vec![object.clone()])
+            .unwrap();
+        assert_eq!(vm.get_heap_ref().len(), heap_size);
+        assert_eq!(vm.get_current_state().return_reg, object);
     }
 }

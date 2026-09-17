@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 coeus = { path = "../coeus" }
-eframe = "0.31"
+eframe = { version = "0.31", features = ["wgpu"] }
 rfd = "0.15"
 regex = "1.11.1"
 serde_json = "1.0"

@@ -17,7 +17,7 @@ use coeus::{
         instruction_flow::{Branch, InstructionFlow, LastInstruction, State},
         Context,
     },
-    coeus_emulation::vm::{runtime::StringClass, Register, Value, VM},
+    coeus_emulation::vm::{runtime::StringClass, ClassInstance, Register, Value, VM},
     coeus_models::models::{
         self, AccessFlags, BinaryObject, DexFile, EncodedItem, Instruction as DexInstructionModel,
         InstructionOffset, TestFunction,
@@ -2531,10 +2531,24 @@ const {function_name} = {class_without_pkg}.{function_name}.overload({arguments}
                             }
                         }
                         ty => {
-                            return Err(PyRuntimeError::new_err(format!(
-                                "{} Type not supported",
-                                ty
-                            )))
+                            let class_arg: Class = python_arg.extract().map_err(|_| {
+                                PyRuntimeError::new_err(format!(
+                                    "{} arguments must be provided as a Class",
+                                    ty
+                                ))
+                            })?;
+                            vm_arguments.push(
+                                vm.new_instance(
+                                    ty.to_string(),
+                                    Value::Object(ClassInstance::new(class_arg.class.clone())),
+                                )
+                                .map_err(|_| {
+                                    PyRuntimeError::new_err(format!(
+                                        "Could not create instance of {}",
+                                        ty
+                                    ))
+                                })?,
+                            );
                         }
                     }
                 } else {
@@ -2542,7 +2556,14 @@ const {function_name} = {class_without_pkg}.{function_name}.overload({arguments}
                 }
             }
             if !method_data.access_flags.contains(AccessFlags::STATIC) {
-                vm_arguments.insert(0, Register::Reference("".to_string(), 0));
+                vm_arguments.insert(
+                    0,
+                    vm.new_instance(
+                        self.class.class_name.clone(),
+                        Value::Object(ClassInstance::new(self.class.clone())),
+                    )
+                    .map_err(|_| PyRuntimeError::new_err("Could not create method receiver"))?,
+                );
             }
 
             if let Some(code) = &method_data.code {

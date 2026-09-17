@@ -580,6 +580,14 @@ class AnalyzeObject:
         """
     def build_supergraph(self, excluded_classes: list[str]):
         """Build supergraph with additional excluded classes"""
+
+    def build_supergraph_with_options(
+        self,
+        excluded_classes: list[str],
+        discover_dynamic_arguments: bool,
+        dynamic_classes: list[str],
+    ):
+        """Build a supergraph with explicit filters and optional dynamic discovery"""
     def replace_string(self, string: DexString, replacement: str) -> None:
         """Replace a DEX string-pool entry and update all references to it."""
     def edit_method(self, method: Method) -> MethodEditor:

@@ -167,11 +167,7 @@ impl EmulatedFunction {
             .iter()
             .find(|(_, c)| c.class_name == class_name.as_str())
             .unwrap();
-        let ci = ClassInstance::new(class.1.clone());
-        let instance = self
-            .vm
-            .new_instance(class_name.to_string(), Value::Object(ci))
-            .unwrap();
+        let instance = self.vm.new_class_instance(class_name.as_str()).unwrap();
         let init_method = class
             .1
             .codes
