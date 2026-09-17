@@ -551,6 +551,7 @@ impl Debugger {
         &mut self,
         py: Python<'_>,
         timeout: Option<Duration>,
+        return_on_non_breakpoint: bool,
     ) -> PyResult<Option<DebuggerStackFrame>> {
         // The GUI calls this from a worker thread. Release Python's GIL while
         // JDWP is waiting on the socket so the command loop stays responsive.
@@ -579,8 +580,12 @@ impl Debugger {
             };
             let Ok(composite) = Composite::try_from(cmd) else {
                 // VM_START, VM_DEATH, and other non-breakpoint events may be
-                // queued by ART. They are not a stopped frame for this API;
-                // continue waiting for the requested breakpoint/step event.
+                // queued by ART. The polling API returns after one such event
+                // so the GUI can service queued breakpoint commands instead of
+                // spinning here forever under an event flood.
+                if return_on_non_breakpoint {
+                    return Ok(None);
+                }
                 continue;
             };
             let Some((bp, is_single_step)) =
@@ -601,6 +606,9 @@ impl Debugger {
                     self.jdwp_client.resume(&self.rt, 1).map_err(|error| {
                         PyRuntimeError::new_err(format!("Could not resume VM start: {error}"))
                     })?;
+                }
+                if return_on_non_breakpoint {
+                    return Ok(None);
                 }
                 continue;
             };
@@ -721,16 +729,17 @@ impl Debugger {
             .map_err(|e| PyRuntimeError::new_err(format!("{}", e)))
     }
     pub fn wait_for_package(&mut self, py: Python) -> PyResult<DebuggerStackFrame> {
-        self.wait_for_package_inner(py, None)?.ok_or_else(|| {
-            PyRuntimeError::new_err("JDWP connection closed while waiting for a debugger event")
-        })
+        self.wait_for_package_inner(py, None, false)?
+            .ok_or_else(|| {
+                PyRuntimeError::new_err("JDWP connection closed while waiting for a debugger event")
+            })
     }
     pub fn poll_for_package(
         &mut self,
         py: Python,
         timeout_millis: u64,
     ) -> PyResult<Option<DebuggerStackFrame>> {
-        self.wait_for_package_inner(py, Some(Duration::from_millis(timeout_millis.max(1))))
+        self.wait_for_package_inner(py, Some(Duration::from_millis(timeout_millis.max(1))), true)
     }
     pub fn get_code_indices(&self, method: &Method) -> PyResult<Vec<u32>> {
         let Some(code_item) = method.method_data.as_ref().and_then(|m| m.code.as_ref()) else {

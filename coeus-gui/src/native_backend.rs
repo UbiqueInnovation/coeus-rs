@@ -4,7 +4,7 @@
 //! module deliberately keeps the same JSON request/response contract so the UI
 //! does not need to know which implementation is selected.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fs;
 use std::fs::File;
@@ -23,9 +23,10 @@ use coeus::coeus_analysis::analysis::{
 use coeus::coeus_debug::models::Value as DebugValue;
 use coeus::coeus_debug::models::{Composite, Event, SlotValue, StackFrame};
 use coeus::coeus_debug::Runtime;
+use coeus::coeus_emulation::vm::{runtime::StringClass, Register, Value as EmulationValue, VM};
 use coeus::coeus_models::models::{
-    Class as ModelClass, DexFile, Field as ModelField, Files, Instruction, Method as ModelMethod,
-    MethodData, TestFunction,
+    AccessFlags, Class as ModelClass, DexFile, Field as ModelField, Files, Instruction,
+    Method as ModelMethod, MethodData, Proto, TestFunction,
 };
 use coeus::coeus_parse::apk;
 use coeus::coeus_parse::dex::encode::{
@@ -406,7 +407,7 @@ impl NativeDebugger {
 
 struct NativeStoppedFrame {
     frame: StackFrame,
-    values: Vec<SlotValue>,
+    values: Vec<(u32, SlotValue)>,
 }
 
 struct NativeWait {
@@ -522,6 +523,12 @@ struct StringObject {
 }
 
 #[derive(Clone)]
+struct ProtoObject {
+    proto: Arc<Proto>,
+    file: Arc<DexFile>,
+}
+
+#[derive(Clone)]
 struct FieldAccessObject {
     field: FieldObject,
     place: Location,
@@ -554,6 +561,7 @@ enum NativeObject {
     Class(ClassObject),
     Field(FieldObject),
     String(StringObject),
+    Proto(ProtoObject),
     FieldAccess(FieldAccessObject),
     Native(NativeSymbolObject),
     Edit(EditSpec),
@@ -571,6 +579,7 @@ pub struct RustBackend {
     objects: HashMap<String, ObjectEntry>,
     next_object_id: Arc<AtomicUsize>,
     notes: HashMap<String, String>,
+    aliases: HashMap<String, String>,
     session_origin: Option<Value>,
     session_events: Vec<Value>,
     session_script_override: Option<String>,
@@ -654,6 +663,7 @@ impl RustBackend {
             objects: HashMap::new(),
             next_object_id: Arc::new(AtomicUsize::new(1)),
             notes: HashMap::new(),
+            aliases: HashMap::new(),
             session_origin: None,
             session_events: Vec::new(),
             session_script_override: None,
@@ -675,6 +685,7 @@ impl RustBackend {
             objects: self.objects.clone(),
             next_object_id: self.next_object_id.clone(),
             notes: self.notes.clone(),
+            aliases: self.aliases.clone(),
             session_origin: self.session_origin.clone(),
             session_events: self.session_events.clone(),
             session_script_override: self.session_script_override.clone(),
@@ -737,8 +748,10 @@ impl RustBackend {
                     .to_string(),
                 value_string(&request, "query"),
             ),
+            "resolve" => self.resolve(&request),
             "edit_search" => self.edit_search(&request),
             "describe" => self.describe(value_string(&request, "id")),
+            "emulate" => self.emulate(&request),
             "xrefs" => self.cross_references(value_string(&request, "id")),
             "graph" => self.graph(&request),
             "graph_node_details" => self.graph_node_details(&request),
@@ -756,6 +769,7 @@ impl RustBackend {
             "sign_and_install_split" => self.sign_and_install_split(&request),
             "generate_keystore" => self.generate_keystore(&request),
             "set_note" => self.set_note(&request),
+            "set_alias" => self.set_alias(&request),
             "save_project" => self.save_project(value_string(&request, "path")),
             "load_project" => self.load_project(value_string(&request, "path")),
             "export_script" => self.export_script(value_string(&request, "path")),
@@ -771,6 +785,8 @@ impl RustBackend {
             "debug_apps" => self.debug_apps(&request),
             "debug_apps_poll" => self.debug_apps_poll(),
             "debug_breakpoint" => self.debug_breakpoint(&request),
+            "debug_breakpoint_skip" => self.debug_breakpoint_skip(&request),
+            "debug_breakpoint_remove" => self.debug_breakpoint_remove(&request),
             "debug_wait" => self.debug_wait_start(),
             "debug_poll" => self.debug_poll(),
             "debug_resume" => self.debug_resume(),
@@ -786,6 +802,7 @@ impl RustBackend {
         self.session_events.clear();
         self.session_script_override = None;
         self.notes.clear();
+        self.aliases.clear();
     }
 
     fn record_event(&mut self, event: Value) {
@@ -976,9 +993,20 @@ impl RustBackend {
                         })
                         .collect();
                 }
+                if let Some(aliases) = metadata.get("aliases").and_then(Value::as_object) {
+                    self.aliases = aliases
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            let value = value.as_str()?.to_string();
+                            (!key.trim().is_empty() && !value.trim().is_empty())
+                                .then(|| (key.clone(), value))
+                        })
+                        .collect();
+                }
             }
             data["path"] = json!(path);
             data["notes"] = json!(self.notes);
+            data["aliases"] = json!(self.aliases);
             data["split"] = json!(members.len() > 1);
             data["history"] = json!(self
                 .session
@@ -1037,6 +1065,7 @@ impl RustBackend {
             "split": split,
             "members": self.session.as_ref().map(Session::names).unwrap_or_default(),
             "notes": self.notes,
+            "aliases": self.aliases,
             "history": self.session.as_ref().map(Session::history).unwrap_or_default(),
         })
     }
@@ -1100,9 +1129,69 @@ impl RustBackend {
     }
 
     fn search(&mut self, kind: String, query: String) -> BackendResult {
-        let analysis = self.analysis()?;
         let regex = Regex::new(if query.is_empty() { ".*" } else { &query })
             .map_err(|error| format!("invalid search regex: {error}"))?;
+        let aliases = self
+            .aliases
+            .iter()
+            .filter_map(|(key, alias)| {
+                let (alias_kind, canonical) = key.split_once(':')?;
+                let allowed = match kind.as_str() {
+                    "any" => matches!(alias_kind, "method" | "class"),
+                    "methods" => alias_kind == "method",
+                    "classes" => alias_kind == "class",
+                    _ => false,
+                };
+                (allowed && regex.is_match(alias)).then_some((
+                    alias_kind.to_string(),
+                    canonical.to_string(),
+                    alias.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut alias_evidence = Vec::new();
+        {
+            let analysis = self.analysis()?;
+            for (alias_kind, canonical, alias) in aliases {
+                let lookup = if alias_kind == "method" {
+                    canonical
+                        .split_once("->")
+                        .and_then(|(_, member)| member.split_once('(').map(|(name, _)| name))
+                        .unwrap_or_default()
+                } else {
+                    canonical.as_str()
+                };
+                let lookup_regex = Regex::new(&regex::escape(lookup))
+                    .map_err(|error| format!("invalid alias lookup regex: {error}"))?;
+                let found = if alias_kind == "method" {
+                    find_methods(&lookup_regex, &analysis.files)
+                } else {
+                    find_classes(&lookup_regex, &analysis.files)
+                };
+                for evidence in found {
+                    let object = object_from_evidence(&evidence)?;
+                    if object_label(&object) == canonical {
+                        alias_evidence.push((evidence, alias));
+                        break;
+                    }
+                }
+            }
+        }
+        let mut results = Vec::new();
+        let mut seen = HashSet::new();
+        for (evidence, alias) in alias_evidence {
+            let mut result = self.result_from_evidence(evidence)?;
+            let key = (
+                value_string(&result, "kind"),
+                value_string(&result, "label"),
+            );
+            if seen.insert(key) {
+                result["alias"] = json!(true);
+                result["alias_label"] = json!(alias);
+                results.push(result);
+            }
+        }
+        let analysis = self.analysis()?;
         let found = match kind.as_str() {
             "any" => find_any(&regex, &ALL_TYPES, &analysis.files),
             "methods" => find_methods(&regex, &analysis.files),
@@ -1111,13 +1200,55 @@ impl RustBackend {
             "strings" => find_strings(&regex, &analysis.files),
             other => return Err(format!("unknown search kind: {other}")),
         };
-        let count = found.len();
-        let results = found
-            .into_iter()
-            .take(MAX_RESULTS)
-            .map(|evidence| self.result_from_evidence(evidence))
-            .collect::<Result<Vec<_>, _>>()?;
+        for evidence in found {
+            let result = self.result_from_evidence(evidence)?;
+            let key = (
+                value_string(&result, "kind"),
+                value_string(&result, "label"),
+            );
+            if seen.insert(key) {
+                results.push(result);
+            }
+        }
+        let count = results.len();
+        results.truncate(MAX_RESULTS);
         Ok(json!({"results": results, "count": count}))
+    }
+
+    fn resolve(&mut self, request: &Value) -> BackendResult {
+        let kind = optional_string(request, "kind").unwrap_or("method");
+        let label = value_string(request, "label");
+        if label.is_empty() {
+            return Err(format!("could not resolve {kind}: empty label"));
+        }
+        let lookup = if kind == "method" {
+            label
+                .split_once("->")
+                .and_then(|(_, member)| member.split_once('(').map(|(name, _)| name))
+                .unwrap_or_default()
+                .to_string()
+        } else if kind == "class" {
+            label.clone()
+        } else {
+            return Err("exact resolution is only supported for methods and classes".to_string());
+        };
+        let found = {
+            let analysis = self.analysis()?;
+            let regex = Regex::new(&regex::escape(&lookup))
+                .map_err(|error| format!("invalid exact lookup regex: {error}"))?;
+            if kind == "method" {
+                find_methods(&regex, &analysis.files)
+            } else {
+                find_classes(&regex, &analysis.files)
+            }
+        };
+        for evidence in found {
+            let object = object_from_evidence(&evidence)?;
+            if object_label(&object) == label {
+                return self.result_from_evidence(evidence);
+            }
+        }
+        Err(format!("could not resolve {kind}: {label}"))
     }
 
     fn edit_search(&mut self, request: &Value) -> BackendResult {
@@ -1207,23 +1338,14 @@ impl RustBackend {
                 data["code"] = json!(method.code());
                 data["instructions"] = json!(self.instructions_json(&method)?);
                 data["class"] = json!(method.class.class_name);
+                data["method_key"] = json!(method.signature());
             }
             NativeObject::Class(class) => {
-                let code = self
-                    .analysis()?
-                    .files
-                    .multi_dex
-                    .iter()
-                    .find(|multi_dex| {
-                        multi_dex.primary.identifier == class.file.identifier
-                            || multi_dex
-                                .secondary
-                                .iter()
-                                .any(|dex| dex.identifier == class.file.identifier)
-                    })
-                    .map(|multi_dex| class.class.get_disassembly(multi_dex))
-                    .unwrap_or_default();
+                let (code, line_method_ids, line_method_keys) =
+                    self.class_source_with_method_ids(class)?;
                 data["code"] = json!(code);
+                data["line_method_ids"] = json!(line_method_ids);
+                data["line_method_keys"] = json!(line_method_keys);
                 data["class"] = json!(class.class.class_name);
             }
             NativeObject::FieldAccess(access) => {
@@ -1237,9 +1359,156 @@ impl RustBackend {
                 }
             }
             NativeObject::String(string) => data["value"] = json!(string.content),
-            NativeObject::Field(_) | NativeObject::Native(_) | NativeObject::Edit(_) => {}
+            NativeObject::Field(_)
+            | NativeObject::Proto(_)
+            | NativeObject::Native(_)
+            | NativeObject::Edit(_) => {}
         }
         Ok(data)
+    }
+
+    fn emulate(&self, request: &Value) -> BackendResult {
+        let id = value_string(request, "id");
+        let object = self.entry(&id)?.object.clone();
+        let NativeObject::Method(method) = object else {
+            return Err("emulation is only available for methods".to_string());
+        };
+        let arguments = request
+            .get("arguments")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let descriptors = parse_emulation_descriptors(&method.method.proto_name)?;
+        if arguments.len() != descriptors.len() {
+            return Ok(json!({
+                "success": false,
+                "error": format!("expected {} argument(s), received {}", descriptors.len(), arguments.len()),
+            }));
+        }
+        let analysis = self.analysis()?;
+        let runtime = analysis
+            .files
+            .multi_dex
+            .iter()
+            .flat_map(|multi_dex| {
+                std::iter::once(multi_dex.primary.clone()).chain(multi_dex.secondary.clone())
+            })
+            .filter(|dex| dex.identifier != method.file.identifier)
+            .collect::<Vec<_>>();
+        let mut vm = VM::new(
+            method.file.clone(),
+            runtime,
+            Arc::new(analysis.files.binaries.clone()),
+        );
+        let mut vm_arguments = Vec::with_capacity(descriptors.len() + 2);
+        for (descriptor, argument) in descriptors.iter().zip(arguments.iter()) {
+            let text = argument.as_str().unwrap_or_default();
+            vm_arguments.push(native_emulation_argument(&mut vm, descriptor, text)?);
+        }
+        if !method
+            .data
+            .as_ref()
+            .map(|data| data.access_flags.contains(AccessFlags::STATIC))
+            .unwrap_or(false)
+        {
+            vm_arguments.insert(0, Register::Reference(String::new(), 0));
+            vm_arguments.insert(0, Register::Reference(String::new(), 0));
+        }
+        let Some(data) = method.data.as_ref() else {
+            return Ok(json!({"success": false, "error": "No method definition found"}));
+        };
+        let Some(code) = data.code.as_ref() else {
+            return Ok(json!({"success": false, "error": "No method definition found"}));
+        };
+        match vm.start(
+            method.method.method_idx as u32,
+            &method.file.identifier,
+            code,
+            vm_arguments,
+        ) {
+            Ok(()) => {
+                let value = vm.get_instance(vm.get_current_state().return_reg.clone());
+                let result = value.as_string().unwrap_or_else(|| format!("{:?}", value));
+                Ok(json!({
+                    "success": true,
+                    "result": result,
+                    "return_type": method.method.proto_name.rsplit(')').next().unwrap_or(""),
+                }))
+            }
+            Err(error) => Ok(json!({"success": false, "error": format!("VM failed: {error:?}")})),
+        }
+    }
+
+    fn class_source_with_method_ids(
+        &mut self,
+        class: &ClassObject,
+    ) -> Result<(String, Vec<Option<String>>, Vec<Option<String>>), String> {
+        let (source_class, file, code) = {
+            let analysis = self.analysis()?;
+            let Some(multi_dex) = analysis.files.multi_dex.iter().find(|multi_dex| {
+                multi_dex.primary.identifier == class.file.identifier
+                    || multi_dex
+                        .secondary
+                        .iter()
+                        .any(|dex| dex.identifier == class.file.identifier)
+            }) else {
+                return Ok((String::new(), Vec::new(), Vec::new()));
+            };
+            let file = multi_dex
+                .dex_file_from_identifier(&class.file.identifier)
+                .unwrap_or_else(|| class.file.clone());
+            let source_class = if !class.class.codes.is_empty() {
+                class.class.clone()
+            } else {
+                multi_dex
+                    .classes()
+                    .into_iter()
+                    .find(|(_, candidate)| candidate.class_name == class.class.class_name)
+                    .map(|(_, candidate)| candidate)
+                    .unwrap_or_else(|| class.class.clone())
+            };
+            let code = source_class.get_disassembly(multi_dex);
+            (source_class, file, code)
+        };
+
+        let lines = code.lines().collect::<Vec<_>>();
+        let mut line_method_ids = vec![None; lines.len()];
+        let mut line_method_keys = vec![None; lines.len()];
+        let mut search_from = 0usize;
+        for method_data in &source_class.codes {
+            let method_code = method_data.get_disassembly(&file);
+            let method_lines = method_code.lines().collect::<Vec<_>>();
+            if method_lines.is_empty() || search_from >= lines.len() {
+                continue;
+            }
+            let Some(relative_start) = lines[search_from..]
+                .windows(method_lines.len())
+                .position(|window| window == method_lines.as_slice())
+            else {
+                continue;
+            };
+            let start = search_from + relative_start;
+            let method = method_object(&file, &method_data.method);
+            let method_key = method.as_ref().map(MethodObject::signature);
+            let method_id = method.map(|method| {
+                self.store(ObjectEntry {
+                    object: NativeObject::Method(method),
+                    evidence: None,
+                })
+            });
+            if let Some(method_id) = method_id {
+                for line_method_id in &mut line_method_ids[start..start + method_lines.len()] {
+                    *line_method_id = Some(method_id.clone());
+                }
+            }
+            if let Some(method_key) = method_key {
+                for line_method_key in &mut line_method_keys[start..start + method_lines.len()] {
+                    *line_method_key = Some(method_key.clone());
+                }
+            }
+            search_from = start + method_lines.len();
+        }
+        Ok((code, line_method_ids, line_method_keys))
     }
 
     fn instructions_json(&mut self, method: &MethodObject) -> Result<Vec<Value>, String> {
@@ -1677,7 +1946,11 @@ impl RustBackend {
                 label,
                 "replace",
                 vec![
-                    integer("register_count", "Argument register count", register_count.min(5)),
+                    integer(
+                        "register_count",
+                        "Argument register count",
+                        register_count.min(5),
+                    ),
                     text("registers", "Argument registers", &register_list),
                     picker("method_index", "Target method", method_index, "methods"),
                 ],
@@ -1706,7 +1979,11 @@ impl RustBackend {
             "invoke-custom",
             "replace",
             vec![
-                integer("register_count", "Argument register count", register_count.min(5)),
+                integer(
+                    "register_count",
+                    "Argument register count",
+                    register_count.min(5),
+                ),
                 text("registers", "Argument registers", &register_list),
                 integer("call_site_index", "Call-site index", 0),
             ],
@@ -2106,6 +2383,7 @@ impl RustBackend {
             "events": self.session_events,
             "history": self.session.as_ref().map(Session::history).unwrap_or_default(),
             "notes": self.notes,
+            "aliases": self.aliases,
         });
         let script = self.session_script();
         let file = File::create(&path)
@@ -2216,6 +2494,20 @@ impl RustBackend {
             self.notes.insert(key.clone(), note.clone());
         }
         Ok(json!({"key": key, "note": note}))
+    }
+
+    fn set_alias(&mut self, request: &Value) -> BackendResult {
+        let key = value_string(request, "key").trim().to_string();
+        if key.is_empty() {
+            return Err("alias requires a class or method identity".to_string());
+        }
+        let alias = value_string(request, "alias").trim().to_string();
+        if alias.is_empty() {
+            self.aliases.remove(&key);
+        } else {
+            self.aliases.insert(key.clone(), alias.clone());
+        }
+        Ok(json!({"key": key, "alias": alias}))
     }
 
     fn debug_connect(&mut self, host: String, port: u16) -> BackendResult {
@@ -2400,30 +2692,42 @@ impl RustBackend {
             .as_ref()
             .cloned()
             .ok_or_else(|| "connect a debugger first".to_string())?;
-        let method = self.debug_method(&value_string(request, "id"))?;
+        let method_id = value_string(request, "id");
+        let method = self.debug_method(&method_id)?;
         let offset = value_u32(request, "offset")?;
-        let key = (method.signature(), offset);
-        let enabled = {
+        let method_key = method.signature();
+        let key = (method_key.clone(), offset);
+        let active = {
             let debugger = debugger
                 .lock()
                 .map_err(|_| "debugger lock was poisoned".to_string())?;
-            !debugger.breakpoints.contains_key(&key)
+            debugger.breakpoints.contains_key(&key)
         };
-
-        if !enabled {
-            if let Some(wait) = self.debug_wait.take() {
-                wait.cancel.store(true, Ordering::Relaxed);
-            }
-            self.debug_waiting = false;
+        if active {
             debugger
                 .lock()
                 .map_err(|_| "debugger lock was poisoned".to_string())?
                 .clear_breakpoint(&method, offset)?;
+            if let Some(wait) = self.debug_wait.take() {
+                let no_breakpoints = debugger
+                    .lock()
+                    .map_err(|_| "debugger lock was poisoned".to_string())?
+                    .breakpoints
+                    .is_empty();
+                if no_breakpoints {
+                    wait.cancel.store(true, Ordering::Relaxed);
+                    self.debug_waiting = false;
+                } else {
+                    self.debug_wait = Some(wait);
+                }
+            }
             return Ok(json!({
                 "enabled": false,
+                "method_id": method_id,
+                "method_key": method_key,
                 "offset": offset,
-                "location": format!("{}@0x{offset:x}", method.signature()),
-                "waiting": false,
+                "location": format!("{}@0x{offset:x}", method_key),
+                "waiting": self.debug_waiting,
             }));
         }
 
@@ -2441,9 +2745,110 @@ impl RustBackend {
         };
         Ok(json!({
             "enabled": true,
+            "method_id": method_id,
+            "method_key": method_key,
             "offset": offset,
-            "location": format!("{}@0x{offset:x}", method.signature()),
+            "location": format!("{}@0x{offset:x}", method_key),
             "waiting": waiting,
+        }))
+    }
+
+    fn debug_breakpoint_skip(&mut self, request: &Value) -> BackendResult {
+        let debugger = self
+            .debugger
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "connect a debugger first".to_string())?;
+        let method_id = value_string(request, "id");
+        let method = self.debug_method(&method_id)?;
+        let offset = value_u32(request, "offset")?;
+        let method_key = method.signature();
+        let key = (method_key.clone(), offset);
+        let skip = request.get("skip").and_then(Value::as_bool).unwrap_or(true);
+        let active = {
+            let debugger = debugger
+                .lock()
+                .map_err(|_| "debugger lock was poisoned".to_string())?;
+            debugger.breakpoints.contains_key(&key)
+        };
+        if skip && active {
+            debugger
+                .lock()
+                .map_err(|_| "debugger lock was poisoned".to_string())?
+                .clear_breakpoint(&method, offset)?;
+        } else if !skip && !active {
+            debugger
+                .lock()
+                .map_err(|_| "debugger lock was poisoned".to_string())?
+                .set_breakpoint(&method, offset)?;
+        }
+        if skip {
+            let no_breakpoints = debugger
+                .lock()
+                .map_err(|_| "debugger lock was poisoned".to_string())?
+                .breakpoints
+                .is_empty();
+            if no_breakpoints {
+                if let Some(wait) = self.debug_wait.take() {
+                    wait.cancel.store(true, Ordering::Relaxed);
+                }
+                self.debug_waiting = false;
+            }
+        } else if self.debug_frame.is_none() {
+            self.debug_wait_start()?;
+        }
+        Ok(json!({
+            "enabled": !skip,
+            "method_id": method_id,
+            "method_key": method_key,
+            "offset": offset,
+            "location": format!("{}@0x{offset:x}", method_key),
+            "waiting": self.debug_waiting,
+        }))
+    }
+
+    fn debug_breakpoint_remove(&mut self, request: &Value) -> BackendResult {
+        let debugger = self
+            .debugger
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "connect a debugger first".to_string())?;
+        let method_id = value_string(request, "id");
+        let method = self.debug_method(&method_id)?;
+        let offset = value_u32(request, "offset")?;
+        let method_key = method.signature();
+        let key = (method_key.clone(), offset);
+        let active = {
+            let debugger = debugger
+                .lock()
+                .map_err(|_| "debugger lock was poisoned".to_string())?;
+            debugger.breakpoints.contains_key(&key)
+        };
+        if active {
+            debugger
+                .lock()
+                .map_err(|_| "debugger lock was poisoned".to_string())?
+                .clear_breakpoint(&method, offset)?;
+        }
+        let no_breakpoints = debugger
+            .lock()
+            .map_err(|_| "debugger lock was poisoned".to_string())?
+            .breakpoints
+            .is_empty();
+        if no_breakpoints {
+            if let Some(wait) = self.debug_wait.take() {
+                wait.cancel.store(true, Ordering::Relaxed);
+            }
+            self.debug_waiting = false;
+        }
+        Ok(json!({
+            "enabled": false,
+            "removed": true,
+            "method_id": method_id,
+            "method_key": method_key,
+            "offset": offset,
+            "location": format!("{}@0x{offset:x}", method_key),
+            "waiting": self.debug_waiting,
         }))
     }
 
@@ -2594,7 +2999,7 @@ impl RustBackend {
                 .lock()
                 .map_err(|_| "debugger lock was poisoned".to_string())?;
             let runtime = debugger_guard.runtime.clone();
-            match frame.get_values(code, &mut debugger_guard.client, &runtime) {
+            match frame.get_values_with_slots(code, &mut debugger_guard.client, &runtime) {
                 Ok(found) => {
                     values = infer_debug_value_types(&method, frame.location.code_index, found);
                 }
@@ -2609,7 +3014,7 @@ impl RustBackend {
                 .map_err(|_| "debugger lock was poisoned".to_string())?;
             values
                 .iter()
-                .map(|value| debug_value_text(&mut debugger_guard, value))
+                .map(|(slot, value)| (*slot, debug_value_text(&mut debugger_guard, value)))
                 .collect::<Vec<_>>()
         };
         self.debug_frame = Some(NativeStoppedFrame { frame, values });
@@ -2620,7 +3025,6 @@ impl RustBackend {
             "code_index": self.debug_frame.as_ref().map(|frame| frame.frame.location.code_index).unwrap_or_default(),
             "values": value_text
                 .into_iter()
-                .enumerate()
                 .map(|(slot, value)| json!({"slot": slot, "value": value}))
                 .collect::<Vec<_>>(),
         });
@@ -2678,7 +3082,9 @@ impl RustBackend {
             .ok_or_else(|| "the debugger is not stopped at a frame".to_string())?;
         let old_value = frame
             .values
-            .get(slot as usize)
+            .iter()
+            .find(|(value_slot, _)| *value_slot == slot as u32)
+            .map(|(_, value)| value)
             .ok_or_else(|| format!("register v{slot} is not available"))?
             .clone();
         let mut debugger_guard = debugger
@@ -2698,7 +3104,11 @@ impl RustBackend {
         let display = debug_value_text(&mut debugger_guard, &new_value);
         drop(debugger_guard);
         if let Some(frame) = self.debug_frame.as_mut() {
-            if let Some(value) = frame.values.get_mut(slot as usize) {
+            if let Some((_, value)) = frame
+                .values
+                .iter_mut()
+                .find(|(value_slot, _)| *value_slot == slot as u32)
+            {
                 *value = new_value;
             }
         }
@@ -2974,12 +3384,11 @@ fn parallel_read_operation(request: &Value) -> bool {
 fn infer_debug_value_types(
     method: &MethodObject,
     code_index: u64,
-    values: Vec<SlotValue>,
-) -> Vec<SlotValue> {
+    values: Vec<(u32, SlotValue)>,
+) -> Vec<(u32, SlotValue)> {
     let string_registers = debug_string_registers(method, code_index);
     values
         .into_iter()
-        .enumerate()
         .map(|(slot, value)| {
             if string_registers.contains(&(slot as u16))
                 && matches!(value.value, DebugValue::Object(_))
@@ -2988,9 +3397,9 @@ fn infer_debug_value_types(
                     DebugValue::Object(object_id) => object_id,
                     _ => unreachable!("the value was checked to be an object"),
                 };
-                DebugValue::String(object_id).into()
+                (slot, DebugValue::String(object_id).into())
             } else {
-                value
+                (slot, value)
             }
         })
         .collect()
@@ -3358,10 +3767,7 @@ fn script_instruction(factory: &str, arguments: &Value) -> Option<String> {
             integer("register"),
             integer("type_index")
         ),
-        "invoke_virtual"
-        | "invoke_super"
-        | "invoke_direct"
-        | "invoke_static"
+        "invoke_virtual" | "invoke_super" | "invoke_direct" | "invoke_static"
         | "invoke_interface" => format!(
             "DexInstruction.{factory}({}, {}, {})",
             default_one("register_count"),
@@ -3403,20 +3809,10 @@ fn script_instruction(factory: &str, arguments: &Value) -> Option<String> {
             integer("object_register"),
             integer("field_index")
         ),
-        "static_get"
-        | "static_get_wide"
-        | "static_get_object"
-        | "static_get_boolean"
-        | "static_get_byte"
-        | "static_get_char"
-        | "static_get_short"
-        | "static_put"
-        | "static_put_wide"
-        | "static_put_object"
-        | "static_put_boolean"
-        | "static_put_byte"
-        | "static_put_char"
-        | "static_put_short" => format!(
+        "static_get" | "static_get_wide" | "static_get_object" | "static_get_boolean"
+        | "static_get_byte" | "static_get_char" | "static_get_short" | "static_put"
+        | "static_put_wide" | "static_put_object" | "static_put_boolean" | "static_put_byte"
+        | "static_put_char" | "static_put_short" => format!(
             "DexInstruction.{factory}({}, {})",
             integer("register"),
             integer("field_index")
@@ -3488,12 +3884,27 @@ fn object_from_evidence(evidence: &Evidence) -> Result<NativeObject, String> {
                 .to_string(),
             file: file.clone(),
         })),
+        Some(Context::DexProto(proto, file)) => Ok(NativeObject::Proto(ProtoObject {
+            proto: proto.clone(),
+            file: file.clone(),
+        })),
         Some(Context::NativeLib(_, symbol, ..)) | Some(Context::NativeSymbol(_, symbol)) => {
             Ok(NativeObject::Native(NativeSymbolObject {
                 symbol: symbol.to_string(),
             }))
         }
-        _ => Err("unsupported evidence object".to_string()),
+        _ => {
+            // Cross-reference evidence is anchored by its location.  A few
+            // older analysis paths do not populate a fully typed place
+            // context, but a DEX-method location is still sufficient to open
+            // and inspect the referencing method.
+            if let Evidence::CrossReference(cross_reference) = evidence {
+                if let Some(method) = method_from_location(&cross_reference.place) {
+                    return Ok(NativeObject::Method(method));
+                }
+            }
+            Err("unsupported evidence object".to_string())
+        }
     }
 }
 
@@ -3562,6 +3973,7 @@ fn object_kind(object: &NativeObject) -> String {
         NativeObject::Class(_) => "class",
         NativeObject::Field(_) => "field",
         NativeObject::String(_) => "string",
+        NativeObject::Proto(_) => "proto",
         NativeObject::FieldAccess(_) => "field_access",
         NativeObject::Native(_) => "native",
         NativeObject::Edit(_) => "edit",
@@ -3577,6 +3989,7 @@ fn object_label(object: &NativeObject) -> String {
             format!("{}->{}", field.class.class.class_name, field.field.name)
         }
         NativeObject::String(string) => string.content.clone(),
+        NativeObject::Proto(proto) => proto.proto.to_string(&proto.file),
         NativeObject::FieldAccess(access) => format!(
             "{} :: {}",
             access.field.class.class.class_name, access.instruction
@@ -3594,9 +4007,15 @@ fn object_index(object: &NativeObject) -> Option<u32> {
             .file
             .fields
             .iter()
-            .position(|candidate| candidate == field.field.as_ref())
+            .position(|candidate| candidate.as_ref() == field.field.as_ref())
             .map(|index| index as u32),
         NativeObject::String(string) => Some(string.index),
+        NativeObject::Proto(proto) => proto
+            .file
+            .protos
+            .iter()
+            .position(|candidate| candidate.as_ref() == proto.proto.as_ref())
+            .map(|index| index as u32),
         _ => None,
     }
 }
@@ -3607,6 +4026,7 @@ fn object_dex_name(object: &NativeObject) -> Option<String> {
         NativeObject::Class(class) => Some(class.file.get_dex_name().to_string()),
         NativeObject::Field(field) => Some(field.file.get_dex_name().to_string()),
         NativeObject::String(string) => Some(string.file.get_dex_name().to_string()),
+        NativeObject::Proto(proto) => Some(proto.file.get_dex_name().to_string()),
         NativeObject::FieldAccess(access) => Some(access.field.file.get_dex_name().to_string()),
         _ => None,
     }
@@ -3717,7 +4137,7 @@ fn build_instruction(
         let count = u4_value(count_name)?;
         let method = integer(index_name, 0)? as u16;
         let registers = register_list()?;
-        if registers.len() != u4::from(count) as usize {
+        if registers.len() != u8::from(count) as usize {
             return Err(format!(
                 "{count_name} must match the number of invoke registers"
             ));
@@ -3879,62 +4299,48 @@ fn build_instruction(
             u4_value("object_register")?,
             integer("field_index", 0)? as u16,
         ),
-        "static_get" => Instruction::StaticGet(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
-        "static_get_wide" => Instruction::StaticGetWide(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
-        "static_get_object" => Instruction::StaticGetObject(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
-        "static_get_boolean" => Instruction::StaticGetBoolean(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
-        "static_get_byte" => Instruction::StaticGetByte(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
-        "static_get_char" => Instruction::StaticGetChar(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
-        "static_get_short" => Instruction::StaticGetShort(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
-        "static_put" => Instruction::StaticPut(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
-        "static_put_wide" => Instruction::StaticPutWide(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
-        "static_put_object" => Instruction::StaticPutObject(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
-        "static_put_boolean" => Instruction::StaticPutBoolean(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
-        "static_put_byte" => Instruction::StaticPutByte(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
-        "static_put_char" => Instruction::StaticPutChar(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
-        "static_put_short" => Instruction::StaticPutShort(
-            register("register")?,
-            integer("field_index", 0)? as u16,
-        ),
+        "static_get" => {
+            Instruction::StaticGet(register("register")?, integer("field_index", 0)? as u16)
+        }
+        "static_get_wide" => {
+            Instruction::StaticGetWide(register("register")?, integer("field_index", 0)? as u16)
+        }
+        "static_get_object" => {
+            Instruction::StaticGetObject(register("register")?, integer("field_index", 0)? as u16)
+        }
+        "static_get_boolean" => {
+            Instruction::StaticGetBoolean(register("register")?, integer("field_index", 0)? as u16)
+        }
+        "static_get_byte" => {
+            Instruction::StaticGetByte(register("register")?, integer("field_index", 0)? as u16)
+        }
+        "static_get_char" => {
+            Instruction::StaticGetChar(register("register")?, integer("field_index", 0)? as u16)
+        }
+        "static_get_short" => {
+            Instruction::StaticGetShort(register("register")?, integer("field_index", 0)? as u16)
+        }
+        "static_put" => {
+            Instruction::StaticPut(register("register")?, integer("field_index", 0)? as u16)
+        }
+        "static_put_wide" => {
+            Instruction::StaticPutWide(register("register")?, integer("field_index", 0)? as u16)
+        }
+        "static_put_object" => {
+            Instruction::StaticPutObject(register("register")?, integer("field_index", 0)? as u16)
+        }
+        "static_put_boolean" => {
+            Instruction::StaticPutBoolean(register("register")?, integer("field_index", 0)? as u16)
+        }
+        "static_put_byte" => {
+            Instruction::StaticPutByte(register("register")?, integer("field_index", 0)? as u16)
+        }
+        "static_put_char" => {
+            Instruction::StaticPutChar(register("register")?, integer("field_index", 0)? as u16)
+        }
+        "static_put_short" => {
+            Instruction::StaticPutShort(register("register")?, integer("field_index", 0)? as u16)
+        }
         "if_eq" => Instruction::Test(
             TestFunction::Equal,
             u4_value("left_register")?,
@@ -4027,6 +4433,111 @@ fn value_string(value: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+fn parse_emulation_descriptors(proto: &str) -> Result<Vec<String>, String> {
+    let arguments = proto
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')').map(|(args, _)| args))
+        .ok_or_else(|| format!("invalid method prototype: {proto}"))?;
+    let bytes = arguments.as_bytes();
+    let mut descriptors = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let start = index;
+        while index < bytes.len() && bytes[index] == b'[' {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return Err(format!("invalid method prototype: {proto}"));
+        }
+        if bytes[index] == b'L' {
+            let end = arguments[index..]
+                .find(';')
+                .ok_or_else(|| format!("invalid method prototype: {proto}"))?;
+            index += end + 1;
+        } else {
+            index += 1;
+        }
+        descriptors.push(arguments[start..index].to_string());
+    }
+    Ok(descriptors)
+}
+
+fn native_emulation_argument(
+    vm: &mut VM,
+    descriptor: &str,
+    text: &str,
+) -> Result<Register, String> {
+    let normalized = text.trim();
+    match descriptor {
+        "Z" => match normalized.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(Register::Literal(1)),
+            "false" | "0" | "no" => Ok(Register::Literal(0)),
+            _ => Err("boolean arguments must be true or false".to_string()),
+        },
+        "B" | "S" | "I" => normalized
+            .parse::<i32>()
+            .map(Register::Literal)
+            .map_err(|_| format!("{text} is not an integer")),
+        "J" => normalized
+            .parse::<i64>()
+            .map(Register::LiteralWide)
+            .map_err(|_| format!("{text} is not a long integer")),
+        "C" => {
+            let value = if text.chars().count() == 1 {
+                text.chars().next().unwrap_or_default() as i32
+            } else {
+                normalized
+                    .parse::<i32>()
+                    .map_err(|_| "character arguments must be one character or a code point")?
+            };
+            Ok(Register::Literal(value))
+        }
+        "Ljava/lang/String;" => {
+            let instance = vm
+                .new_instance(
+                    descriptor.to_string(),
+                    EmulationValue::Object(StringClass::new(text.to_string())),
+                )
+                .map_err(|error| format!("could not allocate string argument: {error:?}"))?;
+            Ok(instance)
+        }
+        "[B" | "[C" => {
+            let bytes = if let Some(hex) = normalized.strip_prefix("hex:") {
+                hex.split_whitespace()
+                    .collect::<String>()
+                    .as_bytes()
+                    .chunks(2)
+                    .map(|chunk| {
+                        u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or(""), 16)
+                            .map_err(|_| "invalid hexadecimal array argument".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                let values: Vec<i64> = serde_json::from_str(normalized)
+                    .map_err(|_| "array arguments must be JSON numbers or hex:…".to_string())?;
+                values
+                    .into_iter()
+                    .map(|value| {
+                        u8::try_from(value)
+                            .map_err(|_| "array values must be in the range 0..255".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            vm.new_instance(descriptor.to_string(), EmulationValue::Array(bytes))
+                .map_err(|error| format!("could not allocate array argument: {error:?}"))
+        }
+        descriptor if descriptor.starts_with('L') => {
+            if matches!(normalized.to_ascii_lowercase().as_str(), "null" | "nil") {
+                Ok(Register::Null)
+            } else {
+                Err(format!("argument type {descriptor} is not supported yet"))
+            }
+        }
+        "F" | "D" => Err(format!("argument type {descriptor} is not supported yet")),
+        _ => Err(format!("argument type {descriptor} is not supported yet")),
+    }
 }
 
 fn value_u32(value: &Value, key: &str) -> Result<u32, String> {

@@ -383,6 +383,19 @@ impl StackFrame {
         client: &mut JdwpClient,
         runtime: &Runtime,
     ) -> anyhow::Result<Vec<SlotValue>> {
+        Ok(self
+            .get_values_with_slots(m, client, runtime)?
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect())
+    }
+
+    pub fn get_values_with_slots(
+        &self,
+        m: &coeus_models::models::CodeItem,
+        client: &mut JdwpClient,
+        runtime: &Runtime,
+    ) -> anyhow::Result<Vec<(u32, SlotValue)>> {
         runtime.block_on(async {
             let mut slots_in_scope = vec![Slot {
                 code_index: 0,
@@ -429,7 +442,7 @@ impl StackFrame {
                     let Ok(val) = SlotValue::from_bytes(&mut reader) else {
                         break;
                     };
-                    slot_values.push(val);
+                    slot_values.push((i as u32, val));
                 }
             }
 

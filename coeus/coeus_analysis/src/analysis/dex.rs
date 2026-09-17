@@ -15,7 +15,7 @@ use std::{
 use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 
 use coeus_macros::iterator;
-use coeus_models::models::{AccessFlags, Class, DexFile, Field, Files, Method, MultiDexFile};
+use coeus_models::models::{AccessFlags, Class, DexFile, Field, Files, Method, MultiDexFile, Proto};
 
 use super::{
     ConfidenceLevel, Context, CrossReferenceEvidence, Evidence, InstructionEvidence, Location,
@@ -117,6 +117,9 @@ pub fn find_cross_reference(place: &Context, multi_dex: &MultiDexFile) -> Vec<Ev
         Context::DexMethod(method, dex_file) => {
             find_references_to_method(method, dex_file.clone(), multi_dex, place)
         }
+        Context::DexProto(proto, dex_file) => {
+            find_references_to_proto(proto, dex_file.clone(), multi_dex, place)
+        }
         Context::DexField(field, dex_file) => {
             find_references_to_field(field, dex_file.clone(), multi_dex, place)
         }
@@ -179,6 +182,18 @@ pub fn find_cross_reference_array<'a: 'b, 'b>(
                     new_place = Context::DexField(field.clone(), dex_file.clone());
 
                     find_references_to_field(&field, dex_file, multi_dex, &new_place)
+                }
+                Context::DexProto(proto, dex_file) => {
+                    let (multi_dex, dex_file) = if let Some((md, f)) =
+                        multi_dex.get_multi_dex_from_dex_identifier(&dex_file.identifier)
+                    {
+                        (md, f)
+                    } else {
+                        return vec![];
+                    };
+                    new_place = Context::DexProto(proto.clone(), dex_file.clone());
+
+                    find_references_to_proto(&proto, dex_file, multi_dex, &new_place)
                 }
                 Context::DexString(str_idx, dex_file) => {
                     let (multi_dex, dex_file) = if let Some((md, f)) =
@@ -597,6 +612,58 @@ fn find_references_to_method<'a: 'b, 'b>(
                 Evidence::CrossReference(CrossReferenceEvidence {
                     place: Location::DexMethod(m.method.method_idx as u32, f.clone()),
                     place_context: Context::DexMethod(m.method.clone(), f.clone()),
+                    context: place.clone(),
+                })
+            })
+            .collect();
+        if let Ok(mut lock) = vec_loc.lock() {
+            lock.extend(methods_containing_references);
+        }
+    });
+    context_matches
+}
+
+fn find_references_to_proto<'a: 'b, 'b>(
+    looking_for_proto: &'b Proto,
+    dex_file: Arc<DexFile>,
+    multi_dex: &'a MultiDexFile,
+    place: &'b Context,
+) -> Vec<Evidence> {
+    let target_descriptor = looking_for_proto.to_string(&dex_file);
+    let mut context_matches: Vec<Evidence> = vec![];
+    let vec_loc = Arc::new(Mutex::new(&mut context_matches));
+    let classes = multi_dex.classes();
+    iterator!(classes).for_each(|(f, c)| {
+        let methods_containing_references: Vec<_> = iterator!(c.codes)
+            .filter(|method_data| match method_data.code.as_ref() {
+                Some(code) => iterator!(code.insns).any(|(_, _, instruction)| {
+                    let method_idx = match instruction {
+                        coeus_models::models::Instruction::Invoke(method_idx)
+                        | coeus_models::models::Instruction::InvokeVirtual(_, method_idx, _)
+                        | coeus_models::models::Instruction::InvokeSuper(_, method_idx, _)
+                        | coeus_models::models::Instruction::InvokeDirect(_, method_idx, _)
+                        | coeus_models::models::Instruction::InvokeStatic(_, method_idx, _)
+                        | coeus_models::models::Instruction::InvokeInterface(
+                            _,
+                            method_idx,
+                            _,
+                        ) => *method_idx as usize,
+                        _ => return false,
+                    };
+                    let Some(method) = f.methods.get(method_idx) else {
+                        return false;
+                    };
+                    let Some(proto) = f.protos.get(method.proto_idx as usize) else {
+                        return false;
+                    };
+                    proto.to_string(f) == target_descriptor
+                }),
+                None => false,
+            })
+            .map(|method_data| {
+                Evidence::CrossReference(CrossReferenceEvidence {
+                    place: Location::DexMethod(method_data.method.method_idx as u32, f.clone()),
+                    place_context: Context::DexMethod(method_data.method.clone(), f.clone()),
                     context: place.clone(),
                 })
             })

@@ -37,7 +37,7 @@ COEUS_GUI_BACKEND=python cargo run --release
 COEUS_GUI_BACKEND=rust cargo run --release
 ```
 
-Use the Browse button to choose an APK in the application. The Python
+Use **Open APK…** in the sidebar or welcome screen to choose an APK. The Python
 executable can be overridden with `COEUS_PYTHON=/path/to/python` when using
 the Python backend. The Rust backend covers the same current GUI feature set:
 APK loading, split APK sets, manifest changes, search, inspection, graphing,
@@ -57,6 +57,35 @@ collapsed. The Code / Edit tab gives the smali source and replacement-node
 pane the full available work area, with replacement nodes attached to the
 left side of the code view.
 
+## Workspace controls
+
+The workspace uses a consistent dark theme, with navigation across the top
+and operation status along the bottom. The welcome screen opens APKs, split
+sets, saved projects, or the device browser. **Paths & output** in the sidebar
+exposes direct path loading and the edited APK destination.
+
+- **Cmd/Ctrl+O** opens an APK; **Cmd/Ctrl+S** saves a project.
+- **Cmd/Ctrl+F** expands the sidebar and focuses search. Press Enter to search.
+- Search accepts regular expressions, validates syntax before submitting, and
+  explains empty results. The Search tab offers entry-point, cryptography, and
+  URL searches to get started.
+- Results show the member name above its class. Hover for the full identifier;
+  click to inspect, or right-click for cross-references and notes.
+- Failed backend operations stay visible until dismissed, with a control to
+  copy details. Pending manifest edits are visible in the status bar; click
+  the indicator to return to the editor.
+- The **B** breakpoint shortcut applies in Code / Edit when no text input has
+  focus. **F5** resumes and **F10** steps a connected debugger.
+
+Toolbars wrap at smaller window sizes. Signing forms and instruction controls
+scroll independently so actions remain reachable in shorter windows.
+
+In Graphs, hold **Cmd** (Ctrl on other platforms) and scroll over the canvas to
+zoom around the pointer. Ordinary scrolling pans the graph. Click or drag the
+minimap to center the viewport on that part of the graph; **Fit to view** returns
+to the overview. Call graph layers and supergraph rings leave space between
+nodes, including when a large ring is followed by a smaller one.
+
 The ADB tab lists installed packages on a connected device. Select a package
 to pull its base APK and split APKs to a local directory, or load the complete
 split set directly for analysis. The Sign / Install tab signs single APKs with
@@ -71,6 +100,12 @@ certificates.
 The Sign / Install tab can generate `debug.keystore` beside the loaded APK or
 project. It uses `keytool`, fills the generated path into the signing form,
 and refuses to overwrite an existing keystore.
+
+When a method is open in Code / Edit, **Emulate** opens an argument form and
+runs the method in Coeus's embedded DexVm. Primitive values and strings can be
+entered directly; byte arrays accept JSON numbers or a `hex:` value. The result
+dialog reports the returned value or the VM failure. The same action is
+available from a method's source-line context menu when viewing a class.
 
 ## Editing model
 

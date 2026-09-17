@@ -574,11 +574,7 @@ impl DexInstruction {
                 "35c invoke registers must fit in four bits",
             ));
         }
-        Self::from_factory(kind(
-            ux::u4::new(register_count),
-            method_index,
-            registers,
-        ))
+        Self::from_factory(kind(ux::u4::new(register_count), method_index, registers))
     }
 
     fn from_symbolic(
@@ -787,6 +783,142 @@ impl DexInstruction {
         Self::from_factory(DexInstructionModel::CheckCast(register, type_index))
     }
 
+    #[staticmethod]
+    pub fn invoke_virtual(
+        register_count: u8,
+        method_index: u16,
+        registers: Vec<u8>,
+    ) -> PyResult<Self> {
+        Self::invoke35(
+            DexInstructionModel::InvokeVirtual,
+            register_count,
+            method_index,
+            registers,
+        )
+    }
+
+    #[staticmethod]
+    pub fn invoke_super(
+        register_count: u8,
+        method_index: u16,
+        registers: Vec<u8>,
+    ) -> PyResult<Self> {
+        Self::invoke35(
+            DexInstructionModel::InvokeSuper,
+            register_count,
+            method_index,
+            registers,
+        )
+    }
+
+    #[staticmethod]
+    pub fn invoke_direct(
+        register_count: u8,
+        method_index: u16,
+        registers: Vec<u8>,
+    ) -> PyResult<Self> {
+        Self::invoke35(
+            DexInstructionModel::InvokeDirect,
+            register_count,
+            method_index,
+            registers,
+        )
+    }
+
+    #[staticmethod]
+    pub fn invoke_static(
+        register_count: u8,
+        method_index: u16,
+        registers: Vec<u8>,
+    ) -> PyResult<Self> {
+        Self::invoke35(
+            DexInstructionModel::InvokeStatic,
+            register_count,
+            method_index,
+            registers,
+        )
+    }
+
+    #[staticmethod]
+    pub fn invoke_interface(
+        register_count: u8,
+        method_index: u16,
+        registers: Vec<u8>,
+    ) -> PyResult<Self> {
+        Self::invoke35(
+            DexInstructionModel::InvokeInterface,
+            register_count,
+            method_index,
+            registers,
+        )
+    }
+
+    #[staticmethod]
+    pub fn invoke_custom(
+        register_count: u8,
+        call_site_index: u16,
+        registers: Vec<u8>,
+    ) -> PyResult<Self> {
+        Self::invoke35(
+            DexInstructionModel::InvokeCustom,
+            register_count,
+            call_site_index,
+            registers,
+        )
+    }
+
+    #[staticmethod]
+    pub fn invoke_virtual_range(
+        register_count: u8,
+        method_index: u16,
+        first_register: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InvokeVirtualRange(
+            register_count,
+            method_index,
+            first_register,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn invoke_super_range(
+        register_count: u8,
+        method_index: u16,
+        first_register: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InvokeSuperRange(
+            register_count,
+            method_index,
+            first_register,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn invoke_direct_range(
+        register_count: u8,
+        method_index: u16,
+        first_register: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InvokeDirectRange(
+            register_count,
+            method_index,
+            first_register,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn invoke_interface_range(
+        register_count: u8,
+        method_index: u16,
+        first_register: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InvokeInterfaceRange(
+            register_count,
+            method_index,
+            first_register,
+        ))
+    }
+
     /// Construct the range form of an invoke-static instruction.
     #[staticmethod]
     pub fn invoke_static_range(
@@ -799,6 +931,250 @@ impl DexInstruction {
             method_index,
             first_register,
         ))
+    }
+
+    #[staticmethod]
+    pub fn instance_get(register: u8, object_register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstanceGet(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn instance_get_wide(
+        register: u8,
+        object_register: u8,
+        field_index: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstanceGetWide(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn instance_get_object(
+        register: u8,
+        object_register: u8,
+        field_index: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstanceGetObject(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn instance_get_boolean(
+        register: u8,
+        object_register: u8,
+        field_index: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstanceGetBoolean(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn instance_get_byte(
+        register: u8,
+        object_register: u8,
+        field_index: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstanceGetByte(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn instance_get_char(
+        register: u8,
+        object_register: u8,
+        field_index: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstanceGetChar(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn instance_get_short(
+        register: u8,
+        object_register: u8,
+        field_index: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstanceGetShort(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn instance_put(register: u8, object_register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstancePut(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn instance_put_wide(
+        register: u8,
+        object_register: u8,
+        field_index: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstancePutWide(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn instance_put_object(
+        register: u8,
+        object_register: u8,
+        field_index: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstancePutObject(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn instance_put_boolean(
+        register: u8,
+        object_register: u8,
+        field_index: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstancePutBoolean(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn instance_put_byte(
+        register: u8,
+        object_register: u8,
+        field_index: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstancePutByte(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn instance_put_char(
+        register: u8,
+        object_register: u8,
+        field_index: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstancePutChar(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn instance_put_short(
+        register: u8,
+        object_register: u8,
+        field_index: u16,
+    ) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::InstancePutShort(
+            ux::u4::new(register),
+            ux::u4::new(object_register),
+            field_index,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn static_get(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticGet(register, field_index))
+    }
+
+    #[staticmethod]
+    pub fn static_get_wide(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticGetWide(register, field_index))
+    }
+
+    #[staticmethod]
+    pub fn static_get_object(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticGetObject(register, field_index))
+    }
+
+    #[staticmethod]
+    pub fn static_get_boolean(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticGetBoolean(register, field_index))
+    }
+
+    #[staticmethod]
+    pub fn static_get_byte(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticGetByte(register, field_index))
+    }
+
+    #[staticmethod]
+    pub fn static_get_char(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticGetChar(register, field_index))
+    }
+
+    #[staticmethod]
+    pub fn static_get_short(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticGetShort(register, field_index))
+    }
+
+    #[staticmethod]
+    pub fn static_put(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticPut(register, field_index))
+    }
+
+    #[staticmethod]
+    pub fn static_put_wide(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticPutWide(register, field_index))
+    }
+
+    #[staticmethod]
+    pub fn static_put_object(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticPutObject(register, field_index))
+    }
+
+    #[staticmethod]
+    pub fn static_put_boolean(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticPutBoolean(register, field_index))
+    }
+
+    #[staticmethod]
+    pub fn static_put_byte(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticPutByte(register, field_index))
+    }
+
+    #[staticmethod]
+    pub fn static_put_char(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticPutChar(register, field_index))
+    }
+
+    #[staticmethod]
+    pub fn static_put_short(register: u8, field_index: u16) -> PyResult<Self> {
+        Self::from_factory(DexInstructionModel::StaticPutShort(register, field_index))
     }
 
     /// Construct an if-eq instruction whose target is resolved by a
@@ -1539,6 +1915,16 @@ impl DexField {
     }
     pub fn fqdn(&self) -> String {
         format!("{}->{}", self.dex_class.class.class_name, self.field_name())
+    }
+    pub fn get_field_idx(&self) -> u32 {
+        self.file
+            .fields
+            .iter()
+            .position(|field| field.as_ref() == self.field.as_ref())
+            .unwrap_or_default() as u32
+    }
+    pub fn get_dex_name(&self) -> String {
+        self.file.get_dex_name().to_string()
     }
     #[getter(dex_class)]
     pub fn get_class(&self) -> Class {

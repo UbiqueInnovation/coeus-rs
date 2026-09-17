@@ -21,6 +21,7 @@ from pathlib import Path
 
 from coeus_python import (
     AnalyzeObject,
+    DexVm,
     DexInstruction,
     Debugger,
     StackValue,
@@ -51,6 +52,7 @@ class Backend:
         self.debug_wait = None
         self.debug_waiting = False
         self.debug_breakpoints = set()
+        self.debug_breakpoint_specs = {}
         self.debug_control_queue = queue.Queue()
         self.debug_connect_result = None
         self.debug_connecting = False
@@ -60,6 +62,7 @@ class Backend:
         self.session_events = []
         self.session_script_override = None
         self.notes = {}
+        self.aliases = {}
 
     def _refresh_method(self, object_id):
         """Refresh a method wrapper after Coeus reparses an edited DEX."""
@@ -132,7 +135,7 @@ class Backend:
             if kind == "class":
                 return "class:{}".format(obj.name())
             if kind == "string":
-                return "string:{}:{}".format(obj.get_dex_name(), obj.get_index())
+                return "string:{}".format(obj.content())
         except Exception:
             pass
         return ""
@@ -167,6 +170,8 @@ class Backend:
                 return obj.get_method_idx()
             if kind == "class":
                 return obj.get_type_idx()
+            if kind == "field":
+                return obj.get_field_idx()
             if kind == "string":
                 return obj.get_index()
         except Exception:
@@ -176,7 +181,7 @@ class Backend:
     @staticmethod
     def _dex_name(kind, obj):
         try:
-            if kind in {"method", "class", "string"}:
+            if kind in {"method", "class", "field", "string"}:
                 return obj.get_dex_name()
         except Exception:
             pass
@@ -189,7 +194,9 @@ class Backend:
         self.session_events = []
         self.session_script_override = None
         self.notes = {}
+        self.aliases = {}
         self.debug_breakpoints.clear()
+        self.debug_breakpoint_specs.clear()
         self.objects.clear()
         self.next_object_id = 1
         manifests = self.ao.get_manifests()
@@ -203,6 +210,7 @@ class Backend:
             "split": False,
             "members": [],
             "notes": self.notes,
+            "aliases": self.aliases,
             "history": self._history(),
         }
 
@@ -216,7 +224,9 @@ class Backend:
         self.session_events = []
         self.session_script_override = None
         self.notes = {}
+        self.aliases = {}
         self.debug_breakpoints.clear()
+        self.debug_breakpoint_specs.clear()
         self.objects.clear()
         self.next_object_id = 1
         manifests = self.ao.get_manifests()
@@ -230,6 +240,7 @@ class Backend:
             "split": True,
             "members": self.split_set.get_names(),
             "notes": self.notes,
+            "aliases": self.aliases,
             "history": self._history(),
         }
 
@@ -254,7 +265,9 @@ class Backend:
         self.session_events = []
         self.session_script_override = None
         self.notes = {}
+        self.aliases = {}
         self.debug_breakpoints.clear()
+        self.debug_breakpoint_specs.clear()
         self.objects.clear()
         self.next_object_id = 1
         manifests = self.ao.get_manifests()
@@ -268,6 +281,7 @@ class Backend:
             "split": True,
             "members": self.split_set.get_names(),
             "notes": self.notes,
+            "aliases": self.aliases,
             "history": self._history(),
         }
 
@@ -279,6 +293,7 @@ class Backend:
         self.session_events = []
         self.session_script_override = None
         self.notes = {}
+        self.aliases = {}
         try:
             with zipfile.ZipFile(path, "r") as archive:
                 metadata = json.loads(archive.read("gui/session.json").decode("utf-8"))
@@ -295,9 +310,17 @@ class Backend:
                     for key, value in notes.items()
                     if str(key).strip() and str(value).strip()
                 }
+            aliases = metadata.get("aliases", {})
+            if isinstance(aliases, dict):
+                self.aliases = {
+                    str(key): str(value)
+                    for key, value in aliases.items()
+                    if str(key).strip() and str(value).strip()
+                }
         except (KeyError, OSError, ValueError, UnicodeDecodeError, zipfile.BadZipFile):
             pass
         self.debug_breakpoints.clear()
+        self.debug_breakpoint_specs.clear()
         self.objects.clear()
         self.next_object_id = 1
         manifests = self.ao.get_manifests()
@@ -311,6 +334,7 @@ class Backend:
             "split": len(self.split_set.get_names()) > 1,
             "members": self.split_set.get_names(),
             "notes": self.notes,
+            "aliases": self.aliases,
             "history": self._history(),
         }
 
@@ -385,11 +409,60 @@ class Backend:
             return "DexInstruction.{}({}, {})".format(
                 factory, integer("register"), integer("type_index")
             )
-        if factory == "invoke_static_range":
-            return "DexInstruction.invoke_static_range({}, {}, {})".format(
-                integer("register_count", 1),
+        if factory in {
+            "invoke_virtual",
+            "invoke_super",
+            "invoke_direct",
+            "invoke_static",
+            "invoke_interface",
+        }:
+            registers = [
+                int(value.strip().lstrip("v"), 0)
+                for value in re.split(r"[\s,]+", str(arguments.get("registers", "")).strip())
+                if value.strip()
+            ]
+            return "DexInstruction.{}({}, {}, {})".format(
+                factory,
+                integer("register_count"),
+                integer("method_index"),
+                repr(registers),
+            )
+        if factory == "invoke_custom":
+            registers = [
+                int(value.strip().lstrip("v"), 0)
+                for value in re.split(r"[\s,]+", str(arguments.get("registers", "")).strip())
+                if value.strip()
+            ]
+            return "DexInstruction.invoke_custom({}, {}, {})".format(
+                integer("register_count"),
+                integer("call_site_index"),
+                repr(registers),
+            )
+        if factory in {
+            "invoke_virtual_range",
+            "invoke_super_range",
+            "invoke_direct_range",
+            "invoke_static_range",
+            "invoke_interface_range",
+        }:
+            return "DexInstruction.{}({}, {}, {})".format(
+                factory,
+                integer("register_count"),
                 integer("method_index"),
                 integer("first_register"),
+            )
+        if factory.startswith("instance_"):
+            return "DexInstruction.{}({}, {}, {})".format(
+                factory,
+                integer("register"),
+                integer("object_register"),
+                integer("field_index"),
+            )
+        if factory.startswith("static_"):
+            return "DexInstruction.{}({}, {})".format(
+                factory,
+                integer("register"),
+                integer("field_index"),
             )
         if factory in {"if_eq", "if_ne", "if_lt", "if_le", "if_gt", "if_ge"}:
             return "DexInstruction.{}({}, {}, after)".format(
@@ -536,6 +609,7 @@ class Backend:
             "events": self.session_events,
             "history": self._history(),
             "notes": self.notes,
+            "aliases": self.aliases,
         }
         directory = str(Path(path).expanduser().resolve().parent)
         temporary = tempfile.NamedTemporaryFile(
@@ -585,6 +659,18 @@ class Backend:
         else:
             self.notes.pop(key, None)
         return {"key": key, "note": self.notes.get(key, "")}
+
+    def set_alias(self, key, alias):
+        """Create, replace, or remove a GUI-only class or method alias."""
+        key = str(key).strip()
+        if not key:
+            raise RuntimeError("alias requires a class or method identity")
+        alias = str(alias).strip()
+        if alias:
+            self.aliases[key] = alias
+        else:
+            self.aliases.pop(key, None)
+        return {"key": key, "alias": self.aliases.get(key, "")}
 
     def export_script(self, path):
         path = str(path)
@@ -840,10 +926,74 @@ class Backend:
         if finder is None:
             raise RuntimeError("unknown search kind: {}".format(kind))
         found = finder(query)
+        alias_results = []
+        alias_keys = set()
+        alias_pattern = re.compile(query or ".*")
+
+        def method_name(signature):
+            return signature.split("->", 1)[-1].split("(", 1)[0]
+
+        alias_finders = []
+        if kind in {"any", "methods"}:
+            alias_finders.append(("method", self.ao.find_methods))
+        if kind in {"any", "classes"}:
+            alias_finders.append(("class", self.ao.find_classes))
+        for key, alias in self.aliases.items():
+            prefix, separator, canonical = str(key).partition(":")
+            if not separator or prefix not in {item[0] for item in alias_finders}:
+                continue
+            if not alias_pattern.search(str(alias)):
+                continue
+            expected = canonical
+            lookup = method_name(canonical) if prefix == "method" else canonical
+            finder_for_alias = next(
+                finder_for_kind for alias_kind, finder_for_kind in alias_finders
+                if alias_kind == prefix
+            )
+            for evidence in finder_for_alias(re.escape(lookup))[:100]:
+                result = self._result(evidence, evidence=evidence)
+                if result.get("label") != expected:
+                    continue
+                identity = (result.get("kind"), result.get("label"))
+                if identity in alias_keys:
+                    continue
+                alias_keys.add(identity)
+                result["alias"] = True
+                result["alias_label"] = str(alias)
+                alias_results.append(result)
+                break
+
         results = []
+        seen = set(alias_keys)
         for evidence in found[:1000]:
-            results.append(self._result(evidence, evidence=evidence))
-        return {"results": results, "count": len(found)}
+            result = self._result(evidence, evidence=evidence)
+            identity = (result.get("kind"), result.get("label"))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            results.append(result)
+        merged = alias_results + results
+        return {"results": merged[:1000], "count": len(merged)}
+
+    def resolve(self, kind, label):
+        """Resolve one persisted note identity without using a broad GUI search."""
+        if self.ao is None:
+            raise RuntimeError("load an APK first")
+        kind = str(kind)
+        label = str(label)
+        if kind == "method":
+            lookup = label.split("->", 1)[-1].split("(", 1)[0]
+            finder = self.ao.find_methods
+        elif kind == "class":
+            lookup = label
+            finder = self.ao.find_classes
+        else:
+            raise RuntimeError("exact resolution is only supported for methods and classes")
+        for evidence in finder(re.escape(lookup)):
+            result = self._result(evidence, evidence=evidence)
+            if result.get("label") == label:
+                return result
+        raise RuntimeError("could not resolve {}: {}".format(kind, label))
 
     def edit_search(self, kind, query, dex_name=None):
         """Search for a pool object without replacing the main search list."""
@@ -950,10 +1100,39 @@ class Backend:
                     "code": obj.code(),
                     "instructions": self._instructions(obj),
                     "class": obj.get_class().name(),
+                    "method_key": obj.signature(),
                 }
             )
         elif kind == "class":
-            data.update({"code": obj.code(self.ao), "class": obj.name()})
+            code = obj.code(self.ao)
+            line_method_ids = [None] * len(code.splitlines())
+            line_method_keys = [None] * len(code.splitlines())
+            source_lines = code.splitlines()
+            search_from = 0
+            for method in obj.get_methods():
+                method_lines = method.code().splitlines()
+                if not method_lines or search_from >= len(source_lines):
+                    continue
+                start = None
+                for index in range(search_from, len(source_lines) - len(method_lines) + 1):
+                    if source_lines[index : index + len(method_lines)] == method_lines:
+                        start = index
+                        break
+                if start is None:
+                    continue
+                method_id = self._id(method, kind="method")
+                for index in range(start, start + len(method_lines)):
+                    line_method_ids[index] = method_id
+                    line_method_keys[index] = method.signature()
+                search_from = start + len(method_lines)
+            data.update(
+                {
+                    "code": code,
+                    "class": obj.name(),
+                    "line_method_ids": line_method_ids,
+                    "line_method_keys": line_method_keys,
+                }
+            )
         elif kind == "field_access":
             function = obj.get_function()
             method_id = self._id(function, kind="method")
@@ -961,6 +1140,98 @@ class Backend:
         elif kind == "string":
             data.update({"value": obj.content()})
         return data
+
+    @staticmethod
+    def _emulation_descriptors(proto):
+        """Return the Dalvik argument descriptors from a method prototype."""
+        arguments = proto.split("(", 1)[1].split(")", 1)[0]
+        descriptors = []
+        index = 0
+        while index < len(arguments):
+            start = index
+            while index < len(arguments) and arguments[index] == "[":
+                index += 1
+            if index >= len(arguments):
+                raise RuntimeError("invalid method prototype: {}".format(proto))
+            if arguments[index] == "L":
+                end = arguments.find(";", index)
+                if end < 0:
+                    raise RuntimeError("invalid method prototype: {}".format(proto))
+                index = end + 1
+            else:
+                index += 1
+            descriptors.append(arguments[start:index])
+        return descriptors
+
+    @staticmethod
+    def _emulation_argument(descriptor, text):
+        value = "" if text is None else str(text)
+        normalized = value.strip()
+        if descriptor == "Z":
+            if normalized.lower() in ("true", "1", "yes"):
+                return True
+            if normalized.lower() in ("false", "0", "no"):
+                return False
+            raise RuntimeError("boolean arguments must be true or false")
+        if descriptor in ("B", "S", "I", "J"):
+            try:
+                return int(normalized, 0)
+            except ValueError as error:
+                raise RuntimeError("{} is not an integer".format(value)) from error
+        if descriptor == "C":
+            if len(value) == 1:
+                return value
+            try:
+                return chr(int(normalized, 0))
+            except (ValueError, TypeError) as error:
+                raise RuntimeError("character arguments must be one character or a code point") from error
+        if descriptor in ("F", "D"):
+            try:
+                return float(normalized)
+            except ValueError as error:
+                raise RuntimeError("{} is not a floating-point number".format(value)) from error
+        if descriptor == "Ljava/lang/String;":
+            return value
+        if descriptor in ("[B", "[C"):
+            try:
+                if normalized.startswith("hex:"):
+                    return bytes.fromhex(normalized[4:].replace(" ", ""))
+                if normalized.startswith("["):
+                    values = json.loads(normalized)
+                    return bytes(int(item) & 0xFF for item in values)
+            except (ValueError, TypeError, json.JSONDecodeError) as error:
+                raise RuntimeError("array arguments must be JSON numbers or hex:…") from error
+            raise RuntimeError("array arguments must use JSON numbers or hex:…")
+        raise RuntimeError("argument type {} is not supported yet".format(descriptor))
+
+    def emulate(self, object_id, arguments):
+        entry = self._entry(object_id)
+        if entry["kind"] != "method":
+            raise RuntimeError("emulation is only available for methods")
+        method = entry["object"]
+        descriptors = self._emulation_descriptors(method.proto_type())
+        if len(arguments) != len(descriptors):
+            return {
+                "success": False,
+                "error": "expected {} argument(s), received {}".format(
+                    len(descriptors), len(arguments)
+                ),
+            }
+        try:
+            converted = [
+                self._emulation_argument(descriptor, value)
+                for descriptor, value in zip(descriptors, arguments)
+            ]
+            vm = DexVm(self.ao)
+            result = method(*converted, vm=vm)
+            value = result.get_value()
+            return {
+                "success": True,
+                "result": repr(value),
+                "return_type": method.get_return_type(),
+            }
+        except Exception as error:
+            return {"success": False, "error": str(error)}
 
     def replace_string(self, object_id, replacement):
         if self.ao is None:
@@ -1026,8 +1297,10 @@ class Backend:
             return "Register moves"
         if factory in {"new_instance", "check_cast"}:
             return "Objects and types"
-        if factory == "invoke_static_range":
+        if factory.startswith("invoke_"):
             return "Function calls"
+        if factory.startswith("instance_") or factory.startswith("static_"):
+            return "Fields"
         if factory == "nop":
             return "Basic"
         return "Other"
@@ -1082,11 +1355,56 @@ class Backend:
                 self._edit_int(arguments, "register", 0),
                 self._edit_int(arguments, "type_index", 0),
             )
-        if factory == "invoke_static_range":
-            return DexInstruction.invoke_static_range(
-                self._edit_int(arguments, "register_count", 1),
+        if factory in {
+            "invoke_virtual",
+            "invoke_super",
+            "invoke_direct",
+            "invoke_static",
+            "invoke_interface",
+        }:
+            registers = [
+                int(value.strip().lstrip("v"), 0)
+                for value in re.split(r"[\s,]+", str(arguments.get("registers", "")).strip())
+                if value.strip()
+            ]
+            return getattr(DexInstruction, factory)(
+                self._edit_int(arguments, "register_count", 0),
+                self._edit_int(arguments, "method_index", 0),
+                registers,
+            )
+        if factory == "invoke_custom":
+            registers = [
+                int(value.strip().lstrip("v"), 0)
+                for value in re.split(r"[\s,]+", str(arguments.get("registers", "")).strip())
+                if value.strip()
+            ]
+            return DexInstruction.invoke_custom(
+                self._edit_int(arguments, "register_count", 0),
+                self._edit_int(arguments, "call_site_index", 0),
+                registers,
+            )
+        if factory in {
+            "invoke_virtual_range",
+            "invoke_super_range",
+            "invoke_direct_range",
+            "invoke_static_range",
+            "invoke_interface_range",
+        }:
+            return getattr(DexInstruction, factory)(
+                self._edit_int(arguments, "register_count", 0),
                 self._edit_int(arguments, "method_index", 0),
                 self._edit_int(arguments, "first_register", 0),
+            )
+        if factory.startswith("instance_"):
+            return getattr(DexInstruction, factory)(
+                self._edit_int(arguments, "register", 0),
+                self._edit_int(arguments, "object_register", 0),
+                self._edit_int(arguments, "field_index", 0),
+            )
+        if factory.startswith("static_"):
+            return getattr(DexInstruction, factory)(
+                self._edit_int(arguments, "register", 0),
+                self._edit_int(arguments, "field_index", 0),
             )
         if factory in {
             "if_eq",
@@ -1140,11 +1458,12 @@ class Backend:
         target_text = str(target)
         registers = [int(value) for value in re.findall(r"\bv(\d+)\b", target_text)]
         first_register = registers[0] if registers else 0
-        register_count = len(registers) or 1
+        register_count = len(registers)
         if ".." in target_text and len(registers) >= 2:
             register_count = max(1, registers[-1] - registers[0] + 1)
 
         method_index = 0
+        field_index = 0
         for navigation_target in self._instruction_targets(target):
             if navigation_target["kind"] == "method":
                 try:
@@ -1152,6 +1471,13 @@ class Backend:
                 except Exception:
                     pass
                 break
+            if navigation_target["kind"] == "field":
+                try:
+                    field_index = self._entry(navigation_target["id"])["object"].get_field_idx()
+                except Exception:
+                    pass
+
+        register_list = ", ".join("v{}".format(value) for value in registers)
 
         integer = lambda name, label, value: self._edit_argument(name, label, value)
         candidates = [
@@ -1167,11 +1493,117 @@ class Backend:
             {"factory": "move_object_from16", "label": "move-object/from16", "action": "replace", "arguments": [integer("register", "Destination register", 0), integer("source_register", "Source register", 0)]},
             {"factory": "new_instance", "label": "new-instance", "action": "replace", "arguments": [integer("register", "Destination register", 0), self._edit_argument("type_index", "Class/type entry", 0, picker="classes")]},
             {"factory": "check_cast", "label": "check-cast", "action": "replace", "arguments": [integer("register", "Register", 0), self._edit_argument("type_index", "Class/type entry", 0, picker="classes")]},
-            {"factory": "invoke_static_range", "label": "invoke-static/range function", "action": "replace", "arguments": [integer("register_count", "Argument register count", register_count), self._edit_argument("method_index", "Target method", method_index, picker="methods"), integer("first_register", "First argument register", first_register)]},
             {"factory": "insert_nop", "label": "Insert NOP before", "action": "insert_before", "arguments": []},
             {"factory": "insert_nop", "label": "Insert NOP after", "action": "insert_after", "arguments": []},
             {"factory": "prepend_nop", "label": "Prepend NOP at method entry", "action": "prepend", "arguments": []},
         ]
+        for factory, label in [
+            ("invoke_virtual", "invoke-virtual"),
+            ("invoke_super", "invoke-super"),
+            ("invoke_direct", "invoke-direct"),
+            ("invoke_static", "invoke-static"),
+            ("invoke_interface", "invoke-interface"),
+        ]:
+            candidates.append({
+                "factory": factory,
+                "label": label,
+                "action": "replace",
+                "arguments": [
+                    integer("register_count", "Argument register count", min(register_count, 5)),
+                    self._edit_argument("registers", "Argument registers", register_list, "text"),
+                    self._edit_argument("method_index", "Target method", method_index, picker="methods"),
+                ],
+            })
+        for factory, label in [
+            ("invoke_virtual_range", "invoke-virtual/range"),
+            ("invoke_super_range", "invoke-super/range"),
+            ("invoke_direct_range", "invoke-direct/range"),
+            ("invoke_static_range", "invoke-static/range"),
+            ("invoke_interface_range", "invoke-interface/range"),
+        ]:
+            candidates.append({
+                "factory": factory,
+                "label": label,
+                "action": "replace",
+                "arguments": [
+                    integer("register_count", "Argument register count", register_count),
+                    self._edit_argument("method_index", "Target method", method_index, picker="methods"),
+                    integer("first_register", "First argument register", first_register),
+                ],
+            })
+        candidates.append({
+            "factory": "invoke_custom",
+            "label": "invoke-custom",
+            "action": "replace",
+            "arguments": [
+                integer("register_count", "Argument register count", min(register_count, 5)),
+                self._edit_argument("registers", "Argument registers", register_list, "text"),
+                integer("call_site_index", "Call-site index", 0),
+            ],
+        })
+        for factory, label in [
+            ("instance_get", "iget"),
+            ("instance_get_wide", "iget-wide"),
+            ("instance_get_object", "iget-object"),
+            ("instance_get_boolean", "iget-boolean"),
+            ("instance_get_byte", "iget-byte"),
+            ("instance_get_char", "iget-char"),
+            ("instance_get_short", "iget-short"),
+        ]:
+            candidates.append({
+                "factory": factory,
+                "label": label,
+                "action": "replace",
+                "arguments": [
+                    integer("register", "Destination register", first_register),
+                    integer("object_register", "Object register", 0),
+                    self._edit_argument("field_index", "Target field", field_index, picker="fields"),
+                ],
+            })
+        for factory, label in [
+            ("instance_put", "iput"),
+            ("instance_put_wide", "iput-wide"),
+            ("instance_put_object", "iput-object"),
+            ("instance_put_boolean", "iput-boolean"),
+            ("instance_put_byte", "iput-byte"),
+            ("instance_put_char", "iput-char"),
+            ("instance_put_short", "iput-short"),
+        ]:
+            candidates.append({
+                "factory": factory,
+                "label": label,
+                "action": "replace",
+                "arguments": [
+                    integer("register", "Source register", first_register),
+                    integer("object_register", "Object register", 0),
+                    self._edit_argument("field_index", "Target field", field_index, picker="fields"),
+                ],
+            })
+        for factory, label in [
+            ("static_get", "sget"),
+            ("static_get_wide", "sget-wide"),
+            ("static_get_object", "sget-object"),
+            ("static_get_boolean", "sget-boolean"),
+            ("static_get_byte", "sget-byte"),
+            ("static_get_char", "sget-char"),
+            ("static_get_short", "sget-short"),
+            ("static_put", "sput"),
+            ("static_put_wide", "sput-wide"),
+            ("static_put_object", "sput-object"),
+            ("static_put_boolean", "sput-boolean"),
+            ("static_put_byte", "sput-byte"),
+            ("static_put_char", "sput-char"),
+            ("static_put_short", "sput-short"),
+        ]:
+            candidates.append({
+                "factory": factory,
+                "label": label,
+                "action": "replace",
+                "arguments": [
+                    integer("register", "Register", first_register),
+                    self._edit_argument("field_index", "Target field", field_index, picker="fields"),
+                ],
+            })
         for factory, label in [
             ("if_eq", "Insert if-eq"), ("if_ne", "Insert if-ne"),
             ("if_lt", "Insert if-lt"), ("if_le", "Insert if-le"),
@@ -1440,6 +1872,7 @@ class Backend:
         self.debug_method = None
         self.debug_values = []
         self.debug_breakpoints.clear()
+        self.debug_breakpoint_specs.clear()
         return {"connecting": False, "connected": True}
 
     def debug_detach(self):
@@ -1448,7 +1881,7 @@ class Backend:
         # requested while the target is being polled for an event.
         if self.debug_waiting:
             result = queue.Queue(maxsize=1)
-            self.debug_control_queue.put(("detach", None, None, result))
+            self.debug_control_queue.put(("detach", None, None, result, True))
             try:
                 result.get(timeout=1.0)
             except queue.Empty:
@@ -1519,12 +1952,16 @@ class Backend:
         if entry["kind"] != "method":
             raise RuntimeError("breakpoints require a method")
         offset = int(offset)
-        key = (entry["object"].signature(), offset)
+        method = entry["object"]
+        method_key = method.signature()
+        key = (method_key, offset)
+        self.debug_breakpoint_specs[key] = (object_id, method)
         enabled = key not in self.debug_breakpoints
         if self.debug_waiting:
             result = queue.Queue(maxsize=1)
+            stop_after = len(self.debug_breakpoints) <= 1 if not enabled else False
             self.debug_control_queue.put(
-                ("set" if enabled else "clear", entry["object"], offset, result)
+                ("set" if enabled else "clear", method, offset, result, stop_after)
             )
             try:
                 status, error = result.get(timeout=5)
@@ -1538,31 +1975,38 @@ class Backend:
                 self.debug_breakpoints.add(key)
                 return {
                     "enabled": True,
+                    "method_id": object_id,
+                    "method_key": method_key,
                     "offset": offset,
-                    "location": "{}@0x{:x}".format(entry["object"].signature(), offset),
+                    "location": "{}@0x{:x}".format(method_key, offset),
                     "waiting": True,
                 }
             else:
-                self.debug_waiting = False
-                self.debug_wait = None
                 self.debug_breakpoints.remove(key)
+                if stop_after:
+                    self.debug_waiting = False
+                    self.debug_wait = None
                 return {
                     "enabled": False,
+                    "method_id": object_id,
+                    "method_key": method_key,
                     "offset": offset,
-                    "location": "{}@0x{:x}".format(entry["object"].signature(), offset),
-                    "waiting": False,
+                    "location": "{}@0x{:x}".format(method_key, offset),
+                    "waiting": self.debug_waiting,
                 }
 
         if not enabled:
-            self.debugger.clear_breakpoint(entry["object"], offset)
+            self.debugger.clear_breakpoint(method, offset)
             self.debug_breakpoints.remove(key)
             return {
                 "enabled": False,
+                "method_id": object_id,
+                "method_key": method_key,
                 "offset": offset,
-                "location": "{}@0x{:x}".format(entry["object"].signature(), offset),
-                "waiting": False,
+                "location": "{}@0x{:x}".format(method_key, offset),
+                "waiting": self.debug_waiting,
             }
-        self.debugger.set_breakpoint(entry["object"], offset)
+        self.debugger.set_breakpoint(method, offset)
         self.debug_breakpoints.add(key)
         # A stopped frame means the VM is already suspended and there is no
         # need to start an event waiter yet. Starting one here would make the
@@ -1579,13 +2023,114 @@ class Backend:
             wait = self.debug_wait_start()
         return {
             "enabled": True,
+            "method_id": object_id,
+            "method_key": method_key,
             "offset": offset,
-            "location": "{}@0x{:x}".format(entry["object"].signature(), offset),
+            "location": "{}@0x{:x}".format(method_key, offset),
             **wait,
         }
 
+    def debug_breakpoint_skip(self, object_id, offset, skip=True):
+        if self.debugger is None:
+            raise RuntimeError("connect a debugger first")
+        entry = self._entry(object_id)
+        if entry["kind"] != "method":
+            raise RuntimeError("breakpoints require a method")
+        method = entry["object"]
+        method_key = method.signature()
+        offset = int(offset)
+        key = (method_key, offset)
+        if key not in self.debug_breakpoint_specs:
+            self.debug_breakpoint_specs[key] = (object_id, method)
+        active = key in self.debug_breakpoints
+        if bool(skip) == (not active):
+            return {
+                "enabled": active,
+                "method_id": object_id,
+                "method_key": method_key,
+                "offset": offset,
+                "location": "{}@0x{:x}".format(method_key, offset),
+                "waiting": self.debug_waiting,
+            }
+        if self.debug_waiting:
+            result = queue.Queue(maxsize=1)
+            stop_after = bool(skip) and len(self.debug_breakpoints) <= 1
+            self.debug_control_queue.put(
+                ("clear" if skip else "set", method, offset, result, stop_after)
+            )
+            try:
+                status, error = result.get(timeout=5)
+            except queue.Empty:
+                raise RuntimeError(
+                    "timed out while changing the breakpoint from the JDWP wait thread"
+                )
+            if status != "ok":
+                raise RuntimeError(error)
+        elif skip:
+            self.debugger.clear_breakpoint(method, offset)
+        else:
+            self.debugger.set_breakpoint(method, offset)
+        if skip:
+            self.debug_breakpoints.discard(key)
+            if self.debug_waiting and len(self.debug_breakpoints) == 0:
+                self.debug_waiting = False
+                self.debug_wait = None
+        else:
+            self.debug_breakpoints.add(key)
+            if not self.debug_waiting and self.debug_frame is None:
+                self.debug_wait_start()
+        return {
+            "enabled": not bool(skip),
+            "method_id": object_id,
+            "method_key": method_key,
+            "offset": offset,
+            "location": "{}@0x{:x}".format(method_key, offset),
+            "waiting": self.debug_waiting,
+        }
+
+    def debug_breakpoint_remove(self, object_id, offset):
+        if self.debugger is None:
+            raise RuntimeError("connect a debugger first")
+        entry = self._entry(object_id)
+        if entry["kind"] != "method":
+            raise RuntimeError("breakpoints require a method")
+        method = entry["object"]
+        method_key = method.signature()
+        offset = int(offset)
+        key = (method_key, offset)
+        if key in self.debug_breakpoints:
+            if self.debug_waiting:
+                result = queue.Queue(maxsize=1)
+                self.debug_control_queue.put(
+                    ("clear", method, offset, result, len(self.debug_breakpoints) <= 1)
+                )
+                try:
+                    status, error = result.get(timeout=5)
+                except queue.Empty:
+                    raise RuntimeError(
+                        "timed out while removing the breakpoint from the JDWP wait thread"
+                    )
+                if status != "ok":
+                    raise RuntimeError(error)
+            else:
+                self.debugger.clear_breakpoint(method, offset)
+            self.debug_breakpoints.discard(key)
+        self.debug_breakpoint_specs.pop(key, None)
+        if not self.debug_breakpoints:
+            self.debug_waiting = False
+            self.debug_wait = None
+        return {
+            "enabled": False,
+            "removed": True,
+            "method_id": object_id,
+            "method_key": method_key,
+            "offset": offset,
+            "location": "{}@0x{:x}".format(method_key, offset),
+            "waiting": self.debug_waiting,
+        }
+
     def _handle_debug_control(self, command):
-        kind, method, offset, result = command
+        kind, method, offset, result, stop_after = command
         try:
             if kind == "detach":
                 result.put(("ok", None))
@@ -1602,7 +2147,7 @@ class Backend:
             result.put(("ok", None))
         # Clearing cancels the wait worker. Setting leaves it as the owner of
         # the JDWP connection so it can continue polling safely.
-        return kind == "clear"
+        return kind == "clear" and stop_after
 
     def _wait_worker(self):
         while True:
@@ -1801,6 +2346,8 @@ class Backend:
             return self.save_project(request["path"])
         if op == "set_note":
             return self.set_note(request["key"], request.get("note", ""))
+        if op == "set_alias":
+            return self.set_alias(request["key"], request.get("alias", ""))
         if op == "export_script":
             return self.export_script(request["path"])
         if op == "generate_keystore":
@@ -1886,6 +2433,8 @@ class Backend:
             return self.replace_string(request["id"], request["value"])
         if op == "search":
             return self.search(request.get("kind", "any"), request.get("query", ".*"))
+        if op == "resolve":
+            return self.resolve(request.get("kind", "method"), request.get("label", ""))
         if op == "edit_search":
             return self.edit_search(
                 request.get("kind", "methods"),
@@ -1894,6 +2443,8 @@ class Backend:
             )
         if op == "describe":
             return self.describe(request["id"])
+        if op == "emulate":
+            return self.emulate(request["id"], request.get("arguments", []))
         if op == "edit_options":
             return self.edit_options(request["id"], request["offset"])
         if op == "apply_edit":
@@ -1923,6 +2474,12 @@ class Backend:
             return self.debug_apps_poll()
         if op == "debug_breakpoint":
             return self.debug_breakpoint(request["id"], request["offset"])
+        if op == "debug_breakpoint_skip":
+            return self.debug_breakpoint_skip(
+                request["id"], request["offset"], request.get("skip", True)
+            )
+        if op == "debug_breakpoint_remove":
+            return self.debug_breakpoint_remove(request["id"], request["offset"])
         if op == "debug_wait":
             return self.debug_wait_start()
         if op == "debug_poll":
