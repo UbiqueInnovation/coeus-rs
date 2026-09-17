@@ -558,6 +558,29 @@ impl DexInstruction {
         Ok(Self::from_instruction(instruction, 0, size, None))
     }
 
+    fn invoke35(
+        kind: fn(ux::u4, u16, Vec<u8>) -> DexInstructionModel,
+        register_count: u8,
+        method_index: u16,
+        registers: Vec<u8>,
+    ) -> PyResult<Self> {
+        if register_count > 5 || registers.len() != register_count as usize {
+            return Err(PyRuntimeError::new_err(
+                "35c invoke register count must match and be at most five",
+            ));
+        }
+        if registers.iter().any(|register| *register > 15) {
+            return Err(PyRuntimeError::new_err(
+                "35c invoke registers must fit in four bits",
+            ));
+        }
+        Self::from_factory(kind(
+            ux::u4::new(register_count),
+            method_index,
+            registers,
+        ))
+    }
+
     fn from_symbolic(
         instruction: DexInstructionModel,
         symbolic: SymbolicInstruction,

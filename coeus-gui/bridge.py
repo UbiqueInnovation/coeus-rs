@@ -1442,6 +1442,29 @@ class Backend:
         self.debug_breakpoints.clear()
         return {"connecting": False, "connected": True}
 
+    def debug_detach(self):
+        # Let the polling worker release the JDWP object before closing it.
+        # This avoids concurrent use of the native client when a detach is
+        # requested while the target is being polled for an event.
+        if self.debug_waiting:
+            result = queue.Queue(maxsize=1)
+            self.debug_control_queue.put(("detach", None, None, result))
+            try:
+                result.get(timeout=1.0)
+            except queue.Empty:
+                pass
+        debugger = self.debugger
+        self.debugger = None
+        self.debug_waiting = False
+        self.debug_wait = None
+        self.debug_frame = None
+        self.debug_method = None
+        self.debug_values = []
+        self.debug_breakpoints.clear()
+        if debugger is not None:
+            debugger.close()
+        return {"connected": False, "detached": True}
+
     @staticmethod
     def _debug_apps_worker(result_queue, serial, adb_path):
         try:
@@ -1564,6 +1587,9 @@ class Backend:
     def _handle_debug_control(self, command):
         kind, method, offset, result = command
         try:
+            if kind == "detach":
+                result.put(("ok", None))
+                return True
             if kind == "set":
                 self.debugger.set_breakpoint(method, offset)
             elif kind == "clear":
@@ -1727,6 +1753,8 @@ class Backend:
         normalized = text.strip()
         if normalized.lower() in ("true", "false"):
             value = normalized.lower() == "true"
+        elif normalized.lower() in ("none", "null", "nil"):
+            value = None
         else:
             try:
                 value = int(normalized, 0)
@@ -1885,6 +1913,8 @@ class Backend:
                 request.get("serial"),
                 request.get("adb_path"),
             )
+        if op == "debug_detach":
+            return self.debug_detach()
         if op == "debug_connect_poll":
             return self.debug_connect_poll()
         if op == "debug_apps":

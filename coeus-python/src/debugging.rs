@@ -16,7 +16,7 @@ use pyo3::{
     types::{PyAnyMethods, PyBool, PyFloat, PyInt, PyModule, PyModuleMethods, PyString},
     wrap_pyfunction, Bound, IntoPy, Py, PyAny, PyResult, Python, ToPyObject,
 };
-use std::{path::Path, time::Duration};
+use std::{collections::HashSet, path::Path, time::Duration};
 
 use crate::{analysis::Method, parse::AnalyzeObject};
 
@@ -188,6 +188,20 @@ impl StackValue {
         let bound_val = value.bind(py);
         let val = bound_val.as_ref();
         match val {
+            v if v.is_none() => {
+                let null_value = match old_value.map(|old| &old.slot.value) {
+                    Some(coeus::coeus_debug::models::Value::Array(_)) => {
+                        coeus::coeus_debug::models::Value::Array(0)
+                    }
+                    Some(coeus::coeus_debug::models::Value::String(_)) => {
+                        coeus::coeus_debug::models::Value::String(0)
+                    }
+                    _ => coeus::coeus_debug::models::Value::Object(0),
+                };
+                Ok(StackValue {
+                    slot: null_value.into(),
+                })
+            }
             v if v.is_instance_of::<PyBool>() => {
                 let value: bool = val.extract()?;
                 let stack_value = coeus::coeus_debug::models::Value::Boolean(value as u8);
@@ -284,12 +298,18 @@ impl StackValue {
             coeus::coeus_debug::models::Value::Int(i) => Ok(i.to_object(py)),
             coeus::coeus_debug::models::Value::Long(l) => Ok(l.to_object(py)),
             coeus::coeus_debug::models::Value::String(s) => {
+                if s == 0 {
+                    return Ok(None::<String>.to_object(py));
+                }
                 let Ok(s) = debugger.jdwp_client.get_string(&debugger.rt, s) else {
                     return Err(PyRuntimeError::new_err("Could not get string"));
                 };
                 Ok(s.to_object(py))
             }
             coeus::coeus_debug::models::Value::Array(a) => {
+                if a == 0 {
+                    return Ok(None::<String>.to_object(py));
+                }
                 let Ok(values) = debugger.jdwp_client.get_array(&debugger.rt, a) else {
                     return Err(PyRuntimeError::new_err("Could not get array"));
                 };
@@ -305,6 +325,109 @@ impl StackValue {
     }
 }
 
+fn debug_string_registers(method: &Method, code_index: u64) -> HashSet<u16> {
+    let Some(code) = method
+        .method_data
+        .as_ref()
+        .and_then(|data| data.code.as_ref())
+    else {
+        return HashSet::new();
+    };
+
+    let mut string_registers = HashSet::new();
+    let mut pending_invoke_returns_string = None;
+    for (_, offset, instruction) in &code.insns {
+        if u32::from(*offset) as u64 > code_index {
+            break;
+        }
+
+        match instruction {
+            instruction if invoke_method_index(instruction).is_some() => {
+                pending_invoke_returns_string = invoke_method_index(instruction)
+                    .and_then(|method_idx| method.file.methods.get(method_idx as usize))
+                    .and_then(|target| method.file.protos.get(target.proto_idx as usize))
+                    .and_then(|proto| method.file.get_type_name(proto.return_type_idx as usize))
+                    .map(|return_type| return_type == "Ljava/lang/String;");
+            }
+            coeus::coeus_models::models::Instruction::MoveResultObject(register) => {
+                if pending_invoke_returns_string == Some(true) {
+                    string_registers.insert(*register as u16);
+                } else {
+                    string_registers.remove(&(*register as u16));
+                }
+                pending_invoke_returns_string = None;
+            }
+            coeus::coeus_models::models::Instruction::MoveResult(register)
+            | coeus::coeus_models::models::Instruction::MoveResultWide(register) => {
+                string_registers.remove(&(*register as u16));
+                pending_invoke_returns_string = None;
+            }
+            coeus::coeus_models::models::Instruction::ConstString(register, _)
+            | coeus::coeus_models::models::Instruction::ConstStringJumbo(register, _) => {
+                string_registers.insert(*register as u16);
+                pending_invoke_returns_string = None;
+            }
+            coeus::coeus_models::models::Instruction::MoveObject(destination, source) => {
+                copy_debug_string_type(
+                    &mut string_registers,
+                    u16::from(*destination),
+                    u16::from(*source),
+                );
+                pending_invoke_returns_string = None;
+            }
+            coeus::coeus_models::models::Instruction::MoveObjectFrom16(destination, source) => {
+                copy_debug_string_type(&mut string_registers, u16::from(*destination), *source);
+                pending_invoke_returns_string = None;
+            }
+            coeus::coeus_models::models::Instruction::MoveObject16(destination, source) => {
+                copy_debug_string_type(&mut string_registers, *destination, *source);
+                pending_invoke_returns_string = None;
+            }
+            coeus::coeus_models::models::Instruction::CheckCast(register, type_idx) => {
+                if method.file.get_type_name(*type_idx) == Some("Ljava/lang/String;") {
+                    string_registers.insert(*register as u16);
+                } else {
+                    string_registers.remove(&(*register as u16));
+                }
+                pending_invoke_returns_string = None;
+            }
+            coeus::coeus_models::models::Instruction::NewInstance(register, _) => {
+                string_registers.remove(&(*register as u16));
+                pending_invoke_returns_string = None;
+            }
+            _ => pending_invoke_returns_string = None,
+        }
+    }
+
+    string_registers
+}
+
+fn copy_debug_string_type(string_registers: &mut HashSet<u16>, destination: u16, source: u16) {
+    if string_registers.contains(&source) {
+        string_registers.insert(destination);
+    } else {
+        string_registers.remove(&destination);
+    }
+}
+
+fn invoke_method_index(instruction: &coeus::coeus_models::models::Instruction) -> Option<u16> {
+    use coeus::coeus_models::models::Instruction;
+
+    match instruction {
+        Instruction::InvokeVirtual(_, method_idx, _)
+        | Instruction::InvokeSuper(_, method_idx, _)
+        | Instruction::InvokeDirect(_, method_idx, _)
+        | Instruction::InvokeStatic(_, method_idx, _)
+        | Instruction::InvokeInterface(_, method_idx, _)
+        | Instruction::InvokeVirtualRange(_, method_idx, _)
+        | Instruction::InvokeSuperRange(_, method_idx, _)
+        | Instruction::InvokeDirectRange(_, method_idx, _)
+        | Instruction::InvokeStaticRange(_, method_idx, _)
+        | Instruction::InvokeInterfaceRange(_, method_idx, _) => Some(*method_idx),
+        _ => None,
+    }
+}
+
 #[pymethods]
 impl DebuggerStackFrame {
     pub fn get_values_for(&self, debugger: &mut Debugger, m: &Method) -> PyResult<Vec<StackValue>> {
@@ -317,7 +440,23 @@ impl DebuggerStackFrame {
         else {
             return Err(PyRuntimeError::new_err("Failed to get values"));
         };
-        Ok(values.into_iter().map(|slot| StackValue { slot }).collect())
+        let string_registers = debug_string_registers(m, self.get_code_index());
+        Ok(values
+            .into_iter()
+            .enumerate()
+            .map(|(slot, mut value)| {
+                if string_registers.contains(&(slot as u16))
+                    && matches!(value.value, coeus::coeus_debug::models::Value::Object(_))
+                {
+                    let object_id = match value.value {
+                        coeus::coeus_debug::models::Value::Object(object_id) => object_id,
+                        _ => unreachable!("the value was checked to be an object"),
+                    };
+                    value = coeus::coeus_debug::models::Value::String(object_id).into();
+                }
+                StackValue { slot: value }
+            })
+            .collect())
     }
     pub fn set_value(
         &self,

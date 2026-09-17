@@ -1,13 +1,25 @@
 # Coeus GUI
 
-`coeus-gui` is a native `egui` desktop frontend for the existing
-`coeus-python` API. The Rust process owns the UI and a small Python worker
-owns `AnalyzeObject` and `Debugger` instances behind a JSON-lines protocol.
+`coeus-gui` is a native `egui` desktop frontend with two interchangeable
+analysis backends. Both receive and return the same JSON request/response
+objects used by the UI:
+
+- `python` keeps the existing `bridge.py` worker and `coeus-python` wheel.
+- `rust` uses the `coeus` crates directly, with no Python process or PyO3
+  interop.
 
 ## Build and run
 
-Build the Python extension from `coeus-python` and install its wheel into the
-Python environment that will run the worker:
+The native Rust backend needs only the Rust dependencies:
+
+```text
+cd coeus-gui
+COEUS_GUI_BACKEND=rust cargo run --release
+```
+
+To use the compatibility backend, build the Python extension from
+`coeus-python` and install its wheel into the Python environment that will run
+the worker:
 
 ```text
 cd coeus-python
@@ -17,14 +29,28 @@ cd ../coeus-gui
 cargo run --release
 ```
 
+The Python backend remains the default for compatibility. Select either
+backend at runtime without rebuilding:
+
+```text
+COEUS_GUI_BACKEND=python cargo run --release
+COEUS_GUI_BACKEND=rust cargo run --release
+```
+
 Use the Browse button to choose an APK in the application. The Python
-executable can be overridden with `COEUS_PYTHON=/path/to/python`.
+executable can be overridden with `COEUS_PYTHON=/path/to/python` when using
+the Python backend. The Rust backend covers the same current GUI feature set:
+APK loading, split APK sets, manifest changes, search, inspection, graphing,
+DEX string/instruction editing, project archives, ADB operations, signing,
+installation, keystore generation, JDWP debugging, and replayable Python
+script export. Native inspection commands can run concurrently; state-changing
+commands are serialized per loaded analysis.
 The project controls can save and reopen a `.coeus` project archive. The
 archive is the GUI's portable virtual project boundary: it contains the
-current bytes of every APK member, Coeus edit history, GUI annotations, and
-`gui/session.py`, a generated Python replay script. `Export script…` writes
-that script separately for review or automation. Reopening an archive does
-not require the source APKs to remain available.
+current bytes of every APK member, Coeus edit history, and GUI annotations.
+Both backends store `gui/session.py`, a generated Python replay script, and
+support exporting that script separately. Reopening an archive does not
+require the source APKs to remain available.
 The project/search sidebar, code pane, instruction pane, graph canvas, and
 source panes can be resized; the project and instruction panes can also be
 collapsed. The Code / Edit tab gives the smali source and replacement-node

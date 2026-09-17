@@ -12,17 +12,26 @@ use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{self, Color32, FontId, Key, Rect, RichText, Sense, Stroke, Vec2};
 use serde_json::{json, Value};
 
+mod native_backend;
+use native_backend::RustBackendHandle;
+
 const BRIDGE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bridge.py");
 
 type Response = Result<Value, String>;
 
-struct Bridge {
+struct PendingRequest {
+    request_id: u64,
+    operation: String,
+    receiver: mpsc::Receiver<Response>,
+}
+
+struct PythonBridge {
     _child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
 
-impl Bridge {
+impl PythonBridge {
     fn spawn() -> Result<Self, String> {
         let python = std::env::var("COEUS_PYTHON").unwrap_or_else(|_| "python3".to_string());
         if !std::path::Path::new(BRIDGE_PATH).exists() {
@@ -76,6 +85,56 @@ impl Bridge {
                 .unwrap_or("unknown Python bridge error")
                 .to_string())
         }
+    }
+}
+
+enum Backend {
+    Python(Arc<Mutex<PythonBridge>>),
+    Rust(Arc<RustBackendHandle>),
+}
+
+struct Bridge {
+    backend: Backend,
+}
+
+impl Backend {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Python(_) => "python",
+            Self::Rust(_) => "rust",
+        }
+    }
+}
+
+impl Bridge {
+    fn spawn() -> Result<Self, String> {
+        let selected = std::env::var("COEUS_GUI_BACKEND")
+            .unwrap_or_else(|_| "python".to_string())
+            .to_ascii_lowercase();
+        let backend = match selected.as_str() {
+            "python" => Backend::Python(Arc::new(Mutex::new(PythonBridge::spawn()?))),
+            "rust" | "native" => Backend::Rust(Arc::new(RustBackendHandle::new())),
+            other => {
+                return Err(format!(
+                    "unknown COEUS_GUI_BACKEND={other}; expected python or rust"
+                ))
+            }
+        };
+        Ok(Self { backend })
+    }
+
+    fn call(&self, request: Value) -> Response {
+        match &self.backend {
+            Backend::Python(bridge) => bridge
+                .lock()
+                .map_err(|_| "Python bridge lock was poisoned".to_string())?
+                .call(request),
+            Backend::Rust(backend) => backend.call(request),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        self.backend.name()
     }
 }
 
@@ -487,10 +546,11 @@ impl Default for DebugState {
 }
 
 struct CoeusApp {
-    bridge: Option<Arc<Mutex<Bridge>>>,
+    bridge: Option<Arc<Bridge>>,
     startup_error: Option<String>,
-    pending: Option<mpsc::Receiver<Response>>,
-    pending_op: Option<String>,
+    pending: Vec<PendingRequest>,
+    next_request_id: u64,
+    latest_view_request: u64,
     tab: Tab,
     path: String,
     output_path: String,
@@ -531,52 +591,57 @@ struct CoeusApp {
 impl CoeusApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         match Bridge::spawn() {
-            Ok(bridge) => Self {
-                bridge: Some(Arc::new(Mutex::new(bridge))),
-                startup_error: None,
-                pending: None,
-                pending_op: None,
-                tab: Tab::Search,
-                path: String::new(),
-                output_path: String::new(),
-                search: ".*".to_string(),
-                search_kind: SearchKind::Methods,
-                results: Vec::new(),
-                result_count: 0,
-                selected_id: None,
-                described_result: None,
-                xrefs: Vec::new(),
-                info: None,
-                session_history: Vec::new(),
-                graph: GraphState::default(),
-                code: CodeState::default(),
-                debug: DebugState::default(),
-                string_editor: StringEditorState::default(),
-                status: "Ready — choose an APK to begin".to_string(),
-                sidebar_collapsed: false,
-                instruction_pane_collapsed: false,
-                navigation_kind: NavigationKind::Automatic,
-                navigation_history: Vec::new(),
-                navigation_cursor: None,
-                navigation_replay: None,
-                edit_picker: None,
-                graph_node_details: None,
-                description_cache: HashMap::new(),
-                notes: HashMap::new(),
-                note_editor: None,
-                note_popup: None,
-                manifest_xml: String::new(),
-                manifest_dirty: false,
-                deploy: DeployState::default(),
-                split_mode: false,
-                split_members: Vec::new(),
-                adb: AdbState::default(),
-            },
+            Ok(bridge) => {
+                let backend_name = bridge.name();
+                Self {
+                    bridge: Some(Arc::new(bridge)),
+                    startup_error: None,
+                    pending: Vec::new(),
+                    next_request_id: 0,
+                    latest_view_request: 0,
+                    tab: Tab::Search,
+                    path: String::new(),
+                    output_path: String::new(),
+                    search: ".*".to_string(),
+                    search_kind: SearchKind::Methods,
+                    results: Vec::new(),
+                    result_count: 0,
+                    selected_id: None,
+                    described_result: None,
+                    xrefs: Vec::new(),
+                    info: None,
+                    session_history: Vec::new(),
+                    graph: GraphState::default(),
+                    code: CodeState::default(),
+                    debug: DebugState::default(),
+                    string_editor: StringEditorState::default(),
+                    status: format!("Ready — {backend_name} backend; choose an APK to begin"),
+                    sidebar_collapsed: false,
+                    instruction_pane_collapsed: false,
+                    navigation_kind: NavigationKind::Automatic,
+                    navigation_history: Vec::new(),
+                    navigation_cursor: None,
+                    navigation_replay: None,
+                    edit_picker: None,
+                    graph_node_details: None,
+                    description_cache: HashMap::new(),
+                    notes: HashMap::new(),
+                    note_editor: None,
+                    note_popup: None,
+                    manifest_xml: String::new(),
+                    manifest_dirty: false,
+                    deploy: DeployState::default(),
+                    split_mode: false,
+                    split_members: Vec::new(),
+                    adb: AdbState::default(),
+                }
+            }
             Err(error) => Self {
                 bridge: None,
                 startup_error: Some(error.clone()),
-                pending: None,
-                pending_op: None,
+                pending: Vec::new(),
+                next_request_id: 0,
+                latest_view_request: 0,
                 tab: Tab::Search,
                 path: String::new(),
                 output_path: String::new(),
@@ -617,7 +682,24 @@ impl CoeusApp {
     }
 
     fn busy(&self) -> bool {
-        self.pending.is_some()
+        !self.pending.is_empty()
+    }
+
+    fn can_overlap_request(op: &str) -> bool {
+        matches!(
+            op,
+            "history"
+                | "manifest"
+                | "search"
+                | "edit_search"
+                | "describe"
+                | "xrefs"
+                | "graph"
+                | "graph_node_details"
+                | "edit_options"
+                | "adb_devices"
+                | "adb_packages"
+        )
     }
 
     fn source_directory(&self) -> Option<String> {
@@ -652,59 +734,171 @@ impl CoeusApp {
         );
     }
 
+    fn open_apk_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Android package", &["apk"])
+            .pick_file()
+        {
+            self.path = path.display().to_string();
+            self.output_path.clear();
+        }
+    }
+
+    fn open_split_dialog(&mut self) {
+        if let Some(paths) = rfd::FileDialog::new()
+            .add_filter("Android packages", &["apk"])
+            .pick_files()
+        {
+            self.path = paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.output_path.clear();
+            self.request(
+                "load_split",
+                json!({
+                    "op": "load_split",
+                    "paths": paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>(),
+                }),
+            );
+        }
+    }
+
+    fn load_selected_path(&mut self) {
+        if self.path.trim().is_empty() {
+            return;
+        }
+        let path = self.path.trim().to_string();
+        let operation = if path.to_lowercase().ends_with(".coeus") {
+            "load_project"
+        } else {
+            "load"
+        };
+        self.request(operation, json!({"op": operation, "path": path}));
+    }
+
+    fn open_project_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Coeus project", &["coeus"])
+            .pick_file()
+        {
+            let path = path.display().to_string();
+            self.path = path.clone();
+            self.output_path.clear();
+            self.request("load_project", json!({"op": "load_project", "path": path}));
+        }
+    }
+
+    fn save_project_dialog(&mut self) {
+        if self.info.is_none() || self.busy() {
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Coeus project", &["coeus"])
+            .set_file_name("project.coeus")
+            .save_file()
+        {
+            self.request(
+                "save_project",
+                json!({"op": "save_project", "path": path.display().to_string()}),
+            );
+        }
+    }
+
+    fn export_script_dialog(&mut self) {
+        if self.info.is_none() || self.busy() {
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Python script", &["py"])
+            .set_file_name("coeus_session.py")
+            .save_file()
+        {
+            self.request(
+                "export_script",
+                json!({"op": "export_script", "path": path.display().to_string()}),
+            );
+        }
+    }
+
     fn request(&mut self, op: &str, request: Value) {
-        if self.busy() {
+        if self.busy() && !Self::can_overlap_request(op) {
             self.status = "Waiting for the current Coeus operation…".to_string();
             return;
+        }
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let request_id = self.next_request_id;
+        if matches!(op, "describe" | "graph") {
+            self.latest_view_request = request_id;
         }
         if op == "describe" {
             if let Some(id) = request.get("id").and_then(Value::as_str) {
                 if let Some(data) = self.description_cache.get(id).cloned() {
                     self.status = "Loaded disassembly from the GUI cache".to_string();
-                    self.finish("describe".to_string(), Ok(data));
+                    self.finish(request_id, "describe".to_string(), Ok(data));
                     return;
                 }
             }
         }
         let Some(bridge) = self.bridge.as_ref().cloned() else {
-            self.status = "Python bridge is unavailable".to_string();
+            self.status = "The selected analysis backend is unavailable".to_string();
             return;
         };
         let (sender, receiver) = mpsc::channel();
         let name = op.to_string();
         thread::spawn(move || {
-            let result = match bridge.lock() {
-                Ok(mut bridge) => bridge.call(request),
-                Err(_) => Err("Python bridge lock was poisoned".to_string()),
-            };
+            let result = bridge.call(request);
             let _ = sender.send(result);
         });
-        self.pending = Some(receiver);
-        self.pending_op = Some(name.clone());
+        self.pending.push(PendingRequest {
+            request_id,
+            operation: name.clone(),
+            receiver,
+        });
         self.status = format!("Running {name}…");
     }
 
     fn poll(&mut self) {
-        let Some(receiver) = self.pending.as_ref() else {
-            return;
-        };
-        match receiver.try_recv() {
-            Ok(result) => {
-                self.pending = None;
-                let operation = self.pending_op.take().unwrap_or_default();
-                self.finish(operation, result);
-                self.dispatch_pending_debug_value();
+        let mut completed = Vec::new();
+        for (index, pending) in self.pending.iter().enumerate() {
+            match pending.receiver.try_recv() {
+                Ok(result) => {
+                    completed.push((index, pending.request_id, pending.operation.clone(), result))
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    completed.push((
+                        index,
+                        pending.request_id,
+                        pending.operation.clone(),
+                        Err("The analysis backend disconnected".to_string()),
+                    ));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.pending = None;
-                self.pending_op = None;
-                self.status = "The Python bridge disconnected".to_string();
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        for (index, _, _, _) in completed.iter().rev() {
+            self.pending.remove(*index);
+        }
+        for (_, request_id, operation, result) in completed {
+            self.finish(request_id, operation, result);
+            self.dispatch_pending_debug_value();
         }
     }
 
-    fn finish(&mut self, operation: String, result: Response) {
+    fn finish(&mut self, request_id: u64, operation: String, result: Response) {
+        // Graphs and disassemblies intentionally run concurrently. Ignore a
+        // response for an older view request so a slow disassembly cannot
+        // switch the UI back to Code after a newer graph request completed
+        // (and vice versa).
+        if matches!(operation.as_str(), "describe" | "graph")
+            && request_id != self.latest_view_request
+        {
+            return;
+        }
         match result {
             Ok(data) => {
                 if let Some(history) = data.get("history").and_then(Value::as_array) {
@@ -1043,7 +1237,11 @@ impl CoeusApp {
                     }
                     "pull_apks" => {
                         if let Some(loaded) = data.get("loaded").cloned() {
-                            self.finish("load_split_from_adb".to_string(), Ok(loaded));
+                            self.finish(
+                                self.next_request_id,
+                                "load_split_from_adb".to_string(),
+                                Ok(loaded),
+                            );
                         }
                         self.status = format!(
                             "Pulled {} APK member(s) into {}",
@@ -1135,6 +1333,19 @@ impl CoeusApp {
                             self.debug.floating_open = false;
                             self.status = "Debugger connected".to_string();
                         }
+                    }
+                    "debug_detach" => {
+                        self.debug.connected = false;
+                        self.debug.connecting = false;
+                        self.debug.waiting = false;
+                        self.debug.apps_loading = false;
+                        self.debug.frame = None;
+                        self.debug.values.clear();
+                        self.debug.edits.clear();
+                        self.debug.pending_value = None;
+                        self.debug.floating_open = false;
+                        self.code.breakpoints.clear();
+                        self.status = "Debugger detached".to_string();
                     }
                     "debug_apps" => {
                         self.debug.apps_loading = data
@@ -1241,6 +1452,11 @@ impl CoeusApp {
                     || operation == "debug_connect_poll"
                 {
                     self.debug.connecting = false;
+                }
+                if operation == "debug_detach" {
+                    self.debug.connected = false;
+                    self.debug.connecting = false;
+                    self.debug.waiting = false;
                 }
                 if operation == "debug_apps" || operation == "debug_apps_poll" {
                     self.debug.apps_loading = false;
@@ -1720,120 +1936,19 @@ impl CoeusApp {
                 });
                 ui.label(RichText::new("Structured APK analysis").small().color(Color32::GRAY));
                 ui.add_space(10.0);
-                ui.label("APK or project path");
-                ui.horizontal(|ui| {
-                    if ui.button("Browse…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Android package", &["apk"])
-                            .pick_file()
-                        {
-                            self.path = path.display().to_string();
-                            self.output_path.clear();
-                        }
-                    }
-                    if ui.button("Browse split…").clicked() {
-                        if let Some(paths) = rfd::FileDialog::new()
-                            .add_filter("Android packages", &["apk"])
-                            .pick_files()
-                        {
-                            self.path = paths
-                                .iter()
-                                .map(|path| path.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            self.output_path.clear();
-                            self.request(
-                                "load_split",
-                                json!({
-                                    "op": "load_split",
-                                    "paths": paths
-                                        .iter()
-                                        .map(|path| path.display().to_string())
-                                        .collect::<Vec<_>>(),
-                                }),
-                            );
-                        }
-                    }
-                    if ui.button("Load").clicked() && !self.path.trim().is_empty() {
-                        let path = self.path.trim().to_string();
-                        let operation = if path.to_lowercase().ends_with(".coeus") {
-                            "load_project"
-                        } else {
-                            "load"
-                        };
-                        self.request(operation, json!({"op": operation, "path": path}));
-                    }
-                });
+                ui.label("Selected APK or project path (File menu for actions)");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.path)
                         .hint_text("Choose an APK or .coeus project")
                         .desired_width(f32::INFINITY),
                 );
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Open project…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Coeus project", &["coeus"])
-                            .pick_file()
-                        {
-                            let path = path.display().to_string();
-                            self.path = path.clone();
-                            self.output_path.clear();
-                            self.request(
-                                "load_project",
-                                json!({"op": "load_project", "path": path}),
-                            );
-                        }
-                    }
-                    let can_save_project = self.info.is_some() && !self.busy();
-                    if ui
-                        .add_enabled(can_save_project, egui::Button::new("Save project…"))
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Coeus project", &["coeus"])
-                            .set_file_name("project.coeus")
-                            .save_file()
-                        {
-                            self.request(
-                                "save_project",
-                                json!({
-                                    "op": "save_project",
-                                    "path": path.display().to_string(),
-                                }),
-                            );
-                        }
-                    }
-                    let can_export_script = self.info.is_some() && !self.busy();
-                    if ui
-                        .add_enabled(can_export_script, egui::Button::new("Export script…"))
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Python script", &["py"])
-                            .set_file_name("coeus_session.py")
-                            .save_file()
-                        {
-                            self.request(
-                                "export_script",
-                                json!({
-                                    "op": "export_script",
-                                    "path": path.display().to_string(),
-                                }),
-                            );
-                        }
-                    }
-                });
                 if self.info.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.output_path)
-                                .hint_text("edited output APK")
-                                .desired_width(215.0),
-                        );
-                        if ui.button("Write").clicked() && !self.output_path.trim().is_empty() {
-                            self.request("write", json!({"op":"write", "path":self.output_path.trim()}));
-                        }
-                    });
+                    ui.label("Edited APK output path");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.output_path)
+                            .hint_text("edited output APK")
+                            .desired_width(f32::INFINITY),
+                    );
                 }
                 if let Some(error) = &self.startup_error {
                     ui.add_space(8.0);
@@ -1902,7 +2017,7 @@ impl CoeusApp {
                     ui.label(RichText::new(format!("Results ({} / {})", self.results.len(), self.result_count)).strong());
                     let mut picked = None;
                     let mut action = None;
-                    egui::ScrollArea::vertical()
+                    egui::ScrollArea::both()
                         .id_salt("results")
                         .auto_shrink([false, false])
                         .max_height(ui.available_height().max(1.0))
@@ -1993,21 +2108,23 @@ impl CoeusApp {
                     .navigation_cursor
                     .map(|cursor| cursor + 1 < self.navigation_history.len())
                     .unwrap_or(false);
-                if ui
-                    .add_enabled(
-                        can_go_back,
-                        egui::Button::new("←").min_size(Vec2::new(28.0, 24.0)),
-                    )
+                let back = ui.add_enabled(
+                    can_go_back,
+                    egui::Button::new("").min_size(Vec2::new(28.0, 24.0)),
+                );
+                paint_navigation_arrow(ui, &back, true, can_go_back);
+                if back
                     .on_hover_text("Go to the previously visited class, method, field, or string")
                     .clicked()
                 {
                     self.navigate_history(-1);
                 }
-                if ui
-                    .add_enabled(
-                        can_go_forward,
-                        egui::Button::new("→").min_size(Vec2::new(28.0, 24.0)),
-                    )
+                let forward = ui.add_enabled(
+                    can_go_forward,
+                    egui::Button::new("").min_size(Vec2::new(28.0, 24.0)),
+                );
+                paint_navigation_arrow(ui, &forward, false, can_go_forward);
+                if forward
                     .on_hover_text("Go to the next item in the navigation history")
                     .clicked()
                 {
@@ -2571,7 +2688,11 @@ impl CoeusApp {
                         request_search = true;
                     }
                 });
-                if self.busy() && self.pending_op.as_deref() == Some("edit_search") {
+                if self
+                    .pending
+                    .iter()
+                    .any(|pending| pending.operation == "edit_search")
+                {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label("Searching…");
@@ -3371,39 +3492,6 @@ impl CoeusApp {
         } else {
             "Sign and install APK"
         });
-        let mut load_split_from_adb = false;
-        ui.collapsing("Load installed split set from ADB", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Package");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.deploy.split_package)
-                        .desired_width(320.0)
-                        .hint_text("com.example.app"),
-                );
-                if ui
-                    .add_enabled(!self.busy(), egui::Button::new("Pull all splits"))
-                    .clicked()
-                {
-                    load_split_from_adb = true;
-                }
-            });
-            ui.label(
-                RichText::new("The base APK becomes the analysis target; signing and installation operate on every split.")
-                    .small()
-                    .color(Color32::GRAY),
-            );
-        });
-        if load_split_from_adb {
-            self.request(
-                "load_split_from_adb",
-                json!({
-                    "op": "load_split_from_adb",
-                    "package": self.deploy.split_package,
-                    "serial": if self.deploy.serial.is_empty() { Value::Null } else { Value::String(self.deploy.serial.clone()) },
-                    "adb_path": if self.deploy.adb_path.is_empty() { Value::Null } else { Value::String(self.deploy.adb_path.clone()) },
-                }),
-            );
-        }
         if self.info.is_none() {
             ui.centered_and_justified(|ui| {
                 ui.label("Load an APK before signing or installing it.")
@@ -4104,6 +4192,12 @@ impl CoeusApp {
             {
                 self.request("debug_wait", json!({"op":"debug_wait"}));
             }
+            if ui
+                .add_enabled(!self.busy() && self.debug.connected, egui::Button::new("Detach"))
+                .clicked()
+            {
+                self.request("debug_detach", json!({"op":"debug_detach"}));
+            }
         });
         if self.debug.connecting {
             ui.horizontal(|ui| {
@@ -4327,6 +4421,46 @@ fn value_string(value: &Value, key: &str) -> String {
         .to_string()
 }
 
+fn paint_navigation_arrow(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    points_left: bool,
+    enabled: bool,
+) {
+    let rect = response.rect.shrink2(Vec2::new(8.0, 7.0));
+    let center = rect.center();
+    let tip = if points_left {
+        egui::pos2(rect.left(), center.y)
+    } else {
+        egui::pos2(rect.right(), center.y)
+    };
+    let tail = if points_left {
+        egui::pos2(rect.right(), center.y)
+    } else {
+        egui::pos2(rect.left(), center.y)
+    };
+    let head_top = if points_left {
+        egui::pos2(rect.left() + 6.0, rect.top())
+    } else {
+        egui::pos2(rect.right() - 6.0, rect.top())
+    };
+    let head_bottom = if points_left {
+        egui::pos2(rect.left() + 6.0, rect.bottom())
+    } else {
+        egui::pos2(rect.right() - 6.0, rect.bottom())
+    };
+    let color = if enabled {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let stroke = Stroke::new(2.0, color);
+    let painter = ui.painter();
+    painter.line_segment([tip, tail], stroke);
+    painter.line_segment([tip, head_top], stroke);
+    painter.line_segment([tip, head_bottom], stroke);
+}
+
 fn value_u64(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or_default()
 }
@@ -4364,6 +4498,7 @@ fn edit_picker_kind(value: &Value) -> Option<SearchKind> {
     match value_string(value, "picker").as_str() {
         "methods" => Some(SearchKind::Methods),
         "classes" => Some(SearchKind::Classes),
+        "fields" => Some(SearchKind::Fields),
         "strings" => Some(SearchKind::Strings),
         _ => None,
     }

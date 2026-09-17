@@ -727,7 +727,7 @@ impl ToBytes for SlotValue {
                 data.write_i32::<BigEndian>(i)?;
             }
             Value::Long(l) => {
-                data.write_u8(VmType::Object as u8)?;
+                data.write_u8(VmType::Long as u8)?;
                 data.write_i64::<BigEndian>(l)?;
             }
             Value::String(s) => {
@@ -751,13 +751,16 @@ impl ToBytes for SlotValue {
                 data.write_u8(b)?;
             }
             Value::Char(c) => {
-                data.write_u8(VmType::Object as u8)?;
+                data.write_u8(VmType::Char as u8)?;
                 data.write_i8(c as i8)?;
             }
             Value::Void => {
                 data.write_u8(VmType::Void as u8)?;
             }
-            Value::Reference(_) => bail!("Cannot write reference"),
+            Value::Reference(reference) => {
+                data.write_u8(self.ty)?;
+                data.write_u64::<BigEndian>(reference)?;
+            }
         }
         Ok(data)
     }
