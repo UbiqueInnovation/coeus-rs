@@ -16,6 +16,9 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use coeus::coeus_analysis::analysis::instruction_flow::{
+    InstructionFlow, InstructionFlowLimits, LastInstruction, Value as FlowValue,
+};
 use coeus::coeus_analysis::analysis::{
     self, find_any, find_classes, find_fields, find_methods, find_strings, Context, Evidence,
     Location, ALL_TYPES,
@@ -44,6 +47,10 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 type BackendResult = Result<Value, String>;
 
 const MAX_RESULTS: usize = 1000;
+const STATIC_ARGUMENT_MAX_ITERATIONS: usize = 256;
+const STATIC_ARGUMENT_MAX_BRANCHES: usize = 32;
+const STATIC_ARGUMENT_MAX_SOURCES: usize = 512;
+const STATIC_ARGUMENT_MAX_OPTIONS: usize = 256;
 
 const ANDROID_FRAMEWORK_CLASS_FILTERS: &[&str] = &[
     "Landroid/app",
@@ -838,7 +845,9 @@ impl RustBackend {
             "resolve" => self.resolve(&request),
             "edit_search" => self.edit_search(&request),
             "describe" => self.describe(value_string(&request, "id")),
+            "emulation_options" => self.emulation_options(&request),
             "emulate" => self.emulate(&request),
+            "emulate_batch" => self.emulate_batch(&request),
             "xrefs" => self.cross_references(value_string(&request, "id")),
             "graph" => self.graph(&request),
             "graph_node_details" => self.graph_node_details(&request),
@@ -1532,6 +1541,193 @@ impl RustBackend {
             }
             Err(error) => Ok(json!({"success": false, "error": format!("VM failed: {error:?}")})),
         }
+    }
+
+    fn emulation_options(&self, request: &Value) -> BackendResult {
+        let id = value_string(request, "id");
+        let target = self.entry(&id)?.object.clone();
+        let NativeObject::Method(target) = target else {
+            return Err("static argument analysis is only available for methods".to_string());
+        };
+        let descriptors = parse_emulation_descriptors(&target.method.proto_name)?;
+        let source_id = optional_string(request, "source_id");
+        let source = source_id
+            .map(|source_id| self.entry(source_id))
+            .transpose()?
+            .and_then(|entry| match &entry.object {
+                NativeObject::Method(method) => Some(method.clone()),
+                _ => None,
+            });
+        let offset = request
+            .get("offset")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+        let (mut options, analysis_limited) =
+            self.static_argument_options(&target, &descriptors, source.as_ref(), offset)?;
+        let truncated = options.len() > STATIC_ARGUMENT_MAX_OPTIONS;
+        options.truncate(STATIC_ARGUMENT_MAX_OPTIONS);
+        let count = options.len();
+        Ok(json!({
+            "id": id,
+            "method_label": target.signature(),
+            "options": options,
+            "count": count,
+            "truncated": truncated,
+            "analysis_limited": analysis_limited,
+        }))
+    }
+
+    fn static_argument_options(
+        &self,
+        target: &MethodObject,
+        descriptors: &[String],
+        source: Option<&MethodObject>,
+        offset: Option<u32>,
+    ) -> Result<(Vec<Value>, bool), String> {
+        let mut sources = Vec::new();
+        if let Some(source) = source {
+            sources.push(source.clone());
+        } else {
+            let analysis = self.analysis()?;
+            'source_limit: for multi_dex in &analysis.files.multi_dex {
+                for file in std::iter::once(&multi_dex.primary).chain(multi_dex.secondary.iter()) {
+                    for class in &file.classes {
+                        for method_data in &class.codes {
+                            if let Some(method) = method_object(file, &method_data.method) {
+                                sources.push(method);
+                                if sources.len() >= STATIC_ARGUMENT_MAX_SOURCES {
+                                    break 'source_limit;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let target_is_static = target
+            .data
+            .as_ref()
+            .map(|data| data.access_flags.contains(AccessFlags::STATIC))
+            .unwrap_or(false);
+        let target_signature = target.signature();
+        let call_regex = Regex::new(&regex::escape(&target_signature))
+            .map_err(|error| format!("invalid target method signature: {error}"))?;
+        let mut options = Vec::new();
+        let mut seen = HashSet::new();
+        let mut analysis_limited = sources.len() >= STATIC_ARGUMENT_MAX_SOURCES;
+        for source in &sources {
+            let Some(code) = source.data.as_ref().and_then(|data| data.code.clone()) else {
+                continue;
+            };
+            let mut flow = InstructionFlow::with_limits(
+                code,
+                source.file.clone(),
+                true,
+                InstructionFlowLimits {
+                    max_iterations: STATIC_ARGUMENT_MAX_ITERATIONS,
+                    max_branches: STATIC_ARGUMENT_MAX_BRANCHES,
+                },
+            );
+            for branch in flow.find_all_calls_regex(&call_regex) {
+                if offset.is_some_and(|offset| branch.previous_pc.0 != offset) {
+                    continue;
+                }
+                let Some(LastInstruction::FunctionCall {
+                    signature, args, ..
+                }) = branch.state.last_instruction
+                else {
+                    continue;
+                };
+                if signature != target_signature {
+                    continue;
+                }
+                let mut args = args;
+                if !target_is_static && args.len() == descriptors.len() + 1 {
+                    args.remove(0);
+                }
+                if args.len() != descriptors.len() {
+                    continue;
+                }
+                let arguments = args
+                    .iter()
+                    .zip(descriptors)
+                    .map(|(value, descriptor)| static_argument_text(value, descriptor))
+                    .collect::<Vec<_>>();
+                let key = arguments.clone();
+                if !seen.insert(key) {
+                    continue;
+                }
+                options.push(json!({
+                    "label": format!(
+                        "{} · {} (static flow)",
+                        source.signature(),
+                        if arguments.iter().all(|argument| argument.1) {
+                            "exact"
+                        } else {
+                            "partial"
+                        },
+                    ),
+                    "arguments": arguments
+                        .into_iter()
+                        .map(|(argument, _)| argument)
+                        .collect::<Vec<_>>(),
+                }));
+                if options.len() > STATIC_ARGUMENT_MAX_OPTIONS {
+                    return Ok((options, true));
+                }
+            }
+            analysis_limited |= flow.was_limited();
+        }
+
+        // A class declaration or a method body has no call-site offset. If a
+        // source method was supplied but it did not call the target, retry
+        // against all callers so the menu still provides useful guesses.
+        if options.is_empty() && source.is_some() && offset.is_none() {
+            return self.static_argument_options(target, descriptors, None, None);
+        }
+        Ok((options, analysis_limited))
+    }
+
+    fn emulate_batch(&self, request: &Value) -> BackendResult {
+        let id = value_string(request, "id");
+        let argument_sets = request
+            .get("arguments_sets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut results = Vec::new();
+        for arguments in argument_sets {
+            let arguments = arguments.as_array().cloned().unwrap_or_default();
+            let mut result =
+                match self.emulate(&json!({"op": "emulate", "id": id, "arguments": arguments})) {
+                    Ok(Value::Object(mut result)) => {
+                        result.insert("arguments".to_string(), Value::Array(arguments));
+                        Value::Object(result)
+                    }
+                    Ok(result) => json!({
+                        "success": false,
+                        "error": format!("unexpected emulator response: {result}"),
+                        "arguments": arguments,
+                    }),
+                    Err(error) => json!({
+                        "success": false,
+                        "error": error,
+                        "arguments": arguments,
+                    }),
+                };
+            if !result.is_object() {
+                result = json!({"success": false, "error": "invalid emulator response"});
+            }
+            results.push(result);
+        }
+        Ok(json!({
+            "success": !results.is_empty()
+                && results
+                    .iter()
+                    .all(|result| result.get("success").and_then(Value::as_bool) == Some(true)),
+            "results": results,
+        }))
     }
 
     fn class_source_with_method_ids(
@@ -3469,6 +3665,7 @@ fn parallel_read_operation(request: &Value) -> bool {
                 | "search"
                 | "edit_search"
                 | "describe"
+                | "emulation_options"
                 | "xrefs"
                 | "graph"
                 | "graph_node_details"
@@ -4566,6 +4763,36 @@ fn parse_emulation_descriptors(proto: &str) -> Result<Vec<String>, String> {
         descriptors.push(arguments[start..index].to_string());
     }
     Ok(descriptors)
+}
+
+fn static_argument_default(descriptor: &str) -> String {
+    match descriptor {
+        "Z" => "false".to_string(),
+        "Ljava/lang/String;" => String::new(),
+        descriptor if descriptor.starts_with('[') => "[]".to_string(),
+        descriptor if descriptor.starts_with('L') => "null".to_string(),
+        "F" | "D" => "0.0".to_string(),
+        _ => "0".to_string(),
+    }
+}
+
+fn static_argument_text(value: &FlowValue, descriptor: &str) -> (String, bool) {
+    match value {
+        FlowValue::String(value) if descriptor == "Ljava/lang/String;" => (value.clone(), true),
+        FlowValue::Number(value) if matches!(descriptor, "B" | "S" | "I" | "J" | "C") => {
+            (value.to_string(), true)
+        }
+        FlowValue::Boolean(value) if descriptor == "Z" => (value.to_string(), true),
+        FlowValue::Char(value) if descriptor == "C" => (value.to_string(), true),
+        FlowValue::Byte(value) if matches!(descriptor, "B" | "S" | "I" | "J") => {
+            (value.to_string(), true)
+        }
+        FlowValue::Bytes(value) if descriptor.starts_with('[') => (json!(value).to_string(), true),
+        FlowValue::Object { .. } | FlowValue::Unknown { .. } if descriptor.starts_with('L') => {
+            ("null".to_string(), false)
+        }
+        _ => (static_argument_default(descriptor), false),
+    }
 }
 
 fn native_emulation_argument(

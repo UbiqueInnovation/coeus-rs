@@ -105,7 +105,13 @@ When a method is open in Code / Edit, **Emulate** opens an argument form and
 runs the method in Coeus's embedded DexVm. Primitive values and strings can be
 entered directly; byte arrays accept JSON numbers or a `hex:` value. The result
 dialog reports the returned value or the VM failure. The same action is
-available from a method's source-line context menu when viewing a class.
+available from a method's source-line context menu in both class and method
+disassemblies. That menu can also open the exact method disassembly, emulate a
+referenced method, or ask the static flow analyzer for possible call-site
+arguments. Guessed sets can be used individually or run together.
+The flow search is bounded per method (256 iterations and 32 branches), with at
+most 512 caller methods and 256 returned argument sets; the UI reports when
+those limits produce partial results.
 
 ## Editing model
 

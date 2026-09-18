@@ -67,6 +67,9 @@ COMMON_LIBRARY_CLASS_FILTERS = (
     "Lorg/bouncycastle/",
 )
 
+STATIC_ARGUMENT_MAX_SOURCES = 512
+STATIC_ARGUMENT_MAX_OPTIONS = 256
+
 
 class Backend:
     def __init__(self):
@@ -1274,6 +1277,171 @@ class Backend:
             }
         except Exception as error:
             return {"success": False, "error": str(error)}
+
+    @staticmethod
+    def _method_is_static(method):
+        try:
+            first_line = method.code().splitlines()[0]
+        except (AttributeError, IndexError):
+            return False
+        return ".method" in first_line and " static " in " {} ".format(first_line)
+
+    @staticmethod
+    def _static_argument_default(descriptor):
+        if descriptor == "Z":
+            return "false"
+        if descriptor == "Ljava/lang/String;":
+            return ""
+        if descriptor.startswith("["):
+            return "[]"
+        if descriptor.startswith("L"):
+            return "null"
+        if descriptor in ("F", "D"):
+            return "0.0"
+        return "0"
+
+    @classmethod
+    def _static_argument_text(cls, value, descriptor):
+        """Convert an InstructionValue into the GUI emulation text format."""
+        get_value = getattr(value, "get_value", None)
+        if callable(get_value):
+            try:
+                value = get_value()
+            except Exception:
+                return cls._static_argument_default(descriptor), False
+        # A nested Instruction represents a value the flow analyser could not
+        # reduce to a constant. Keep the candidate usable with a typed default
+        # rather than dropping an otherwise useful call-site candidate.
+        if type(value).__name__ == "Instruction":
+            return cls._static_argument_default(descriptor), False
+        if descriptor == "Ljava/lang/String;" and isinstance(value, str):
+            return value, True
+        if descriptor.startswith("L"):
+            return ("null", False)
+        if descriptor.startswith("[") and isinstance(value, (bytes, bytearray)):
+            return json.dumps(list(value)), True
+        if descriptor.startswith("[") and isinstance(value, (list, tuple)):
+            try:
+                return json.dumps([int(item) & 0xFF for item in value]), True
+            except (TypeError, ValueError):
+                return cls._static_argument_default(descriptor), False
+        if descriptor == "Z" and isinstance(value, bool):
+            return ("true" if value else "false"), True
+        if descriptor == "C" and isinstance(value, str) and len(value) == 1:
+            return value, True
+        if descriptor in ("F", "D") and isinstance(value, (int, float)):
+            return str(value), True
+        if descriptor in ("B", "S", "I", "J", "C") and isinstance(
+            value, (int, float)
+        ) and not isinstance(value, bool):
+            return str(int(value)), True
+        return cls._static_argument_default(descriptor), False
+
+    def emulation_options(self, object_id, source_id=None, offset=None):
+        """Find usable argument sets at statically analysed call sites."""
+        target_entry = self._entry(object_id)
+        if target_entry["kind"] != "method":
+            raise RuntimeError("static argument analysis is only available for methods")
+        target = target_entry["object"]
+        descriptors = self._emulation_descriptors(target.proto_type())
+        target_signature = target.signature()
+        sources = []
+        if source_id:
+            source_entry = self._entry(source_id)
+            if source_entry["kind"] == "method":
+                sources.append(source_entry["object"])
+        source_limit_reached = False
+        if not sources:
+            for evidence in self.ao.find_methods(".*"):
+                if len(sources) >= STATIC_ARGUMENT_MAX_SOURCES:
+                    source_limit_reached = True
+                    break
+                try:
+                    kind, method = self._concrete(evidence)
+                    if kind == "method":
+                        sources.append(method)
+                except Exception:
+                    continue
+
+        static_target = self._method_is_static(target)
+        options = []
+        seen = set()
+
+        def add_from(source):
+            try:
+                calls = source.find_method_call(re.escape(target_signature))
+            except Exception:
+                return
+            if offset is not None:
+                calls_at_offset = [
+                    call
+                    for call in calls
+                    if getattr(call, "get_offset", lambda: None)() == int(offset)
+                ]
+                # Keep compatibility with an older installed wheel that does
+                # not expose call offsets; the source method is still a useful
+                # scope even though it cannot be narrowed to one line.
+                if calls_at_offset:
+                    calls = calls_at_offset
+            for call in calls:
+                try:
+                    values = list(call.get_arguments_as_value())
+                except Exception:
+                    continue
+                if not static_target and len(values) == len(descriptors) + 1:
+                    values = values[1:]
+                if len(values) != len(descriptors):
+                    continue
+                arguments = []
+                exact = True
+                for value, descriptor in zip(values, descriptors):
+                    text, is_exact = self._static_argument_text(value, descriptor)
+                    arguments.append(text)
+                    exact = exact and is_exact
+                key = tuple(arguments)
+                if key in seen:
+                    continue
+                seen.add(key)
+                options.append(
+                    {
+                        "label": "{} · {}{}".format(
+                            "exact" if exact else "partial",
+                            source.signature(),
+                            " (static flow)",
+                        ),
+                        "arguments": arguments,
+                    }
+                )
+
+        analysis_limited = source_limit_reached
+        for source in sources:
+            add_from(source)
+            if len(options) > STATIC_ARGUMENT_MAX_OPTIONS:
+                analysis_limited = True
+                break
+        return {
+            "id": object_id,
+            "method_label": target_signature,
+            "options": options[:STATIC_ARGUMENT_MAX_OPTIONS],
+            "count": min(len(options), STATIC_ARGUMENT_MAX_OPTIONS),
+            "truncated": len(options) > STATIC_ARGUMENT_MAX_OPTIONS,
+            "analysis_limited": analysis_limited,
+        }
+
+    def emulate_batch(self, object_id, argument_sets):
+        results = []
+        for arguments in argument_sets:
+            values = list(arguments) if isinstance(arguments, list) else []
+            try:
+                result = self.emulate(object_id, values)
+            except Exception as error:
+                result = {"success": False, "error": str(error)}
+            result["arguments"] = values
+            results.append(result)
+        return {
+            "success": bool(results) and all(result.get("success", False) for result in results),
+            "results": results,
+        }
 
     def replace_string(self, object_id, replacement):
         if self.ao is None:
@@ -2508,6 +2676,14 @@ class Backend:
             return self.describe(request["id"])
         if op == "emulate":
             return self.emulate(request["id"], request.get("arguments", []))
+        if op == "emulation_options":
+            return self.emulation_options(
+                request["id"], request.get("source_id"), request.get("offset")
+            )
+        if op == "emulate_batch":
+            return self.emulate_batch(
+                request["id"], request.get("arguments_sets", [])
+            )
         if op == "edit_options":
             return self.edit_options(request["id"], request["offset"])
         if op == "apply_edit":

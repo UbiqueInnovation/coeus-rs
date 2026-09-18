@@ -36,6 +36,24 @@ pub struct InstructionFlow {
     register_size: u16,
     already_branched: Vec<(u64, InstructionOffset)>,
     conservative: bool,
+    limits: InstructionFlowLimits,
+    limited: bool,
+}
+
+/// Work limits for symbolic instruction-flow traversal.
+#[derive(Clone, Copy, Debug)]
+pub struct InstructionFlowLimits {
+    pub max_iterations: usize,
+    pub max_branches: usize,
+}
+
+impl Default for InstructionFlowLimits {
+    fn default() -> Self {
+        Self {
+            max_iterations: 1_000,
+            max_branches: 1_000,
+        }
+    }
 }
 
 impl InstructionFlow {
@@ -67,6 +85,22 @@ impl Default for Branch {
         }
     }
 }
+
+fn push_bounded_branch(
+    branches_to_add: &Arc<Mutex<Vec<(InstructionOffset, Branch)>>>,
+    limited: &Arc<Mutex<bool>>,
+    max_branches: usize,
+    offset: InstructionOffset,
+    branch: Branch,
+) {
+    let mut pending = branches_to_add.lock().unwrap();
+    if pending.len() < max_branches {
+        pending.push((offset, branch));
+    } else {
+        *limited.lock().unwrap() = true;
+    }
+}
+
 impl PartialEq for Branch {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
@@ -907,7 +941,6 @@ impl<'a> UShr<i128> for &'a Value {
     }
 }
 
-const MAX_ITERATIONS: usize = 1_000;
 impl InstructionFlow {
     pub fn get_instruction(
         &self,
@@ -918,9 +951,18 @@ impl InstructionFlow {
     pub fn reset(&mut self, start: u32) {
         self.branches.clear();
         self.already_branched.clear();
+        self.limited = false;
         self.new_branch(InstructionOffset(start), None);
     }
     pub fn new(method: CodeItem, dex: Arc<DexFile>, conservative: bool) -> Self {
+        Self::with_limits(method, dex, conservative, InstructionFlowLimits::default())
+    }
+    pub fn with_limits(
+        method: CodeItem,
+        dex: Arc<DexFile>,
+        conservative: bool,
+        limits: InstructionFlowLimits,
+    ) -> Self {
         let register_size = method.register_size;
         let method: HashMap<_, _> = method
             .insns
@@ -935,6 +977,11 @@ impl InstructionFlow {
             register_size,
             already_branched: vec![],
             conservative,
+            limits: InstructionFlowLimits {
+                max_iterations: limits.max_iterations.max(1),
+                max_branches: limits.max_branches.max(1),
+            },
+            limited: false,
         }
     }
 
@@ -942,9 +989,18 @@ impl InstructionFlow {
         if self.branches.is_empty() {
             self.new_branch(InstructionOffset(0), None);
         }
-        let mut branches = vec![];
+        let mut branches: Vec<Branch> = vec![];
         let mut iterations = 0;
         loop {
+            if iterations >= self.limits.max_iterations {
+                self.limited = true;
+                branches.reverse();
+                branches.sort_by_key(|b| b.id);
+                branches.dedup_by(|left, right| {
+                    left.id == right.id && left.previous_pc == right.previous_pc
+                });
+                break;
+            }
             self.next_instruction(self.method.clone());
             for b in &self.branches {
                 let instruction = if let Some(instruction) = self.method.get(&b.pc) {
@@ -966,7 +1022,7 @@ impl InstructionFlow {
                     branches.push(b.clone());
                 }
             }
-            if self.is_done() || iterations > MAX_ITERATIONS {
+            if self.is_done() {
                 branches.reverse();
                 // only show the last of the loop branches
                 branches.sort_by_key(|b| b.id);
@@ -988,6 +1044,10 @@ impl InstructionFlow {
         let mut iterations = 0;
         self.new_branch(InstructionOffset(0), None);
         loop {
+            if iterations >= self.limits.max_iterations {
+                self.limited = true;
+                return branches;
+            }
             self.next_instruction(self.method.clone());
             for state in self.get_all_states() {
                 match (state.last_instruction.as_ref(), &instruction) {
@@ -1010,16 +1070,16 @@ impl InstructionFlow {
                     _ => {}
                 }
             }
+            if self.limited {
+                return branches;
+            }
             if self.is_done() {
                 return branches;
             }
             if self.branches.len() > 300 && iterations > 150 {
+                self.limited = true;
                 return branches;
             }
-            if iterations > MAX_ITERATIONS {
-                return branches;
-            }
-
             iterations += 1;
         }
     }
@@ -1054,6 +1114,9 @@ impl InstructionFlow {
         let branches_to_add: Arc<Mutex<Vec<(InstructionOffset, Branch)>>> =
             Arc::new(Mutex::new(vec![]));
         let clone_branches_to_add = branches_to_add.clone();
+        let max_pending_branches = self.limits.max_branches.saturating_sub(self.branches.len());
+        let branches_to_add_limited = Arc::new(Mutex::new(false));
+        let clone_branches_to_add_limited = branches_to_add_limited.clone();
         let branches_to_taint: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(vec![]));
         let clone_branches_to_taint = branches_to_taint.clone();
         let already_branched = Arc::new(Mutex::new(self.already_branched.clone()));
@@ -1152,7 +1215,13 @@ impl InstructionFlow {
                             new_branch.parent_id = Some(b.id);
                             new_branch.pc += offset as i32;
                             new_branch.state.loop_count = HashMap::new();
-                            branches_to_add.lock().unwrap().push((b.pc, new_branch));
+                            push_bounded_branch(
+                                &branches_to_add,
+                                &branches_to_add_limited,
+                                max_pending_branches,
+                                b.pc,
+                                new_branch,
+                            );
                         }
                     }
                     Instruction::TestZero(test, left, offset) => {
@@ -1205,7 +1274,13 @@ impl InstructionFlow {
                             new_branch.pc += offset as i32;
                             new_branch.parent_id = Some(b.id);
                             new_branch.state.loop_count = HashMap::new();
-                            branches_to_add.lock().unwrap().push((b.pc, new_branch));
+                            push_bounded_branch(
+                                &branches_to_add,
+                                &branches_to_add_limited,
+                                max_pending_branches,
+                                b.pc,
+                                new_branch,
+                            );
                         }
                     }
                     Instruction::PackedSwitch(_, table_offset)
@@ -1225,7 +1300,13 @@ impl InstructionFlow {
                                 let mut new_branch = b.clone();
                                 new_branch.parent_id = Some(b.id);
                                 new_branch.pc += *offset as i32;
-                                branches_to_add.lock().unwrap().push((b.pc, new_branch));
+                                push_bounded_branch(
+                                    &branches_to_add,
+                                    &branches_to_add_limited,
+                                    max_pending_branches,
+                                    b.pc,
+                                    new_branch,
+                                );
                             }
                         }
                         if let Some((_, Instruction::SparseSwitchData(switch))) =
@@ -1243,7 +1324,13 @@ impl InstructionFlow {
                                 let mut new_branch = b.clone();
                                 new_branch.parent_id = Some(b.id);
                                 new_branch.pc += *offset as i32;
-                                branches_to_add.lock().unwrap().push((b.pc, new_branch));
+                                push_bounded_branch(
+                                    &branches_to_add,
+                                    &branches_to_add_limited,
+                                    max_pending_branches,
+                                    b.pc,
+                                    new_branch,
+                                );
                             }
                         }
                         // branches_to_remove.push(b.id);
@@ -1910,16 +1997,17 @@ impl InstructionFlow {
             .unwrap()
             .into_inner()
             .unwrap();
-        if self.branches.len() < 1000 {
-            for (offset, b) in branches_to_add {
-                let id = self.fork(b);
-                self.already_branched.push((id, offset));
-            }
+        if *clone_branches_to_add_limited.lock().unwrap() {
+            self.limited = true;
+        }
+        for (offset, b) in branches_to_add {
+            let id = self.fork(b);
+            self.already_branched.push((id, offset));
         }
     }
     fn new_branch(&mut self, pc: InstructionOffset, parent_id: Option<u64>) {
-        if self.branches.len() > 10 {
-            println!("Føk, we have too many branches");
+        if self.branches.len() >= self.limits.max_branches {
+            self.limited = true;
             return;
         }
         self.branches.push(Branch {
@@ -1946,6 +2034,9 @@ impl InstructionFlow {
     }
     pub fn is_done(&self) -> bool {
         self.branches.is_empty()
+    }
+    pub fn was_limited(&self) -> bool {
+        self.limited
     }
     pub fn get_all_states(&self) -> Vec<&State> {
         self.branches.iter().map(|b| &b.state).collect()

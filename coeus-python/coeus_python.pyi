@@ -245,6 +245,8 @@ class Evidence:
         """Interpret this `Evidence` as a `NativeSymbol`. Raises a `RuntimeException` if it cannot be cast."""
 
 class Instruction:
+    def get_offset(self) -> Optional[int]:
+        """Return the source instruction offset when this is a statically found call."""
     def get_arguments_as_value(self) -> list[Any]:
         """Return all arguments as python values, if they are constant"""
     def get_string_arguments(self) -> list[str]:

@@ -14,7 +14,9 @@ use coeus::{
     coeus_analysis::analysis::{
         self,
         dex::find_cross_reference_array,
-        instruction_flow::{Branch, InstructionFlow, LastInstruction, State},
+        instruction_flow::{
+            Branch, InstructionFlow, InstructionFlowLimits, LastInstruction, State,
+        },
         Context,
     },
     coeus_emulation::vm::{runtime::StringClass, ClassInstance, Register, Value, VM},
@@ -54,6 +56,9 @@ pub enum FieldValue {
     Boolean(bool),
     Null,
 }
+
+const STATIC_ARGUMENT_MAX_ITERATIONS: usize = 256;
+const STATIC_ARGUMENT_MAX_BRANCHES: usize = 32;
 use std::convert::TryFrom;
 impl From<EncodedItem> for FieldValue {
     fn from(value: EncodedItem) -> Self {
@@ -120,6 +125,7 @@ pub struct Evidence {
 /// Gather last instructions
 pub struct Instruction {
     instruction: LastInstruction,
+    offset: Option<u32>,
 }
 
 #[pyclass]
@@ -345,6 +351,10 @@ impl Branching {
 
 #[pymethods]
 impl Instruction {
+    pub fn get_offset(&self) -> Option<u32> {
+        self.offset
+    }
+
     pub fn __str__(&self) -> String {
         if let LastInstruction::FunctionCall {
             name,
@@ -428,7 +438,8 @@ impl Instruction {
                     analysis::instruction_flow::Value::Variable(l) => type_names.push(format!(
                         "{:?}",
                         Instruction {
-                            instruction: (**l).to_owned()
+                            instruction: (**l).to_owned(),
+                            offset: None,
                         }
                         .get_argument_types()
                     )),
@@ -1348,6 +1359,7 @@ impl InstructionValue {
             analysis::instruction_flow::Value::Char(c) => c.to_object(py),
             analysis::instruction_flow::Value::Variable(instruction) => Instruction {
                 instruction: *instruction.clone(),
+                offset: None,
             }
             .into_py(py),
             analysis::instruction_flow::Value::Unknown { ty } => ty.to_object(py),
@@ -2370,14 +2382,23 @@ const {function_name} = {class_without_pkg}.{function_name}.overload({arguments}
         let regex = Regex::new(signature).unwrap();
         if let Some(code) = &self.method_data {
             if let Some(code) = &code.code {
-                let mut instruction_flow =
-                    InstructionFlow::new(code.clone(), self.file.clone(), true);
+                let mut instruction_flow = InstructionFlow::with_limits(
+                    code.clone(),
+                    self.file.clone(),
+                    true,
+                    InstructionFlowLimits {
+                        max_iterations: STATIC_ARGUMENT_MAX_ITERATIONS,
+                        max_branches: STATIC_ARGUMENT_MAX_BRANCHES,
+                    },
+                );
                 let branches = instruction_flow
                     .find_all_calls_regex(&regex)
                     .iter()
-                    .filter_map(|a| a.state.last_instruction.clone())
-                    .map(|last_instruction| Instruction {
-                        instruction: last_instruction,
+                    .filter_map(|branch| {
+                        Some(Instruction {
+                            instruction: branch.state.last_instruction.clone()?,
+                            offset: Some(branch.previous_pc.0),
+                        })
                     })
                     .collect::<Vec<Instruction>>();
                 f_calls.extend(branches);
@@ -2696,14 +2717,23 @@ impl Class {
                 let mut f_calls = vec![];
                 if let Some(code) = &m.method_data {
                     if let Some(code) = &code.code {
-                        let mut instruction_flow =
-                            InstructionFlow::new(code.clone(), self.file.clone(), true);
+                        let mut instruction_flow = InstructionFlow::with_limits(
+                            code.clone(),
+                            self.file.clone(),
+                            true,
+                            InstructionFlowLimits {
+                                max_iterations: STATIC_ARGUMENT_MAX_ITERATIONS,
+                                max_branches: STATIC_ARGUMENT_MAX_BRANCHES,
+                            },
+                        );
                         let branches = instruction_flow
                             .find_all_calls_regex(&regex)
                             .iter()
-                            .filter_map(|a| a.state.last_instruction.clone())
-                            .map(|last_instruction| Instruction {
-                                instruction: last_instruction,
+                            .filter_map(|branch| {
+                                Some(Instruction {
+                                    instruction: branch.state.last_instruction.clone()?,
+                                    offset: Some(branch.previous_pc.0),
+                                })
                             })
                             .collect::<Vec<Instruction>>();
                         f_calls.extend(branches);

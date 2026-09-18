@@ -246,6 +246,11 @@ impl NavigationKind {
 enum CodeAction {
     Navigate(NavigationTarget),
     Emulate(NavigationTarget),
+    EmulateWithStaticArguments {
+        target: NavigationTarget,
+        source_method_id: Option<String>,
+        offset: Option<u64>,
+    },
     Xrefs(NavigationTarget),
     EnclosingMethodXrefs,
     ToggleBreakpoint,
@@ -565,10 +570,17 @@ struct EmulationArgument {
 }
 
 #[derive(Clone)]
+struct EmulationGuess {
+    label: String,
+    arguments: Vec<String>,
+}
+
+#[derive(Clone)]
 struct EmulationEditor {
     method_id: String,
     method_label: String,
     arguments: Vec<EmulationArgument>,
+    guesses: Vec<EmulationGuess>,
 }
 
 #[derive(Clone)]
@@ -1333,6 +1345,124 @@ impl CoeusApp {
                             "Method emulation failed".to_string()
                         };
                     }
+                    "emulation_options" => {
+                        let analysis_limited = data
+                            .get("analysis_limited")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                            || data
+                                .get("truncated")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                        let guesses = data
+                            .get("options")
+                            .and_then(Value::as_array)
+                            .map(|options| {
+                                options
+                                    .iter()
+                                    .map(|option| EmulationGuess {
+                                        label: value_string(option, "label"),
+                                        arguments: option
+                                            .get("arguments")
+                                            .and_then(Value::as_array)
+                                            .map(|arguments| {
+                                                arguments
+                                                    .iter()
+                                                    .map(|argument| {
+                                                        argument
+                                                            .as_str()
+                                                            .unwrap_or_default()
+                                                            .to_string()
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default(),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if let Some(editor) = self.emulation_editor.as_mut() {
+                            editor.guesses = guesses;
+                            self.status = if editor.guesses.is_empty() {
+                                if analysis_limited {
+                                    "Static flow analysis reached its work limit without finding usable argument sets".to_string()
+                                } else {
+                                    "Static flow analysis found no usable argument sets".to_string()
+                                }
+                            } else {
+                                format!(
+                                    "Static flow analysis found {} possible argument set(s){}",
+                                    editor.guesses.len(),
+                                    if analysis_limited {
+                                        " before reaching its work limit"
+                                    } else {
+                                        ""
+                                    }
+                                )
+                            };
+                        }
+                    }
+                    "emulate_batch" => {
+                        let method_label = self
+                            .emulation_pending_label
+                            .take()
+                            .unwrap_or_else(|| self.code.identity_title.clone());
+                        let output = data
+                            .get("results")
+                            .and_then(Value::as_array)
+                            .map(|results| {
+                                results
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, result)| {
+                                        let arguments = result
+                                            .get("arguments")
+                                            .and_then(Value::as_array)
+                                            .map(|arguments| {
+                                                arguments
+                                                    .iter()
+                                                    .map(|argument| {
+                                                        argument.as_str().unwrap_or_default()
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ")
+                                            })
+                                            .unwrap_or_default();
+                                        let success = result
+                                            .get("success")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false);
+                                        let value = if success {
+                                            value_string(result, "result")
+                                        } else {
+                                            value_string(result, "error")
+                                        };
+                                        format!(
+                                            "{}. [{}] {}: {}",
+                                            index + 1,
+                                            arguments,
+                                            if success { "returned" } else { "failed" },
+                                            if value.is_empty() {
+                                                "(no displayable value)"
+                                            } else {
+                                                &value
+                                            }
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_else(|| "No emulation results were returned.".to_string());
+                        self.emulation_result = Some(EmulationResult {
+                            method_label,
+                            success: data
+                                .get("success")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            output,
+                        });
+                        self.status = "Finished emulating all static argument sets".to_string();
+                    }
                     "search" => {
                         self.completed_search = self.submitted_search.take();
                         self.result_count =
@@ -1901,7 +2031,7 @@ impl CoeusApp {
                 if operation == "debug_poll" {
                     self.debug.waiting = false;
                 }
-                if operation == "emulate" {
+                if matches!(operation.as_str(), "emulate" | "emulate_batch") {
                     let method_label = self
                         .emulation_pending_label
                         .take()
@@ -2665,7 +2795,30 @@ impl CoeusApp {
                     descriptor,
                 })
                 .collect(),
+            guesses: Vec::new(),
         });
+    }
+
+    fn open_static_emulation_target(
+        &mut self,
+        method_id: String,
+        method_label: String,
+        method_key: String,
+        source_method_id: Option<String>,
+        offset: Option<u64>,
+    ) {
+        self.open_emulation_target(method_id.clone(), method_label, method_key);
+        let mut request = json!({
+            "op": "emulation_options",
+            "id": method_id,
+        });
+        if let Some(source_method_id) = source_method_id {
+            request["source_id"] = json!(source_method_id);
+        }
+        if let Some(offset) = offset {
+            request["offset"] = json!(offset);
+        }
+        self.request("emulation_options", request);
     }
 
     fn open_emulation(&mut self) {
@@ -2687,6 +2840,9 @@ impl CoeusApp {
         };
         let mut close = false;
         let mut run = false;
+        let mut run_arguments = None;
+        let mut run_all = false;
+        let mut use_guess = None;
         egui::Window::new("Emulate method")
             .id(egui::Id::new(("emulation-editor", editor.method_id.clone())))
             .collapsible(false)
@@ -2721,6 +2877,62 @@ impl CoeusApp {
                         });
                     }
                 }
+                if !editor.guesses.is_empty()
+                    || self
+                        .pending
+                        .iter()
+                        .any(|pending| pending.operation == "emulation_options")
+                {
+                    ui.separator();
+                    ui.label(RichText::new("Static flow argument guesses").strong());
+                    ui.label(
+                        RichText::new(
+                            "These are possible argument sets found at statically analysed call sites. Unknown values are shown with safe defaults such as null or 0.",
+                        )
+                        .small()
+                        .color(theme::MUTED),
+                    );
+                    if self
+                        .pending
+                        .iter()
+                        .any(|pending| pending.operation == "emulation_options")
+                    {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Analysing possible call arguments…");
+                        });
+                    }
+                    for (index, guess) in editor.guesses.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{}.", index + 1))
+                                    .small()
+                                    .color(theme::MUTED),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&guess.label).monospace().small(),
+                                )
+                                .truncate(),
+                            );
+                            if ui.small_button("Use").clicked() {
+                                use_guess = Some(index);
+                            }
+                            if ui.small_button("Run").clicked() {
+                                run_arguments = Some(guess.arguments.clone());
+                            }
+                        });
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.busy() && !editor.guesses.is_empty(),
+                            egui::Button::new("Run all guessed argument sets"),
+                        )
+                        .clicked()
+                    {
+                        run_all = true;
+                    }
+                }
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui
@@ -2735,11 +2947,38 @@ impl CoeusApp {
                 });
             });
         if run {
-            let arguments = editor
-                .arguments
+            run_arguments = Some(
+                editor
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.value.clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        if let Some(index) = use_guess {
+            if let Some(guess) = editor.guesses.get(index) {
+                for (argument, value) in editor.arguments.iter_mut().zip(&guess.arguments) {
+                    argument.value = value.clone();
+                }
+            }
+        }
+        if run_all {
+            let method_id = editor.method_id.clone();
+            let argument_sets = editor
+                .guesses
                 .iter()
-                .map(|argument| argument.value.clone())
+                .map(|guess| guess.arguments.clone())
                 .collect::<Vec<_>>();
+            self.emulation_editor = None;
+            self.request(
+                "emulate_batch",
+                json!({
+                    "op": "emulate_batch",
+                    "id": method_id,
+                    "arguments_sets": argument_sets,
+                }),
+            );
+        } else if let Some(arguments) = run_arguments {
             let method_id = editor.method_id.clone();
             self.emulation_editor = None;
             self.request(
@@ -4194,6 +4433,19 @@ impl CoeusApp {
                 Some(CodeAction::Emulate(target)) => {
                     self.open_emulation_target(target.id, target.label.clone(), target.label);
                 }
+                Some(CodeAction::EmulateWithStaticArguments {
+                    target,
+                    source_method_id,
+                    offset,
+                }) => {
+                    self.open_static_emulation_target(
+                        target.id,
+                        target.label.clone(),
+                        target.label,
+                        source_method_id,
+                        offset,
+                    );
+                }
                 Some(CodeAction::Xrefs(target)) => {
                     self.request("xrefs", json!({"op":"xrefs", "id":target.id}));
                 }
@@ -4761,15 +5013,45 @@ impl CoeusApp {
                                                         enclosing_method_target.clone()
                                                     {
                                                         if ui
-                                                            .button("Emulate enclosing method")
+                                                            .button("Open method disassembly")
+                                                            .clicked()
+                                                        {
+                                                            interaction = Some(CodeInteraction {
+                                                                offset,
+                                                                method_id: Some(target.id.clone()),
+                                                                action: Some(CodeAction::Navigate(
+                                                                    target.clone(),
+                                                                )),
+                                                            });
+                                                            ui.close_menu();
+                                                        }
+                                                        if ui
+                                                            .button("Emulate method")
                                                             .clicked()
                                                         {
                                                             interaction = Some(CodeInteraction {
                                                                 offset,
                                                                 method_id: Some(target.id.clone()),
                                                                 action: Some(CodeAction::Emulate(
-                                                                    target,
+                                                                    target.clone(),
                                                                 )),
+                                                            });
+                                                            ui.close_menu();
+                                                        }
+                                                        if ui
+                                                            .button("Emulate with static argument guesses")
+                                                            .clicked()
+                                                        {
+                                                            interaction = Some(CodeInteraction {
+                                                                offset,
+                                                                method_id: Some(target.id.clone()),
+                                                                action: Some(
+                                                                    CodeAction::EmulateWithStaticArguments {
+                                                                        target,
+                                                                        source_method_id: None,
+                                                                        offset: None,
+                                                                    },
+                                                                ),
                                                             });
                                                             ui.close_menu();
                                                         }
@@ -4816,6 +5098,71 @@ impl CoeusApp {
                                                                         ),
                                                                     });
                                                                 ui.close_menu();
+                                                            }
+                                                            if target.kind == "method" {
+                                                                if ui
+                                                                    .button(format!(
+                                                                        "Open method: {}",
+                                                                        shorten(&display_label, 42)
+                                                                    ))
+                                                                    .clicked()
+                                                                {
+                                                                    interaction =
+                                                                        Some(CodeInteraction {
+                                                                            offset,
+                                                                            method_id: line_method_id
+                                                                                .clone(),
+                                                                            action: Some(
+                                                                                CodeAction::Navigate(
+                                                                                    target.clone(),
+                                                                                ),
+                                                                            ),
+                                                                        });
+                                                                    ui.close_menu();
+                                                                }
+                                                                if ui
+                                                                    .button(format!(
+                                                                        "Emulate method: {}",
+                                                                        shorten(&display_label, 38)
+                                                                    ))
+                                                                    .clicked()
+                                                                {
+                                                                    interaction =
+                                                                        Some(CodeInteraction {
+                                                                            offset,
+                                                                            method_id: line_method_id
+                                                                                .clone(),
+                                                                            action: Some(
+                                                                                CodeAction::Emulate(
+                                                                                    target.clone(),
+                                                                                ),
+                                                                            ),
+                                                                        });
+                                                                    ui.close_menu();
+                                                                }
+                                                                if ui
+                                                                    .button(format!(
+                                                                        "Guess args and emulate: {}",
+                                                                        shorten(&display_label, 32)
+                                                                    ))
+                                                                    .clicked()
+                                                                {
+                                                                    interaction =
+                                                                        Some(CodeInteraction {
+                                                                            offset,
+                                                                            method_id: line_method_id
+                                                                                .clone(),
+                                                                            action: Some(
+                                                                                CodeAction::EmulateWithStaticArguments {
+                                                                                    target: target.clone(),
+                                                                                    source_method_id: line_method_id
+                                                                                        .clone(),
+                                                                                    offset: Some(offset),
+                                                                                },
+                                                                            ),
+                                                                        });
+                                                                    ui.close_menu();
+                                                                }
                                                             }
                                                         }
                                                         ui.separator();
