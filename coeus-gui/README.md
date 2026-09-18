@@ -10,11 +10,11 @@ objects used by the UI:
 
 ## Build and run
 
-The native Rust backend needs only the Rust dependencies:
+The native Rust backend is the default and needs only the Rust dependencies:
 
 ```text
 cd coeus-gui
-COEUS_GUI_BACKEND=rust cargo run --release
+cargo run --release
 ```
 
 To use the compatibility backend, build the Python extension from
@@ -29,8 +29,7 @@ cd ../coeus-gui
 cargo run --release
 ```
 
-The Python backend remains the default for compatibility. Select either
-backend at runtime without rebuilding:
+Select either backend at runtime without rebuilding:
 
 ```text
 COEUS_GUI_BACKEND=python cargo run --release

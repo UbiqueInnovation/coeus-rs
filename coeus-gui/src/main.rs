@@ -113,7 +113,7 @@ impl Backend {
 impl Bridge {
     fn spawn() -> Result<Self, String> {
         let selected = std::env::var("COEUS_GUI_BACKEND")
-            .unwrap_or_else(|_| "python".to_string())
+            .unwrap_or_else(|_| "rust".to_string())
             .to_ascii_lowercase();
         let backend = match selected.as_str() {
             "python" => Backend::Python(Arc::new(Mutex::new(PythonBridge::spawn()?))),
