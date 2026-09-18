@@ -246,6 +246,8 @@ class Backend:
             "notes": self.notes,
             "aliases": self.aliases,
             "graph": self.saved_graph,
+            "documentation": {},
+            "events": list(self.session_events),
             "history": self._history(),
         }
 
@@ -278,6 +280,8 @@ class Backend:
             "notes": self.notes,
             "aliases": self.aliases,
             "graph": self.saved_graph,
+            "documentation": {},
+            "events": list(self.session_events),
             "history": self._history(),
         }
 
@@ -321,6 +325,8 @@ class Backend:
             "notes": self.notes,
             "aliases": self.aliases,
             "graph": self.saved_graph,
+            "documentation": {},
+            "events": list(self.session_events),
             "history": self._history(),
         }
 
@@ -334,6 +340,7 @@ class Backend:
         self.notes = {}
         self.aliases = {}
         self.saved_graph = None
+        documentation = {}
         try:
             with zipfile.ZipFile(path, "r") as archive:
                 metadata = json.loads(archive.read("gui/session.json").decode("utf-8"))
@@ -360,6 +367,11 @@ class Backend:
                     for key, value in aliases.items()
                     if str(key).strip() and str(value).strip()
                 }
+            if isinstance(metadata.get("documentation"), dict):
+                documentation = metadata["documentation"]
+            events = metadata.get("events", [])
+            if isinstance(events, list):
+                self.session_events = events
         except (KeyError, OSError, ValueError, UnicodeDecodeError, zipfile.BadZipFile):
             pass
         self.debug_breakpoints.clear()
@@ -379,6 +391,8 @@ class Backend:
             "notes": self.notes,
             "aliases": self.aliases,
             "graph": self.saved_graph,
+            "documentation": documentation,
+            "events": list(self.session_events),
             "history": self._history(),
         }
 
@@ -646,7 +660,7 @@ class Backend:
         ])
         return "\n".join(lines) + "\n"
 
-    def _write_project_metadata(self, path, graph=None):
+    def _write_project_metadata(self, path, graph=None, documentation=None):
         metadata = {
             "format_version": 1,
             "origin": self.session_origin,
@@ -655,6 +669,7 @@ class Backend:
             "notes": self.notes,
             "aliases": self.aliases,
             "graph": graph,
+            "documentation": documentation or {},
         }
         directory = str(Path(path).expanduser().resolve().parent)
         temporary = tempfile.NamedTemporaryFile(
@@ -680,7 +695,7 @@ class Backend:
             if os.path.exists(temporary_path):
                 os.unlink(temporary_path)
 
-    def save_project(self, path, graph=None):
+    def save_project(self, path, graph=None, documentation=None):
         if self.ao is None:
             raise RuntimeError("load an APK before saving a project")
         path = str(path)
@@ -690,7 +705,7 @@ class Backend:
             self.ao.save_state(path)
         else:
             raise RuntimeError("the installed coeus_python wheel cannot save project state")
-        self._write_project_metadata(path, graph)
+        self._write_project_metadata(path, graph, documentation)
         return {"path": path, "history": self._history(), "script": self.session_script()}
 
     def set_note(self, key, note):
@@ -1471,7 +1486,12 @@ class Backend:
                 "replacement": replacement,
             }
         )
-        return {"id": object_id, "value": replacement, "history": self._history()}
+        return {
+            "id": object_id,
+            "value": replacement,
+            "history": self._history(),
+            "events": list(self.session_events),
+        }
 
     @staticmethod
     def _edit_argument(name, label, value, kind="integer", picker=None):
@@ -1930,6 +1950,7 @@ class Backend:
         )
         data = self.describe(option["method_id"])
         data["history"] = self._history()
+        data["events"] = list(self.session_events)
         return data
 
     def cross_references(self, object_id):
@@ -2574,7 +2595,9 @@ class Backend:
         if op == "write":
             return self.write(request["path"])
         if op == "save_project":
-            return self.save_project(request["path"], request.get("graph"))
+            return self.save_project(
+                request["path"], request.get("graph"), request.get("documentation")
+            )
         if op == "set_note":
             return self.set_note(request["key"], request.get("note", ""))
         if op == "set_alias":

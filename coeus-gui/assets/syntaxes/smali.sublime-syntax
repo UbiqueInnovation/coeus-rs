@@ -1,0 +1,87 @@
+%YAML 1.2
+---
+name: Smali
+file_extensions:
+  - smali
+scope: source.smali
+
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - include: annotations
+    - include: labels
+    - include: directives
+    - include: instructions
+    - include: registers
+    - include: class-descriptors
+    - include: numbers
+    - include: punctuation
+
+  comments:
+    - match: '#.*$'
+      scope: comment.line.smali
+    - match: '//.*$'
+      scope: comment.line.double-slash.smali
+
+  strings:
+    - match: '"'
+      scope: punctuation.definition.string.begin.smali
+      push: double-quoted-string
+    - match: "'"
+      scope: punctuation.definition.string.begin.smali
+      push: single-quoted-string
+
+  double-quoted-string:
+    - meta_scope: string.quoted.double.smali
+    - match: '\\.'
+      scope: constant.character.escape.smali
+    - match: '"'
+      scope: punctuation.definition.string.end.smali
+      pop: true
+
+  single-quoted-string:
+    - meta_scope: string.quoted.single.smali
+    - match: '\\.'
+      scope: constant.character.escape.smali
+    - match: "'"
+      scope: punctuation.definition.string.end.smali
+      pop: true
+
+  annotations:
+    - match: '^\s*\.annotation\b.*$'
+      scope: meta.annotation.smali
+    - match: '^\s*\.end\s+annotation\b.*$'
+      scope: meta.annotation.smali
+
+  labels:
+    - match: '^\s*:[A-Za-z_$][\w$.-]*'
+      scope: entity.name.label.smali
+
+  directives:
+    - match: '^\s*\.(?:class|super|implements|source|field|method|end|registers|locals|catch|catchall|param|prologue|epilogue|line|local|restart|array-data|packed-switch|sparse-switch|end\s+array-data|end\s+packed-switch|end\s+sparse-switch)\b'
+      scope: keyword.control.directive.smali
+
+  instructions:
+    - match: '\b(?:move(?:/from16|/16)?(?:-wide|-object|-exception)?|return(?:-void|-wide|-object)?|const(?:/4|/16|-wide(?:/16|/32)?|-high16)?|monitor-(?:enter|exit)|check-cast|instance-of|new-instance|array-length|new-array|filled-new-array(?:/range)?|fill-array-data|throw|goto(?:/16|/32)?|packed-switch|sparse-switch|cmpl-float|cmpg-float|cmpl-double|cmpg-double|cmp-long|if-(?:eq|ne|lt|ge|gt|le)(?:z)?|aget(?:-wide|-object|-boolean|-byte|-char|-short)?|aput(?:-wide|-object|-boolean|-byte|-char|-short)?|iget(?:-wide|-object|-boolean|-byte|-char|-short)?(?:-quick)?|iput(?:-wide|-object|-boolean|-byte|-char|-short)?(?:-quick)?|sget(?:-wide|-object|-boolean|-byte|-char|-short)?|sput(?:-wide|-object|-boolean|-byte|-char|-short)?|invoke-(?:virtual|super|direct|static|interface)(?:/range)?|execute-inline(?:/range)?|filled-new-array|rsub-int|add-int|sub-int|mul-int|div-int|rem-int|and-int|or-int|xor-int|shl-int|shr-int|ushr-int)(?:\b|$)'
+      scope: keyword.control.instruction.smali
+    - match: '\b(?:nop|neg-int|not-int|neg-long|not-long|neg-float|neg-double|int-to-long|int-to-float|int-to-double|long-to-int|long-to-float|long-to-double|float-to-int|float-to-long|float-to-double|double-to-int|double-to-long|double-to-float|int-to-byte|int-to-char|int-to-short|add-long|sub-long|mul-long|div-long|rem-long|and-long|or-long|xor-long|shl-long|shr-long|ushr-long|add-float|sub-float|mul-float|div-float|rem-float|add-double|sub-double|mul-double|div-double|rem-double)(?:\b|$)'
+      scope: keyword.control.instruction.smali
+
+  registers:
+    - match: '\b(?:v|p|a|param)[0-9]+\b'
+      scope: variable.other.register.smali
+
+  class-descriptors:
+    - match: '\bL[a-zA-Z_$][\w$]*(?:/[\w$-]+)*;'
+      scope: entity.name.type.class.smali
+    - match: '\b(?:Z|B|S|C|I|J|F|D|V|\[)+\b'
+      scope: storage.type.descriptor.smali
+
+  numbers:
+    - match: '\b(?:0[xX][0-9a-fA-F]+|0[bB][01]+|[0-9]+(?:\.[0-9]+)?[fFdDlL]?)\b'
+      scope: constant.numeric.smali
+
+  punctuation:
+    - match: '[{},()\[\]:;]'
+      scope: punctuation.separator.smali

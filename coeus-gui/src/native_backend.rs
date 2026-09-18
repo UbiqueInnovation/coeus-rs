@@ -647,6 +647,7 @@ struct EditSpec {
     offset: u32,
     action: String,
     factory: String,
+    emulation: bool,
 }
 
 #[derive(Clone)]
@@ -671,6 +672,9 @@ pub struct RustBackend {
     session: Option<Session>,
     analysis_revision: u64,
     objects: HashMap<String, ObjectEntry>,
+    // Method copies used only by the emulator. These are deliberately kept
+    // outside `Session`, so APK writes can never include an emulation edit.
+    emulation_overlays: HashMap<String, MethodObject>,
     next_object_id: Arc<AtomicUsize>,
     notes: HashMap<String, String>,
     aliases: HashMap<String, String>,
@@ -755,6 +759,7 @@ impl RustBackend {
             session: None,
             analysis_revision: 0,
             objects: HashMap::new(),
+            emulation_overlays: HashMap::new(),
             next_object_id: Arc::new(AtomicUsize::new(1)),
             notes: HashMap::new(),
             aliases: HashMap::new(),
@@ -777,6 +782,7 @@ impl RustBackend {
             session: self.session.clone(),
             analysis_revision: self.analysis_revision,
             objects: self.objects.clone(),
+            emulation_overlays: self.emulation_overlays.clone(),
             next_object_id: self.next_object_id.clone(),
             notes: self.notes.clone(),
             aliases: self.aliases.clone(),
@@ -845,6 +851,8 @@ impl RustBackend {
             "resolve" => self.resolve(&request),
             "edit_search" => self.edit_search(&request),
             "describe" => self.describe(value_string(&request, "id")),
+            "emulation_view" => self.emulation_view(&request),
+            "emulation_reset" => self.emulation_reset(&request),
             "emulation_options" => self.emulation_options(&request),
             "emulate" => self.emulate(&request),
             "emulate_batch" => self.emulate_batch(&request),
@@ -894,6 +902,7 @@ impl RustBackend {
 
     fn reset_objects(&mut self) {
         self.objects.clear();
+        self.emulation_overlays.clear();
         self.next_object_id.store(1, Ordering::Relaxed);
         self.session_events.clear();
         self.session_script_override = None;
@@ -1017,6 +1026,11 @@ impl RustBackend {
             .and_then(|metadata| metadata.get("graph"))
             .cloned()
             .unwrap_or(Value::Null);
+        let saved_documentation = gui_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("documentation"))
+            .cloned()
+            .unwrap_or(Value::Null);
         let members = state_metadata
             .get("members")
             .and_then(Value::as_array)
@@ -1084,6 +1098,9 @@ impl RustBackend {
             self.session_origin = Some(json!({"kind": "state", "path": path}));
             self.session_script_override = saved_script.filter(|script| !script.trim().is_empty());
             if let Some(metadata) = gui_metadata {
+                if let Some(events) = metadata.get("events").and_then(Value::as_array) {
+                    self.session_events = events.clone();
+                }
                 if let Some(notes) = metadata.get("notes").and_then(Value::as_object) {
                     self.notes = notes
                         .iter()
@@ -1108,6 +1125,8 @@ impl RustBackend {
             data["path"] = json!(path);
             data["notes"] = json!(self.notes);
             data["aliases"] = json!(self.aliases);
+            data["documentation"] = saved_documentation;
+            data["events"] = json!(self.session_events);
             data["split"] = json!(members.len() > 1);
             data["graph"] = saved_graph;
             data["history"] = json!(self
@@ -1168,6 +1187,8 @@ impl RustBackend {
             "members": self.session.as_ref().map(Session::names).unwrap_or_default(),
             "notes": self.notes,
             "aliases": self.aliases,
+            "documentation": Value::Null,
+            "events": self.session_events,
             "history": self.session.as_ref().map(Session::history).unwrap_or_default(),
         })
     }
@@ -1471,10 +1492,7 @@ impl RustBackend {
 
     fn emulate(&self, request: &Value) -> BackendResult {
         let id = value_string(request, "id");
-        let object = self.entry(&id)?.object.clone();
-        let NativeObject::Method(method) = object else {
-            return Err("emulation is only available for methods".to_string());
-        };
+        let method = self.emulation_method(&id)?;
         let arguments = request
             .get("arguments")
             .and_then(Value::as_array)
@@ -1514,7 +1532,7 @@ impl RustBackend {
             .unwrap_or(false)
         {
             let receiver = vm
-                .new_class_instance(&method.class.class_name)
+                .new_class_instance_for_emulation(&method.class.class_name)
                 .map_err(|error| format!("could not allocate method receiver: {error:?}"))?;
             vm_arguments.insert(0, receiver);
         }
@@ -1541,6 +1559,68 @@ impl RustBackend {
             }
             Err(error) => Ok(json!({"success": false, "error": format!("VM failed: {error:?}")})),
         }
+    }
+
+    fn emulation_method(&self, method_id: &str) -> Result<MethodObject, String> {
+        if let Some(method) = self.emulation_overlays.get(method_id) {
+            return Ok(method.clone());
+        }
+        let object = self.entry(method_id)?.object.clone();
+        match object {
+            NativeObject::Method(method) => Ok(method),
+            _ => Err("emulation is only available for methods".to_string()),
+        }
+    }
+
+    fn emulation_view(&mut self, request: &Value) -> BackendResult {
+        let method_id = value_string(request, "id");
+        let method = self.emulation_method(&method_id)?;
+        let instructions = self.instructions_json(&method)?;
+        let offset = request
+            .get("offset")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+            .or_else(|| {
+                instructions
+                    .first()
+                    .and_then(|instruction| instruction.get("offset"))
+                    .and_then(Value::as_u64)
+                    .map(|value| value as u32)
+            });
+        let options = offset
+            .map(|offset| {
+                self.edit_options(&json!({
+                    "op": "edit_options",
+                    "id": method_id.clone(),
+                    "offset": offset,
+                    "emulation": true,
+                }))
+            })
+            .transpose()?
+            .unwrap_or_else(|| json!({"options": [], "available": false}));
+        Ok(json!({
+            "id": method_id,
+            "kind": "method",
+            "label": method.signature(),
+            "method_key": method.signature(),
+            "code": method.code(),
+            "instructions": instructions,
+            "dex": method.file.get_dex_name(),
+            "ghost": true,
+            "emulation": true,
+            "options": options.get("options").cloned().unwrap_or_else(|| json!([])),
+            "available": options.get("available").cloned().unwrap_or_else(|| json!(false)),
+            "selected_offset": offset,
+        }))
+    }
+
+    fn emulation_reset(&mut self, request: &Value) -> BackendResult {
+        let method_id = value_string(request, "id");
+        self.emulation_overlays.remove(&method_id);
+        self.emulation_view(&json!({
+            "op": "emulation_view",
+            "id": method_id,
+        }))
     }
 
     fn emulation_options(&self, request: &Value) -> BackendResult {
@@ -1939,9 +2019,12 @@ impl RustBackend {
             "index": string.index,
             "replacement": replacement,
         }));
-        Ok(
-            json!({"id": id, "value": replacement, "history": self.session.as_ref().map(Session::history).unwrap_or_default()}),
-        )
+        Ok(json!({
+            "id": id,
+            "value": replacement,
+            "history": self.session.as_ref().map(Session::history).unwrap_or_default(),
+            "events": self.session_events,
+        }))
     }
 
     fn cross_references(&mut self, id: String) -> BackendResult {
@@ -2093,9 +2176,18 @@ impl RustBackend {
     fn edit_options(&mut self, request: &Value) -> BackendResult {
         let method_id = value_string(request, "id");
         let offset = value_u32(request, "offset")?;
-        let object = self.entry(&method_id)?.object.clone();
-        let NativeObject::Method(method) = object else {
-            return Err("instruction edits require a method".to_string());
+        let emulation = request
+            .get("emulation")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let method = if emulation {
+            self.emulation_method(&method_id)?
+        } else {
+            let object = self.entry(&method_id)?.object.clone();
+            let NativeObject::Method(method) = object else {
+                return Err("instruction edits require a method".to_string());
+            };
+            method
         };
         let target = method
             .instructions()
@@ -2403,6 +2495,7 @@ impl RustBackend {
                 offset,
                 action: action.to_string(),
                 factory: factory.to_string(),
+                emulation,
             };
             let id = self.store(ObjectEntry {
                 object: NativeObject::Edit(spec),
@@ -2418,7 +2511,7 @@ impl RustBackend {
             }));
         }
         Ok(
-            json!({"selected_offset": offset, "width": target.size, "options": options, "available": true, "dex": method.file.get_dex_name()}),
+            json!({"selected_offset": offset, "width": target.size, "options": options, "available": true, "dex": method.file.get_dex_name(), "emulation": emulation}),
         )
     }
 
@@ -2429,6 +2522,29 @@ impl RustBackend {
             return Err("unknown edit node".to_string());
         };
         let spec = spec.clone();
+        if spec.emulation {
+            let current = self.emulation_method(&spec.method_id)?;
+            let arguments = request.get("arguments").unwrap_or(&Value::Null);
+            let mut scratch = self.analysis()?.clone();
+            scratch.replace_loaded_dex(
+                current.file.get_dex_name(),
+                current.file.raw_data().to_vec(),
+            )?;
+            let edited = scratch.edit_method(
+                &current,
+                spec.offset,
+                &spec.action,
+                &spec.factory,
+                arguments,
+            )?;
+            self.emulation_overlays
+                .insert(spec.method_id.clone(), edited);
+            return self.emulation_view(&json!({
+                "op": "emulation_view",
+                "id": spec.method_id,
+                "offset": spec.offset,
+            }));
+        }
         let object = self.entry(&spec.method_id)?.object.clone();
         let NativeObject::Method(method) = object else {
             return Err("edit target is not a method".to_string());
@@ -2445,6 +2561,7 @@ impl RustBackend {
             entry.object = NativeObject::Method(edited);
             entry.evidence = None;
         }
+        self.emulation_overlays.remove(&spec.method_id);
         self.record_event(json!({
             "operation": "apply_edit",
             "method": method.signature(),
@@ -2453,7 +2570,14 @@ impl RustBackend {
             "factory": spec.factory,
             "arguments": arguments,
         }));
-        self.describe(spec.method_id)
+        let mut data = self.describe(spec.method_id)?;
+        data["history"] = json!(self
+            .session
+            .as_ref()
+            .map(Session::history)
+            .unwrap_or_default());
+        data["events"] = json!(self.session_events);
+        Ok(data)
     }
 
     fn adb_devices(&self, adb_path: String) -> BackendResult {
@@ -2647,6 +2771,7 @@ impl RustBackend {
             return Err("save project requires a path".to_string());
         }
         let graph = request.get("graph").cloned().unwrap_or(Value::Null);
+        let documentation = request.get("documentation").cloned().unwrap_or(Value::Null);
         let (names, bytes) =
             match self.session.as_ref() {
                 Some(Session::Single(analysis)) => (
@@ -2684,6 +2809,7 @@ impl RustBackend {
             "notes": self.notes,
             "aliases": self.aliases,
             "graph": graph,
+            "documentation": documentation,
         });
         let script = self.session_script();
         let file = File::create(&path)
@@ -3665,6 +3791,7 @@ fn parallel_read_operation(request: &Value) -> bool {
                 | "search"
                 | "edit_search"
                 | "describe"
+                | "emulation_view"
                 | "emulation_options"
                 | "xrefs"
                 | "graph"

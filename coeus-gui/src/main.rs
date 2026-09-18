@@ -13,8 +13,10 @@ use eframe::egui::{self, Color32, FontId, Key, Rect, RichText, Sense, Stroke, Ve
 use regex::Regex;
 use serde_json::{json, Value};
 
+mod documentation;
 mod native_backend;
 mod theme;
+use documentation::{DocumentationCodeSample, DocumentationState};
 use native_backend::RustBackendHandle;
 
 const BRIDGE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bridge.py");
@@ -144,12 +146,19 @@ impl Bridge {
 enum Tab {
     Search,
     Notes,
+    Documentation,
     Code,
     Graph,
     Debugger,
     Manifest,
     Deploy,
     Adb,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodeViewTab {
+    Source,
+    Emulation,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -302,6 +311,7 @@ struct EditPicker {
     argument_label: String,
     kind: SearchKind,
     dex_name: String,
+    emulation: bool,
     query: String,
     results: Vec<EditPickerResult>,
     result_count: usize,
@@ -314,12 +324,14 @@ impl EditPicker {
         argument_label: String,
         kind: SearchKind,
         dex_name: String,
+        emulation: bool,
     ) -> Self {
         Self {
             argument_name,
             argument_label,
             kind,
             dex_name,
+            emulation,
             query: ".*".to_string(),
             results: Vec::new(),
             result_count: 0,
@@ -581,6 +593,14 @@ struct EmulationEditor {
     method_label: String,
     arguments: Vec<EmulationArgument>,
     guesses: Vec<EmulationGuess>,
+    code: String,
+    instructions: Vec<InstructionRow>,
+    selected_offset: Option<u64>,
+    edit_options: Vec<EditOption>,
+    edit_form: Option<EditOption>,
+    edit_dex_name: String,
+    edit_available: bool,
+    edit_reason: String,
 }
 
 #[derive(Clone)]
@@ -697,6 +717,7 @@ struct CoeusApp {
     next_request_id: u64,
     latest_view_request: u64,
     tab: Tab,
+    code_view_tab: CodeViewTab,
     path: String,
     output_path: String,
     search: String,
@@ -728,6 +749,18 @@ struct CoeusApp {
     description_cache: HashMap<String, Value>,
     notes: HashMap<String, String>,
     aliases: HashMap<String, String>,
+    session_events: Vec<Value>,
+    documentation: DocumentationState,
+    documentation_render:
+        Option<mpsc::Receiver<(u64, Result<documentation::RenderedDocumentation, String>)>>,
+    documentation_render_due: Option<Instant>,
+    documentation_requested_generation: u64,
+    documentation_preview_generation: u64,
+    documentation_preview_textures: Vec<egui::TextureHandle>,
+    documentation_completions: Vec<documentation::TypstCompletion>,
+    documentation_completion_cursor: usize,
+    documentation_workspace_collapsed: bool,
+    documentation_preview_collapsed: bool,
     note_editor: Option<NoteEditor>,
     note_popup: Option<NotePopup>,
     alias_editor: Option<AliasEditor>,
@@ -762,6 +795,7 @@ impl CoeusApp {
                     next_request_id: 0,
                     latest_view_request: 0,
                     tab: Tab::Search,
+                    code_view_tab: CodeViewTab::Source,
                     path: String::new(),
                     output_path: String::new(),
                     search: ".*".to_string(),
@@ -793,6 +827,17 @@ impl CoeusApp {
                     description_cache: HashMap::new(),
                     notes: HashMap::new(),
                     aliases: HashMap::new(),
+                    session_events: Vec::new(),
+                    documentation: DocumentationState::default(),
+                    documentation_render: None,
+                    documentation_render_due: None,
+                    documentation_requested_generation: 0,
+                    documentation_preview_generation: 0,
+                    documentation_preview_textures: Vec::new(),
+                    documentation_completions: Vec::new(),
+                    documentation_completion_cursor: 0,
+                    documentation_workspace_collapsed: false,
+                    documentation_preview_collapsed: false,
                     note_editor: None,
                     note_popup: None,
                     alias_editor: None,
@@ -817,6 +862,7 @@ impl CoeusApp {
                 next_request_id: 0,
                 latest_view_request: 0,
                 tab: Tab::Search,
+                code_view_tab: CodeViewTab::Source,
                 path: String::new(),
                 output_path: String::new(),
                 search: ".*".to_string(),
@@ -848,6 +894,17 @@ impl CoeusApp {
                 description_cache: HashMap::new(),
                 notes: HashMap::new(),
                 aliases: HashMap::new(),
+                session_events: Vec::new(),
+                documentation: DocumentationState::default(),
+                documentation_render: None,
+                documentation_render_due: None,
+                documentation_requested_generation: 0,
+                documentation_preview_generation: 0,
+                documentation_preview_textures: Vec::new(),
+                documentation_completions: Vec::new(),
+                documentation_completion_cursor: 0,
+                documentation_workspace_collapsed: false,
+                documentation_preview_collapsed: false,
                 note_editor: None,
                 note_popup: None,
                 alias_editor: None,
@@ -1127,7 +1184,8 @@ impl CoeusApp {
         self.status = format!("Running {name}…");
     }
 
-    fn poll(&mut self) {
+    fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_documentation_render(ctx);
         let mut completed = Vec::new();
         for (index, pending) in self.pending.iter().enumerate() {
             match pending.receiver.try_recv() {
@@ -1154,6 +1212,117 @@ impl CoeusApp {
         }
     }
 
+    fn poll_documentation_render(&mut self, ctx: &egui::Context) {
+        if self.documentation_render.is_none()
+            && self
+                .documentation_render_due
+                .is_some_and(|due| due <= Instant::now())
+        {
+            self.start_documentation_render(ctx);
+        }
+        let Some(receiver) = self.documentation_render.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((generation, Ok(rendered))) => {
+                if generation == self.documentation_requested_generation {
+                    let page_count = rendered.preview.len();
+                    match upload_documentation_previews(ctx, generation, &rendered.preview) {
+                        Ok(textures) => {
+                            self.documentation.rendered_pdf = Some(rendered.pdf);
+                            self.documentation.rendered_preview = Some(rendered.preview);
+                            self.documentation_preview_textures = textures;
+                            self.documentation_preview_generation = generation;
+                            self.documentation.render_error = None;
+                            self.status = format!(
+                                "Rendered documentation PDF and {page_count} PNG page(s)"
+                            );
+                        }
+                        Err(error) => {
+                            self.documentation.render_error = Some(error.clone());
+                            self.last_error = Some(error);
+                            self.status = "Documentation preview failed".to_string();
+                        }
+                    }
+                }
+                self.documentation_render = None;
+            }
+            Ok((generation, Err(error))) => {
+                if generation == self.documentation_requested_generation {
+                    self.documentation.render_error = Some(error.clone());
+                    self.last_error = Some(error);
+                    self.status = "Documentation rendering failed".to_string();
+                }
+                self.documentation_render = None;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.documentation.render_error =
+                    Some("the Typst renderer stopped unexpectedly".to_string());
+                self.documentation_render = None;
+                self.status = "Documentation rendering failed".to_string();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn schedule_documentation_render(&mut self, ctx: &egui::Context) {
+        self.documentation_requested_generation =
+            self.documentation_requested_generation.wrapping_add(1);
+        self.documentation_render_due = Some(Instant::now() + Duration::from_millis(140));
+        self.documentation.render_error = None;
+        self.status = "Documentation render queued…".to_string();
+        ctx.request_repaint_after(Duration::from_millis(160));
+    }
+
+    fn render_documentation(&mut self, ctx: &egui::Context) {
+        if self.documentation_render.is_some() {
+            return;
+        }
+        self.documentation_requested_generation =
+            self.documentation_requested_generation.wrapping_add(1);
+        self.start_documentation_render(ctx);
+    }
+
+    fn start_documentation_render(&mut self, ctx: &egui::Context) {
+        if self.documentation_render.is_some() {
+            return;
+        }
+        self.documentation_render_due = None;
+        let generation = self.documentation_requested_generation;
+        let source = self.documentation.source_for_render(&self.session_history);
+        let files = self.documentation.renderer_files();
+        let repaint_context = ctx.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                documentation::render_typst_outputs(&source, files)
+            }))
+            .unwrap_or_else(|_| Err("Typst renderer panicked while compiling".to_string()));
+            let _ = sender.send((generation, result));
+            repaint_context.request_repaint();
+        });
+        self.documentation.render_error = None;
+        self.documentation_render = Some(receiver);
+        self.status = "Rendering documentation with Typst…".to_string();
+    }
+
+    fn export_documentation_pdf(&mut self) {
+        let Some(pdf) = self.documentation.rendered_pdf.as_ref() else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PDF document", &["pdf"])
+            .set_file_name("coeus-documentation.pdf")
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&path, pdf) {
+            Ok(()) => self.status = format!("Exported documentation to {}", path.display()),
+            Err(error) => self.last_error = Some(format!("could not write PDF: {error}")),
+        }
+    }
+
     fn finish(&mut self, request_id: u64, operation: String, result: Response) {
         // Graphs and disassemblies intentionally run concurrently. Ignore a
         // response for an older view request so a slow disassembly cannot
@@ -1174,8 +1343,15 @@ impl CoeusApp {
                         .map(str::to_string)
                         .collect();
                 }
+                if let Some(events) = data.get("events").and_then(Value::as_array) {
+                    self.session_events = events.clone();
+                }
                 match operation.as_str() {
                     "load" | "load_split" | "load_split_from_adb" | "load_project" => {
+                        let loaded_path = value_string(&data, "path");
+                        if !loaded_path.trim().is_empty() {
+                            self.path = loaded_path;
+                        }
                         let package = value_string(&data, "package");
                         let manifest_xml = value_string(&data, "manifest");
                         let saved_graph = data.get("graph").cloned();
@@ -1202,6 +1378,15 @@ impl CoeusApp {
                         }
                         self.notes = notes_map(&data);
                         self.aliases = aliases_map(&data);
+                        self.documentation =
+                            DocumentationState::from_value(data.get("documentation"));
+                        self.documentation_render = None;
+                        self.documentation_render_due = None;
+                        self.documentation_requested_generation =
+                            self.documentation_requested_generation.wrapping_add(1);
+                        self.documentation_preview_generation = 0;
+                        self.documentation_preview_textures.clear();
+                        self.documentation_completions.clear();
                         self.info = Some(data);
                         self.results.clear();
                         self.result_count = 0;
@@ -1344,6 +1529,14 @@ impl CoeusApp {
                         } else {
                             "Method emulation failed".to_string()
                         };
+                    }
+                    "emulation_view" => {
+                        self.apply_emulation_description(&data);
+                        self.status = "Loaded emulation-only method copy".to_string();
+                    }
+                    "emulation_reset" => {
+                        self.apply_emulation_description(&data);
+                        self.status = "Reset emulation-only method copy".to_string();
                     }
                     "emulation_options" => {
                         let analysis_limited = data
@@ -1551,62 +1744,57 @@ impl CoeusApp {
                         self.status = format!("Found {} cross-reference(s)", self.xrefs.len());
                     }
                     "edit_options" => {
-                        self.code.edit_form = None;
-                        self.code.edit_dex_name = value_string(&data, "dex");
-                        self.code.edit_available = data
-                            .get("available")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        self.code.edit_reason = value_string(&data, "reason");
-                        self.code.edit_options = data
-                            .get("options")
-                            .and_then(Value::as_array)
-                            .map(|items| {
-                                items
-                                    .iter()
-                                    .map(|item| EditOption {
-                                        id: value_string(item, "id"),
-                                        group: value_string(item, "group"),
-                                        label: value_string(item, "label"),
-                                        action: value_string(item, "action"),
-                                        width: item
-                                            .get("width")
-                                            .and_then(Value::as_u64)
-                                            .unwrap_or(0),
-                                        arguments: item
-                                            .get("arguments")
-                                            .and_then(Value::as_array)
-                                            .map(|arguments| {
-                                                arguments
-                                                    .iter()
-                                                    .map(|argument| EditArgument {
-                                                        name: value_string(argument, "name"),
-                                                        label: value_string(argument, "label"),
-                                                        kind: value_string(argument, "kind"),
-                                                        value: value_string(argument, "value"),
-                                                        picker: edit_picker_kind(argument),
-                                                    })
-                                                    .collect()
-                                            })
-                                            .unwrap_or_default(),
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        self.status = if self.code.edit_available {
-                            "Instruction nodes are ready".to_string()
+                        if data.get("emulation").and_then(Value::as_bool) == Some(true) {
+                            if let Some(editor) = self.emulation_editor.as_mut() {
+                                editor.edit_form = None;
+                                editor.edit_dex_name = value_string(&data, "dex");
+                                editor.edit_available = data
+                                    .get("available")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                editor.edit_reason = value_string(&data, "reason");
+                                editor.edit_options = edit_options_from_json(&data);
+                                editor.selected_offset = data
+                                    .get("selected_offset")
+                                    .and_then(Value::as_u64)
+                                    .or(editor.selected_offset);
+                                self.status = if editor.edit_available {
+                                    "Emulation instruction nodes are ready".to_string()
+                                } else {
+                                    editor.edit_reason.clone()
+                                };
+                            }
                         } else {
-                            self.code.edit_reason.clone()
-                        };
+                            self.code.edit_form = None;
+                            self.code.edit_dex_name = value_string(&data, "dex");
+                            self.code.edit_available = data
+                                .get("available")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            self.code.edit_reason = value_string(&data, "reason");
+                            self.code.edit_options = edit_options_from_json(&data);
+                            self.status = if self.code.edit_available {
+                                "Instruction nodes are ready".to_string()
+                            } else {
+                                self.code.edit_reason.clone()
+                            };
+                        }
                     }
                     "apply_edit" => {
-                        self.apply_description(&data);
-                        self.code.edit_options.clear();
-                        self.code.edit_form = None;
-                        self.description_cache.clear();
-                        self.status =
-                            "Applied structured instruction edit and reparsed the DEX".to_string();
-                        self.session_dirty = true;
+                        if data.get("emulation").and_then(Value::as_bool) == Some(true) {
+                            self.apply_emulation_description(&data);
+                            self.status =
+                                "Applied edit to the emulation-only method copy".to_string();
+                        } else {
+                            self.apply_description(&data);
+                            self.code.edit_options.clear();
+                            self.code.edit_form = None;
+                            self.description_cache.clear();
+                            self.status =
+                                "Applied structured instruction edit and reparsed the DEX"
+                                    .to_string();
+                            self.session_dirty = true;
+                        }
                     }
                     "graph" => {
                         self.graph.kind = value_string(&data, "kind");
@@ -1735,19 +1923,46 @@ impl CoeusApp {
                         );
                     }
                     "pull_apks" => {
-                        if let Some(loaded) = data.get("loaded").cloned() {
+                        let pulled_serial = self.adb.serial.clone();
+                        let pulled_adb_path = self.adb.adb_path.clone();
+                        let pulled_paths = data
+                            .get("paths")
+                            .and_then(Value::as_array)
+                            .map(|paths| {
+                                paths
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_string)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        if let Some(mut loaded) = data.get("loaded").cloned() {
+                            // The backend analyzes the pulled split set immediately,
+                            // but reports its origin as ADB. Use the materialized
+                            // local paths for the GUI workspace so signing helpers
+                            // can resolve a local directory and the loaded session
+                            // is visibly tied to the files the user just pulled.
+                            if !pulled_paths.is_empty() {
+                                if let Some(object) = loaded.as_object_mut() {
+                                    object.insert(
+                                        "path".to_string(),
+                                        Value::String(pulled_paths.join(", ")),
+                                    );
+                                }
+                            }
                             self.finish(
-                                self.next_request_id,
+                                request_id,
                                 "load_split_from_adb".to_string(),
                                 Ok(loaded),
                             );
+                            // Carry the selected device settings into the
+                            // split deploy tab for the next sign/install.
+                            self.deploy.serial = pulled_serial;
+                            self.deploy.adb_path = pulled_adb_path;
                         }
                         self.status = format!(
-                            "Pulled {} APK member(s) into {}",
-                            data.get("paths")
-                                .and_then(Value::as_array)
-                                .map(|paths| paths.len())
-                                .unwrap_or(0),
+                            "Pulled {} APK member(s) into {} and loaded the split set",
+                            pulled_paths.len(),
                             value_string(&data, "output_dir")
                         );
                     }
@@ -2046,6 +2261,31 @@ impl CoeusApp {
                 self.status = error;
             }
         }
+    }
+
+    fn apply_emulation_description(&mut self, data: &Value) {
+        let Some(editor) = self.emulation_editor.as_mut() else {
+            return;
+        };
+        let id = value_string(data, "id");
+        if id != editor.method_id {
+            return;
+        }
+        editor.method_label = value_string(data, "label");
+        editor.code = value_string(data, "code");
+        editor.instructions = instruction_rows_from_json(data);
+        editor.edit_options = edit_options_from_json(data);
+        editor.edit_form = None;
+        editor.edit_dex_name = value_string(data, "dex");
+        editor.edit_available = data
+            .get("available")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        editor.edit_reason = value_string(data, "reason");
+        editor.selected_offset = data
+            .get("selected_offset")
+            .and_then(Value::as_u64)
+            .or_else(|| editor.instructions.first().map(|item| item.offset));
     }
 
     fn apply_description(&mut self, data: &Value) {
@@ -2783,6 +3023,7 @@ impl CoeusApp {
         method_key: String,
     ) {
         let descriptors = parse_method_descriptors(&method_key);
+        self.code_view_tab = CodeViewTab::Emulation;
         self.emulation_result = None;
         self.emulation_pending_label = Some(method_label.clone());
         self.emulation_editor = Some(EmulationEditor {
@@ -2796,7 +3037,19 @@ impl CoeusApp {
                 })
                 .collect(),
             guesses: Vec::new(),
+            code: String::new(),
+            instructions: Vec::new(),
+            selected_offset: None,
+            edit_options: Vec::new(),
+            edit_form: None,
+            edit_dex_name: String::new(),
+            edit_available: false,
+            edit_reason: "Loading emulation-only method copy…".to_string(),
         });
+        self.request(
+            "emulation_view",
+            json!({"op": "emulation_view", "id": self.emulation_editor.as_ref().map(|editor| editor.method_id.clone()).unwrap_or_default()}),
+        );
     }
 
     fn open_static_emulation_target(
@@ -2843,6 +3096,10 @@ impl CoeusApp {
         let mut run_arguments = None;
         let mut run_all = false;
         let mut use_guess = None;
+        let mut request_edit_options = None;
+        let mut chosen_edit = None;
+        let mut open_picker: Option<(String, String, SearchKind, String)> = None;
+        let mut reset_emulation = false;
         egui::Window::new("Emulate method")
             .id(egui::Id::new(("emulation-editor", editor.method_id.clone())))
             .collapsible(false)
@@ -2857,6 +3114,14 @@ impl CoeusApp {
                     .small()
                     .color(theme::MUTED),
                 );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.busy(), egui::Button::new("Reset emulation copy"))
+                        .clicked()
+                    {
+                        reset_emulation = true;
+                    }
+                });
                 ui.separator();
                 if editor.arguments.is_empty() {
                     ui.label("This method has no arguments.");
@@ -2875,6 +3140,190 @@ impl CoeusApp {
                                     .hint_text("value"),
                             );
                         });
+                    }
+                }
+                ui.separator();
+                ui.label(RichText::new("Emulation-only method copy").strong());
+                ui.label(
+                    RichText::new(
+                        "Edits here affect only this emulator session. The original DEX and the final APK are unchanged.",
+                    )
+                    .small()
+                    .color(theme::MUTED),
+                );
+                if editor.code.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading disassembly…");
+                    });
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt(("emulation-disassembly", editor.method_id.clone()))
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&editor.code).monospace().small(),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    ui.label(RichText::new("Select an instruction to edit").small().strong());
+                    egui::ScrollArea::vertical()
+                        .id_salt(("emulation-instructions", editor.method_id.clone()))
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for instruction in editor.instructions.clone() {
+                                let selected = editor.selected_offset == Some(instruction.offset);
+                                if ui
+                                    .selectable_label(
+                                        selected,
+                                        RichText::new(format!(
+                                            "@0x{:x} · {}",
+                                            instruction.offset, instruction.text
+                                        ))
+                                        .monospace()
+                                        .small(),
+                                    )
+                                    .clicked()
+                                {
+                                    editor.selected_offset = Some(instruction.offset);
+                                    request_edit_options = Some(instruction.offset);
+                                }
+                            }
+                        });
+                    if let Some(offset) = editor.selected_offset {
+                        if let Some(instruction) = editor
+                            .instructions
+                            .iter()
+                            .find(|instruction| instruction.offset == offset)
+                        {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!(
+                                        "@0x{:x} · {} · {} code units",
+                                        instruction.offset, instruction.text, instruction.size
+                                    ))
+                                    .strong()
+                                    .monospace(),
+                                )
+                                .wrap(),
+                            );
+                        }
+                        if !editor.edit_available {
+                            ui.label(
+                                RichText::new(if editor.edit_reason.is_empty() {
+                                    "Choose an instruction to load typed edits."
+                                } else {
+                                    &editor.edit_reason
+                                })
+                                .small()
+                                .color(theme::WARNING),
+                            );
+                        } else {
+                            let mut groups: Vec<(String, Vec<EditOption>)> = Vec::new();
+                            for option in editor.edit_options.clone() {
+                                let group = if option.group.is_empty() {
+                                    "Other".to_string()
+                                } else {
+                                    option.group.clone()
+                                };
+                                if let Some((_, options)) =
+                                    groups.iter_mut().find(|(name, _)| *name == group)
+                                {
+                                    options.push(option);
+                                } else {
+                                    groups.push((group, vec![option]));
+                                }
+                            }
+                            for (group, options) in groups {
+                                ui.collapsing(
+                                    RichText::new(format!("{} ({})", group, options.len()))
+                                        .strong(),
+                                    |ui| {
+                                        for option in options {
+                                            ui.push_id(option.id.clone(), |ui| {
+                                                let label = format!(
+                                                    "{} · {} · {}w",
+                                                    option.label, option.action, option.width
+                                                );
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(label)
+                                                            .wrap()
+                                                            .min_size(Vec2::new(230.0, 28.0)),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    if option.arguments.is_empty() {
+                                                        chosen_edit = Some(EditRequest {
+                                                            id: option.id.clone(),
+                                                            arguments: Vec::new(),
+                                                        });
+                                                    } else {
+                                                        editor.edit_form = Some(option);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    },
+                                );
+                            }
+                            if let Some(mut form) = editor.edit_form.clone() {
+                                ui.separator();
+                                ui.label(
+                                    RichText::new(format!("Configure {}", form.label)).strong(),
+                                );
+                                ui.label(
+                                    RichText::new(
+                                        "Arguments use the same typed instruction editor as normal DEX edits.",
+                                    )
+                                    .small()
+                                    .color(theme::MUTED),
+                                );
+                                for argument in &mut form.arguments {
+                                    ui.horizontal(|ui| {
+                                        ui.label(&argument.label);
+                                        let desired_width = if argument.kind == "text" {
+                                            260.0
+                                        } else {
+                                            150.0
+                                        };
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut argument.value)
+                                                .min_size(Vec2::new(0.0, 30.0))
+                                                .margin(Vec2::new(8.0, 6.0))
+                                                .desired_width(desired_width),
+                                        );
+                                        if let Some(kind) = argument.picker {
+                                            if ui.button("Choose…").clicked() {
+                                                open_picker = Some((
+                                                    argument.name.clone(),
+                                                    argument.label.clone(),
+                                                    kind,
+                                                    editor.edit_dex_name.clone(),
+                                                ));
+                                            }
+                                        }
+                                    });
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui.button("Apply edit to emulation copy").clicked() {
+                                        chosen_edit = Some(EditRequest {
+                                            id: form.id.clone(),
+                                            arguments: form.arguments.clone(),
+                                        });
+                                        editor.edit_form = None;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        editor.edit_form = None;
+                                    }
+                                });
+                                if chosen_edit.is_none() && editor.edit_form.is_some() {
+                                    editor.edit_form = Some(form);
+                                }
+                            }
+                        }
                     }
                 }
                 if !editor.guesses.is_empty()
@@ -2962,7 +3411,50 @@ impl CoeusApp {
                 }
             }
         }
-        if run_all {
+        if let Some((argument_name, argument_label, kind, dex_name)) = open_picker {
+            self.edit_picker = Some(EditPicker::new(
+                argument_name,
+                argument_label,
+                kind,
+                dex_name,
+                true,
+            ));
+        }
+        if reset_emulation {
+            let method_id = editor.method_id.clone();
+            self.emulation_editor = Some(editor);
+            self.request(
+                "emulation_reset",
+                json!({"op": "emulation_reset", "id": method_id}),
+            );
+        } else if let Some(offset) = request_edit_options {
+            editor.edit_options.clear();
+            editor.edit_form = None;
+            editor.edit_available = false;
+            editor.edit_reason = "Loading instruction edits…".to_string();
+            let method_id = editor.method_id.clone();
+            self.emulation_editor = Some(editor);
+            self.request(
+                "edit_options",
+                json!({
+                    "op": "edit_options",
+                    "id": method_id,
+                    "offset": offset,
+                    "emulation": true,
+                }),
+            );
+        } else if let Some(edit) = chosen_edit {
+            self.emulation_editor = Some(editor);
+            let arguments = edit
+                .arguments
+                .into_iter()
+                .map(|argument| (argument.name, Value::String(argument.value)))
+                .collect::<serde_json::Map<_, _>>();
+            self.request(
+                "apply_edit",
+                json!({"op": "apply_edit", "id": edit.id, "arguments": arguments}),
+            );
+        } else if run_all {
             let method_id = editor.method_id.clone();
             let argument_sets = editor
                 .guesses
@@ -3249,6 +3741,7 @@ impl CoeusApp {
             "op": "save_project",
             "path": path,
             "graph": self.graph_session_data(),
+            "documentation": self.documentation.to_value(),
         })
     }
 
@@ -3903,6 +4396,7 @@ impl CoeusApp {
                     for (tab, label) in [
                         (Tab::Search, "Search"),
                         (Tab::Notes, "Notes"),
+                        (Tab::Documentation, "Documentation"),
                         (Tab::Code, "Code / Edit"),
                         (Tab::Graph, "Graphs"),
                         (Tab::Debugger, "Debugger"),
@@ -4173,15 +4667,553 @@ impl CoeusApp {
         }
     }
 
+    fn show_documentation(&mut self, ui: &mut egui::Ui) {
+        theme::eyebrow(ui, "DOCUMENT / TYPST");
+        ui.heading("Documentation workspace");
+        ui.label(
+            RichText::new(
+                "Compose a portable Typst document from your notes, code samples, custom Typst, and a virtual workspace.",
+            )
+            .color(theme::MUTED),
+        );
+        ui.add_space(10.0);
+
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Document title");
+            changed |= ui
+                .add(egui::TextEdit::singleline(&mut self.documentation.title).desired_width(280.0))
+                .changed();
+            changed |= ui
+                .checkbox(
+                    &mut self.documentation.include_history,
+                    "Include change history",
+                )
+                .changed();
+            if !self.session_history.is_empty() {
+                ui.label(
+                    RichText::new(format!("{} revision(s)", self.session_history.len()))
+                        .small()
+                        .color(theme::MUTED),
+                );
+            }
+        });
+        if changed {
+            self.session_dirty = true;
+            self.schedule_documentation_render(ui.ctx());
+        }
+
+        ui.separator();
+        ui.heading("Typst source");
+        ui.label(
+            RichText::new("This is the main Typst source. Inserted notes and samples are ordinary Typst text and remain fully editable.")
+                .small()
+                .color(theme::MUTED),
+        );
+        let mut typst_layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+            let mut layout = highlight_typst(text);
+            layout.wrap.max_width = wrap_width;
+            ui.fonts(|fonts| fonts.layout_job(layout))
+        };
+        let source_response = ui.add(
+            egui::TextEdit::multiline(&mut self.documentation.source)
+                .desired_width(f32::INFINITY)
+                .desired_rows(15)
+                .font(egui::TextStyle::Monospace)
+                .code_editor()
+                .layouter(&mut typst_layouter),
+        );
+        let documentation_cursor = egui::text_edit::TextEditState::load(
+            ui.ctx(),
+            source_response.id,
+        )
+        .and_then(|state| state.cursor.char_range())
+        .map(|range| range.primary.index)
+        .map(|index| char_index_to_byte_offset(&self.documentation.source, index))
+        .unwrap_or(self.documentation.source.len());
+        if source_response.changed() {
+            self.session_dirty = true;
+            self.schedule_documentation_render(ui.ctx());
+            self.documentation_completion_cursor = documentation_cursor;
+            self.documentation_completions = documentation::typst_completions(
+                &self.documentation.source,
+                self.documentation.additional_files(),
+                documentation_cursor,
+                false,
+            );
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Typst IDE").strong());
+            if ui.button("Complete at cursor").clicked() {
+                self.documentation_completion_cursor = documentation_cursor;
+                self.documentation_completions = documentation::typst_completions(
+                    &self.documentation.source,
+                    self.documentation.additional_files(),
+                    documentation_cursor,
+                    true,
+                );
+            }
+            if self.documentation_completions.is_empty() {
+                ui.label(
+                    RichText::new("Syntax highlighting is active. Completions appear while typing or via the explicit request.")
+                        .small()
+                        .color(theme::MUTED),
+                );
+            } else {
+                ui.label(
+                    RichText::new(format!(
+                        "{} completion(s)",
+                        self.documentation_completions.len()
+                    ))
+                    .small()
+                    .color(theme::MUTED),
+                );
+            }
+        });
+        if !self.documentation_completions.is_empty() {
+            let mut chosen_completion = None;
+            egui::ScrollArea::horizontal()
+                .id_salt("documentation-completions")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for completion in self.documentation_completions.iter().take(32) {
+                            let response = ui
+                                .small_button(&completion.label)
+                                .on_hover_text(
+                                    completion
+                                        .detail
+                                        .as_deref()
+                                        .unwrap_or(&completion.kind),
+                                );
+                            if response.clicked() {
+                                chosen_completion = Some(completion.clone());
+                            }
+                        }
+                    });
+                });
+            if let Some(completion) = chosen_completion {
+                let cursor = self
+                    .documentation_completion_cursor
+                    .min(self.documentation.source.len());
+                let from = completion.from.min(cursor);
+                let replacement = expand_typst_snippet(&completion.apply);
+                self.documentation.source.replace_range(from..cursor, &replacement);
+                self.documentation_completions.clear();
+                self.schedule_documentation_render(ui.ctx());
+                self.session_dirty = true;
+            }
+        }
+
+        ui.separator();
+        ui.heading("Add material");
+        ui.horizontal_wrapped(|ui| {
+            let can_add_code = !self.code.code.trim().is_empty();
+            if ui
+                .add_enabled(can_add_code, egui::Button::new("Add current code sample"))
+                .on_hover_text(
+                    "Insert the currently open class or method as a fenced Typst code block",
+                )
+                .clicked()
+            {
+                let sample = DocumentationCodeSample {
+                    title: if self.code.title.trim().is_empty() {
+                        "Code sample".to_string()
+                    } else {
+                        self.code.title.clone()
+                    },
+                    language: "smali".to_string(),
+                    code: self.code.code.clone(),
+                };
+                self.documentation.code_samples.push(sample.clone());
+                self.documentation.insert_code_sample(&sample);
+                self.schedule_documentation_render(ui.ctx());
+                self.session_dirty = true;
+            }
+            if !can_add_code {
+                ui.label(
+                    RichText::new("Open a method or class in Code / Edit first")
+                        .small()
+                        .color(theme::MUTED),
+                );
+            }
+        });
+
+        let mut note_to_insert = None;
+        let mut notes = self
+            .notes
+            .iter()
+            .map(|(key, note)| (key.clone(), note.clone()))
+            .collect::<Vec<_>>();
+        notes.sort_by(|left, right| left.0.cmp(&right.0));
+        if notes.is_empty() {
+            ui.label(
+                RichText::new("No analysis notes are available yet.")
+                    .small()
+                    .color(theme::MUTED),
+            );
+        } else {
+            ui.label(RichText::new("Analysis notes").strong());
+            for (key, note) in notes {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(RichText::new(&key).monospace().small()).truncate());
+                    ui.label(RichText::new(&note).small().color(theme::MUTED));
+                    if ui.small_button("Insert").clicked() {
+                        note_to_insert = Some((key.clone(), note.clone()));
+                    }
+                });
+            }
+        }
+        if let Some((key, note)) = note_to_insert {
+            self.documentation.insert_note(&key, &note);
+            self.schedule_documentation_render(ui.ctx());
+            self.session_dirty = true;
+        }
+
+        ui.separator();
+        ui.heading("Code samples");
+        if self.documentation.code_samples.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No code samples yet. Open code and use ‘Add current code sample’ above.",
+                )
+                .small()
+                .color(theme::MUTED),
+            );
+        }
+        let mut remove_sample = None;
+        for (index, sample) in self.documentation.code_samples.iter_mut().enumerate() {
+            egui::Frame::group(ui.style())
+                .fill(theme::SURFACE)
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .corner_radius(8)
+                .inner_margin(8)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Title");
+                        changed |= ui
+                            .add(egui::TextEdit::singleline(&mut sample.title).desired_width(240.0))
+                            .changed();
+                        ui.label("Language");
+                        changed |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut sample.language)
+                                    .desired_width(100.0),
+                            )
+                            .changed();
+                        if ui.small_button("Remove").clicked() {
+                            remove_sample = Some(index);
+                        }
+                    });
+                    changed |= ui
+                        .add(
+                            egui::TextEdit::multiline(&mut sample.code)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(6)
+                                .font(egui::TextStyle::Monospace),
+                        )
+                        .changed();
+                });
+            ui.add_space(6.0);
+        }
+        if let Some(index) = remove_sample {
+            self.documentation.code_samples.remove(index);
+            self.session_dirty = true;
+        }
+        if changed {
+            self.session_dirty = true;
+            self.schedule_documentation_render(ui.ctx());
+        }
+
+    }
+
+    fn show_documentation_workspace(&mut self, ctx: &egui::Context) {
+        if self.documentation_workspace_collapsed {
+            egui::SidePanel::left("documentation-workspace-collapsed")
+                .resizable(false)
+                .exact_width(38.0)
+                .show(ctx, |ui| {
+                    if ui
+                        .add(egui::Button::new("»").min_size(Vec2::new(28.0, 28.0)))
+                        .on_hover_text("Show Typst workspace")
+                        .clicked()
+                    {
+                        self.documentation_workspace_collapsed = false;
+                    }
+                });
+            return;
+        }
+
+        let max_width = (ctx.screen_rect().width() * 0.28).max(260.0);
+        let mut render_needed = false;
+        egui::SidePanel::left("documentation-workspace")
+            .resizable(true)
+            .default_width(290.0)
+            .min_width(230.0)
+            .max_width(max_width)
+            .frame(theme::panel())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Typst workspace");
+                    if ui
+                        .small_button("«")
+                        .on_hover_text("Collapse Typst workspace")
+                        .clicked()
+                    {
+                        self.documentation_workspace_collapsed = true;
+                    }
+                });
+                ui.label(
+                    RichText::new("Virtual files are saved with the session.")
+                        .small()
+                        .color(theme::MUTED),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("documentation-workspace-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Import file…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                    match self.documentation.import_file(&path) {
+                                        Ok(()) => {
+                                            render_needed = true;
+                                            self.session_dirty = true;
+                                        }
+                                        Err(error) => self.last_error = Some(error),
+                                    }
+                                }
+                            }
+                            if ui.button("Import folder…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                    match self.documentation.import_folder(&path) {
+                                        Ok(()) => {
+                                            render_needed = true;
+                                            self.session_dirty = true;
+                                        }
+                                        Err(error) => self.last_error = Some(error),
+                                    }
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.documentation.new_file_path)
+                                    .desired_width(160.0)
+                                    .hint_text("assets/example.typ"),
+                            );
+                            if ui.button("Add").clicked() {
+                                match self.documentation.add_empty_file() {
+                                    Ok(()) => {
+                                        render_needed = true;
+                                        self.session_dirty = true;
+                                    }
+                                    Err(error) => self.last_error = Some(error),
+                                }
+                            }
+                        });
+                        if !self.documentation.folders.is_empty() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Folders: {}",
+                                    self.documentation.folders.join(", ")
+                                ))
+                                .small()
+                                .color(theme::MUTED),
+                            );
+                        }
+
+                        ui.add_space(6.0);
+                        if self.documentation.files.is_empty() {
+                            ui.label(
+                                RichText::new("No virtual files yet.")
+                                    .small()
+                                    .color(theme::MUTED),
+                            );
+                        }
+                        let file_listing = self
+                            .documentation
+                            .files
+                            .iter()
+                            .enumerate()
+                            .map(|(index, file)| (index, file.path.clone(), file.bytes.len()))
+                            .collect::<Vec<_>>();
+                        for (index, path, size) in file_listing {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.documentation.selected_file == Some(index),
+                                        RichText::new(path).monospace(),
+                                    )
+                                    .clicked()
+                                {
+                                    self.documentation.selected_file = Some(index);
+                                }
+                                ui.label(
+                                    RichText::new(format!("{size} B"))
+                                        .small()
+                                        .color(theme::MUTED),
+                                );
+                            });
+                        }
+
+                        if let Some(index) = self.documentation.selected_file {
+                            let mut remove_file = false;
+                            if let Some(file) = self.documentation.files.get_mut(index) {
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&file.path).strong().monospace());
+                                    if ui.small_button("Remove").clicked() {
+                                        remove_file = true;
+                                    }
+                                });
+                                if let Ok(mut text) = String::from_utf8(file.bytes.clone()) {
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::multiline(&mut text)
+                                                .desired_width(f32::INFINITY)
+                                                .desired_rows(10)
+                                                .font(egui::TextStyle::Monospace),
+                                        )
+                                        .changed()
+                                    {
+                                        file.bytes = text.into_bytes();
+                                        render_needed = true;
+                                        self.session_dirty = true;
+                                    }
+                                } else {
+                                    ui.label(
+                                        RichText::new(
+                                            "Binary file — available to Typst, not editable here.",
+                                        )
+                                        .small()
+                                        .color(theme::MUTED),
+                                    );
+                                }
+                            }
+                            if remove_file {
+                                self.documentation.remove_selected_file();
+                                render_needed = true;
+                                self.session_dirty = true;
+                            }
+                        }
+                    });
+            });
+        if render_needed {
+            self.schedule_documentation_render(ctx);
+        }
+    }
+
+    fn show_documentation_preview(&mut self, ctx: &egui::Context) {
+        if self.documentation_preview_collapsed {
+            egui::SidePanel::right("documentation-preview-collapsed")
+                .resizable(false)
+                .exact_width(38.0)
+                .show(ctx, |ui| {
+                    if ui
+                        .add(egui::Button::new("«").min_size(Vec2::new(28.0, 28.0)))
+                        .on_hover_text("Show Typst preview")
+                        .clicked()
+                    {
+                        self.documentation_preview_collapsed = false;
+                    }
+                });
+            return;
+        }
+
+        egui::SidePanel::right("documentation-preview")
+            .resizable(true)
+            .default_width(440.0)
+            .min_width(280.0)
+            .max_width((ctx.screen_rect().width() * 0.48).max(320.0))
+            .frame(theme::panel())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Preview");
+                    if ui
+                        .small_button("»")
+                        .on_hover_text("Collapse Typst preview")
+                        .clicked()
+                    {
+                        self.documentation_preview_collapsed = true;
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Render now").clicked() {
+                        self.render_documentation(ui.ctx());
+                    }
+                    if self.documentation_render.is_some() || self.documentation_render_due.is_some()
+                    {
+                        ui.spinner();
+                        ui.label(if self.documentation_render.is_some() {
+                            "Rendering…"
+                        } else {
+                            "Queued…"
+                        });
+                    }
+                    if self.documentation.rendered_pdf.is_some()
+                        && ui.button("Export PDF…").clicked()
+                    {
+                        self.export_documentation_pdf();
+                    }
+                });
+                if let Some(error) = self.documentation.render_error.as_ref() {
+                    ui.colored_label(theme::ERROR, error);
+                }
+                ui.separator();
+                if let Some(previews) = self.documentation.rendered_preview.as_ref() {
+                    ui.label(
+                        RichText::new(format!("{} page(s)", previews.len()))
+                            .small()
+                            .color(theme::MUTED),
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("documentation-preview-scroll")
+                        .auto_shrink([false, false])
+                        .max_height(ui.available_height().max(1.0))
+                        .show(ui, |ui| {
+                            for (index, texture) in
+                                self.documentation_preview_textures.iter().enumerate()
+                            {
+                                ui.label(
+                                    RichText::new(format!("Page {}", index + 1))
+                                        .small()
+                                        .color(theme::MUTED),
+                                );
+                                ui.add(
+                                    egui::Image::from_texture(&texture.clone())
+                                        .fit_to_original_size(1.0)
+                                        .max_width(ui.available_width())
+                                        .alt_text(format!("Documentation page {}", index + 1)),
+                                );
+                                ui.add_space(12.0);
+                            }
+                        });
+                } else if self.documentation_render.is_none()
+                    && self.documentation_render_due.is_none()
+                {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new("Edit the Typst source to render a live preview.")
+                                .color(theme::MUTED),
+                        )
+                    });
+                }
+            });
+    }
+
     fn show_code(&mut self, ctx: &egui::Context) {
         let has_method = self.code.method_id.is_some();
+        let emulation_active =
+            self.code_view_tab == CodeViewTab::Emulation && self.emulation_editor.is_some();
         let mut code_interaction = None;
         let mut chosen_edit: Option<EditRequest> = None;
 
         // Keep the edit nodes in a real side panel so they remain attached to
         // the code view while the source itself scrolls. This also lets the
         // panel use the complete height of the central work area.
-        if has_method && self.instruction_pane_collapsed {
+        if (has_method || emulation_active) && self.instruction_pane_collapsed {
             egui::SidePanel::left("instruction-node-pane-collapsed")
                 .resizable(false)
                 .exact_width(36.0)
@@ -4194,7 +5226,7 @@ impl CoeusApp {
                         self.instruction_pane_collapsed = false;
                     }
                 });
-        } else if has_method {
+        } else if has_method || emulation_active {
             egui::SidePanel::left("instruction-node-pane")
                 .resizable(true)
                 .default_width(340.0)
@@ -4217,7 +5249,11 @@ impl CoeusApp {
                         .id_salt("instruction-controls")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            self.show_instruction_nodes(ui, &mut chosen_edit);
+                            if emulation_active {
+                                self.show_emulation_instruction_nodes_shared(ui, &mut chosen_edit);
+                            } else {
+                                self.show_instruction_nodes(ui, &mut chosen_edit);
+                            }
                         });
                 });
         }
@@ -4234,6 +5270,11 @@ impl CoeusApp {
                     )
                     .wrap(),
                 );
+            }
+            self.show_code_view_tabs(ui);
+            if emulation_active {
+                self.show_emulation_code_panel(ui);
+                return;
             }
             ui.horizontal_wrapped(|ui| {
                 if let Some(target) = self.current_annotation_target() {
@@ -4490,7 +5531,507 @@ impl CoeusApp {
         }
     }
 
+    fn show_code_view_tabs(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("CODE VIEW").small().strong().color(theme::MUTED));
+            ui.selectable_value(&mut self.code_view_tab, CodeViewTab::Source, "Source");
+            if self.emulation_editor.is_some() {
+                ui.selectable_value(
+                    &mut self.code_view_tab,
+                    CodeViewTab::Emulation,
+                    RichText::new("Emulation copy")
+                        .strong()
+                        .color(theme::WARNING),
+                )
+                .on_hover_text(
+                    "Temporary method copy used only by the emulator; changes are never written to the APK",
+                );
+                if ui.small_button("×").on_hover_text("Close emulation tab").clicked() {
+                    self.emulation_editor = None;
+                    self.code_view_tab = CodeViewTab::Source;
+                }
+            }
+        });
+        ui.separator();
+    }
+
+    fn show_emulation_code_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(mut editor) = self.emulation_editor.clone() else {
+            return;
+        };
+        let method_id = editor.method_id.clone();
+        let mut run_arguments = None;
+        let mut run_all = false;
+        let mut use_guess = None;
+        let mut reset_emulation = false;
+        let mut request_edit_options = None;
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("EMULATION COPY")
+                    .strong()
+                    .color(theme::WARNING),
+            );
+            ui.label(RichText::new(&editor.method_label).strong().monospace());
+        });
+        ui.label(
+            RichText::new(
+                "This tab is a ghost copy of the method. It is used for emulation only and is never written to the final APK.",
+            )
+            .small()
+            .color(theme::MUTED),
+        );
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.busy(), egui::Button::new("Reset copy"))
+                .clicked()
+            {
+                reset_emulation = true;
+            }
+            if !editor.instructions.is_empty() {
+                ui.label(
+                    RichText::new(format!(
+                        "{} instruction(s) · select one in the left panel to edit",
+                        editor.instructions.len()
+                    ))
+                    .small()
+                    .color(theme::MUTED),
+                );
+            }
+        });
+
+        ui.separator();
+        ui.label(RichText::new("Arguments").strong());
+        if editor.arguments.is_empty() {
+            ui.label(
+                RichText::new("This method has no arguments.")
+                    .small()
+                    .color(theme::MUTED),
+            );
+        } else {
+            for (index, argument) in editor.arguments.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("arg{index}"));
+                    ui.label(
+                        RichText::new(&argument.descriptor)
+                            .monospace()
+                            .color(theme::MUTED),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut argument.value)
+                            .desired_width(360.0)
+                            .hint_text("value"),
+                    );
+                });
+            }
+        }
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.busy(), egui::Button::new("Run emulation"))
+                .clicked()
+            {
+                run_arguments = Some(
+                    editor
+                        .arguments
+                        .iter()
+                        .map(|argument| argument.value.clone())
+                        .collect(),
+                );
+            }
+            if !editor.guesses.is_empty()
+                && ui
+                    .add_enabled(!self.busy(), egui::Button::new("Run all guesses"))
+                    .clicked()
+            {
+                run_all = true;
+            }
+        });
+
+        if !editor.guesses.is_empty()
+            || self
+                .pending
+                .iter()
+                .any(|pending| pending.operation == "emulation_options")
+        {
+            ui.separator();
+            ui.label(RichText::new("Static flow argument guesses").strong());
+            ui.label(
+                RichText::new(
+                    "Possible argument sets found at statically analysed call sites. Unknown values use safe defaults.",
+                )
+                .small()
+                .color(theme::MUTED),
+            );
+            if self
+                .pending
+                .iter()
+                .any(|pending| pending.operation == "emulation_options")
+            {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Analysing possible call arguments…");
+                });
+            }
+            for (index, guess) in editor.guesses.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{}.", index + 1))
+                            .small()
+                            .color(theme::MUTED),
+                    );
+                    ui.add(
+                        egui::Label::new(RichText::new(&guess.label).monospace().small())
+                            .truncate(),
+                    );
+                    if ui.small_button("Use").clicked() {
+                        use_guess = Some(index);
+                    }
+                    if ui.small_button("Run").clicked() {
+                        run_arguments = Some(guess.arguments.clone());
+                    }
+                });
+            }
+        }
+
+        ui.separator();
+        ui.label(
+            RichText::new("smali (read-only source for this emulation copy)")
+                .small()
+                .color(theme::MUTED),
+        );
+        if editor.code.is_empty() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading disassembly…");
+            });
+        } else {
+            let normal_code = std::mem::take(&mut self.code);
+            self.code = code_state_from_emulation(&editor);
+            let interaction = self.render_code_lines(ui);
+            let mut emulation_code = std::mem::replace(&mut self.code, normal_code);
+            if let Some(interaction) = interaction {
+                emulation_code.selected_offset = Some(interaction.offset);
+                if interaction.action.is_none() {
+                    request_edit_options = Some(interaction.offset);
+                    emulation_code.edit_options.clear();
+                    emulation_code.edit_form = None;
+                    emulation_code.edit_available = false;
+                    emulation_code.edit_reason = "Loading instruction edits…".to_string();
+                }
+            }
+            apply_emulation_code_state(&mut editor, &emulation_code);
+        }
+
+        if let Some(index) = use_guess {
+            if let Some(guess) = editor.guesses.get(index) {
+                for (argument, value) in editor.arguments.iter_mut().zip(&guess.arguments) {
+                    argument.value = value.clone();
+                }
+            }
+        }
+
+        if reset_emulation {
+            self.emulation_editor = Some(editor);
+            self.request(
+                "emulation_reset",
+                json!({"op": "emulation_reset", "id": method_id}),
+            );
+        } else if let Some(offset) = request_edit_options {
+            self.emulation_editor = Some(editor);
+            self.request(
+                "edit_options",
+                json!({
+                    "op": "edit_options",
+                    "id": method_id,
+                    "offset": offset,
+                    "emulation": true,
+                }),
+            );
+        } else if run_all {
+            let argument_sets = editor
+                .guesses
+                .iter()
+                .map(|guess| guess.arguments.clone())
+                .collect::<Vec<_>>();
+            self.emulation_editor = None;
+            self.code_view_tab = CodeViewTab::Source;
+            self.request(
+                "emulate_batch",
+                json!({
+                    "op": "emulate_batch",
+                    "id": method_id,
+                    "arguments_sets": argument_sets,
+                }),
+            );
+        } else if let Some(arguments) = run_arguments {
+            self.emulation_editor = None;
+            self.code_view_tab = CodeViewTab::Source;
+            self.request(
+                "emulate",
+                json!({"op": "emulate", "id": method_id, "arguments": arguments}),
+            );
+        } else {
+            self.emulation_editor = Some(editor);
+        }
+    }
+
+    fn show_emulation_instruction_nodes_shared(
+        &mut self,
+        ui: &mut egui::Ui,
+        chosen_edit: &mut Option<EditRequest>,
+    ) {
+        let Some(editor) = self.emulation_editor.clone() else {
+            return;
+        };
+        let normal_code = std::mem::take(&mut self.code);
+        self.code = code_state_from_emulation(&editor);
+        self.show_instruction_nodes_with_mode(ui, chosen_edit, true);
+        let emulation_code = std::mem::replace(&mut self.code, normal_code);
+        if let Some(editor) = self.emulation_editor.as_mut() {
+            apply_emulation_code_state(editor, &emulation_code);
+        }
+    }
+
+    fn show_emulation_instruction_nodes(
+        &mut self,
+        ui: &mut egui::Ui,
+        chosen_edit: &mut Option<EditRequest>,
+    ) {
+        let Some(mut editor) = self.emulation_editor.clone() else {
+            return;
+        };
+        let mut request_edit_options = None;
+        let mut open_picker: Option<(String, String, SearchKind, String)> = None;
+
+        ui.vertical(|ui| {
+            theme::eyebrow(ui, "EMULATION INSTRUCTION");
+            if editor.code.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading temporary method copy…");
+                });
+                return;
+            }
+            ui.label(
+                RichText::new("Select an instruction to load its typed replacement nodes.")
+                    .small()
+                    .color(theme::MUTED),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt(("emulation-instruction-list", editor.method_id.clone()))
+                .auto_shrink([false, false])
+                .max_height(220.0)
+                .show(ui, |ui| {
+                    for instruction in editor.instructions.clone() {
+                        let selected = editor.selected_offset == Some(instruction.offset);
+                        if ui
+                            .selectable_label(
+                                selected,
+                                RichText::new(format!(
+                                    "@0x{:x} · {}",
+                                    instruction.offset, instruction.text
+                                ))
+                                .monospace()
+                                .small(),
+                            )
+                            .clicked()
+                        {
+                            editor.selected_offset = Some(instruction.offset);
+                            editor.edit_options.clear();
+                            editor.edit_form = None;
+                            editor.edit_available = false;
+                            editor.edit_reason = "Loading instruction edits…".to_string();
+                            request_edit_options = Some(instruction.offset);
+                        }
+                    }
+                });
+
+            let Some(offset) = editor.selected_offset else {
+                ui.label(
+                    RichText::new("No instruction selected")
+                        .small()
+                        .color(theme::MUTED),
+                );
+                return;
+            };
+            let Some(instruction) = editor
+                .instructions
+                .iter()
+                .find(|instruction| instruction.offset == offset)
+                .cloned()
+            else {
+                return;
+            };
+            ui.separator();
+            ui.label(
+                RichText::new(format!(
+                    "@0x{:x} · {} · {} code units",
+                    instruction.offset, instruction.text, instruction.size
+                ))
+                .strong()
+                .monospace(),
+            );
+            if !editor.edit_available {
+                ui.label(
+                    RichText::new(if editor.edit_reason.is_empty() {
+                        "Choose an instruction to load typed edits."
+                    } else {
+                        &editor.edit_reason
+                    })
+                    .small()
+                    .color(theme::WARNING),
+                );
+                return;
+            }
+
+            let mut groups: Vec<(String, Vec<EditOption>)> = Vec::new();
+            for option in editor.edit_options.clone() {
+                let group = if option.group.is_empty() {
+                    "Other".to_string()
+                } else {
+                    option.group.clone()
+                };
+                if let Some((_, options)) = groups.iter_mut().find(|(name, _)| *name == group) {
+                    options.push(option);
+                } else {
+                    groups.push((group, vec![option]));
+                }
+            }
+            for (group, options) in groups {
+                ui.collapsing(
+                    RichText::new(format!("{} ({})", group, options.len())).strong(),
+                    |ui| {
+                        for option in options {
+                            ui.push_id(option.id.clone(), |ui| {
+                                let label = format!(
+                                    "{} · {} · {}w",
+                                    option.label, option.action, option.width
+                                );
+                                if ui
+                                    .add(
+                                        egui::Button::new(label)
+                                            .wrap()
+                                            .min_size(Vec2::new(230.0, 28.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    if option.arguments.is_empty() {
+                                        *chosen_edit = Some(EditRequest {
+                                            id: option.id.clone(),
+                                            arguments: Vec::new(),
+                                        });
+                                    } else {
+                                        editor.edit_form = Some(option);
+                                    }
+                                }
+                            });
+                        }
+                    },
+                );
+            }
+            if let Some(mut form) = editor.edit_form.clone() {
+                ui.separator();
+                ui.label(RichText::new(format!("Configure {}", form.label)).strong());
+                for argument in &mut form.arguments {
+                    ui.horizontal(|ui| {
+                        ui.label(&argument.label);
+                        let desired_width = if argument.kind == "text" {
+                            220.0
+                        } else {
+                            130.0
+                        };
+                        ui.add(
+                            egui::TextEdit::singleline(&mut argument.value)
+                                .min_size(Vec2::new(0.0, 30.0))
+                                .margin(Vec2::new(8.0, 6.0))
+                                .desired_width(desired_width),
+                        );
+                        if let Some(kind) = argument.picker {
+                            if ui.button("Choose…").clicked() {
+                                open_picker = Some((
+                                    argument.name.clone(),
+                                    argument.label.clone(),
+                                    kind,
+                                    editor.edit_dex_name.clone(),
+                                ));
+                            }
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Apply edit to emulation copy").clicked() {
+                        *chosen_edit = Some(EditRequest {
+                            id: form.id.clone(),
+                            arguments: form.arguments.clone(),
+                        });
+                        editor.edit_form = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        editor.edit_form = None;
+                    }
+                });
+                if chosen_edit.is_none() && editor.edit_form.is_some() {
+                    editor.edit_form = Some(form);
+                }
+            }
+        });
+
+        self.emulation_editor = Some(editor);
+        if let Some(offset) = request_edit_options {
+            let method_id = self
+                .emulation_editor
+                .as_ref()
+                .map(|editor| editor.method_id.clone())
+                .unwrap_or_default();
+            self.request(
+                "edit_options",
+                json!({
+                    "op": "edit_options",
+                    "id": method_id,
+                    "offset": offset,
+                    "emulation": true,
+                }),
+            );
+        } else if let Some(edit) = chosen_edit.take() {
+            let method_id = self
+                .emulation_editor
+                .as_ref()
+                .map(|editor| editor.method_id.clone())
+                .unwrap_or_default();
+            let arguments = edit
+                .arguments
+                .into_iter()
+                .map(|argument| (argument.name, Value::String(argument.value)))
+                .collect::<serde_json::Map<_, _>>();
+            self.request(
+                "apply_edit",
+                json!({"op": "apply_edit", "id": edit.id, "arguments": arguments, "emulation": true, "method_id": method_id}),
+            );
+        }
+        if let Some((argument_name, argument_label, kind, dex_name)) = open_picker {
+            self.edit_picker = Some(EditPicker::new(
+                argument_name,
+                argument_label,
+                kind,
+                dex_name,
+                true,
+            ));
+        }
+    }
+
     fn show_instruction_nodes(&mut self, ui: &mut egui::Ui, chosen_edit: &mut Option<EditRequest>) {
+        self.show_instruction_nodes_with_mode(ui, chosen_edit, false);
+    }
+
+    fn show_instruction_nodes_with_mode(
+        &mut self,
+        ui: &mut egui::Ui,
+        chosen_edit: &mut Option<EditRequest>,
+        emulation: bool,
+    ) {
         ui.vertical(|ui| {
             theme::eyebrow(ui, "SELECTED INSTRUCTION");
             if let Some(offset) = self.code.selected_offset {
@@ -4638,6 +6179,7 @@ impl CoeusApp {
                                 argument_label,
                                 kind,
                                 dex_name,
+                                emulation,
                             ));
                         }
                     }
@@ -4734,7 +6276,14 @@ impl CoeusApp {
             });
 
         if let Some(result) = chosen {
-            if let Some(form) = self.code.edit_form.as_mut() {
+            let form = if picker.emulation {
+                self.emulation_editor
+                    .as_mut()
+                    .and_then(|editor| editor.edit_form.as_mut())
+            } else {
+                self.code.edit_form.as_mut()
+            };
+            if let Some(form) = form {
                 if let Some(argument) = form
                     .arguments
                     .iter_mut()
@@ -7406,7 +8955,7 @@ impl CoeusApp {
 
 impl eframe::App for CoeusApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll();
+        self.poll(ctx);
         if !self.busy() && self.debug.last_poll.elapsed() >= Duration::from_millis(250) {
             self.debug.last_poll = Instant::now();
             if self.debug.connecting {
@@ -7483,12 +9032,35 @@ impl eframe::App for CoeusApp {
         }
         self.show_tabs(ctx);
         self.show_status(ctx);
-        self.show_sidebar(ctx);
-        if self.info.is_none() && !matches!(self.tab, Tab::Adb | Tab::Debugger) {
+        if self.tab == Tab::Documentation
+            && self.documentation_render.is_none()
+            && self.documentation_render_due.is_none()
+            && self.documentation.rendered_preview.is_none()
+            && self.documentation.render_error.is_none()
+        {
+            self.schedule_documentation_render(ctx);
+        }
+        if self.tab != Tab::Documentation {
+            self.show_sidebar(ctx);
+        } else {
+            self.show_documentation_workspace(ctx);
+            self.show_documentation_preview(ctx);
+        }
+        if self.info.is_none() && !matches!(self.tab, Tab::Adb | Tab::Debugger | Tab::Documentation)
+        {
             egui::CentralPanel::default()
                 .frame(theme::workspace())
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| self.show_welcome(ui));
+                });
+        } else if self.tab == Tab::Documentation {
+            egui::CentralPanel::default()
+                .frame(theme::workspace())
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("documentation-editor")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.show_documentation(ui));
                 });
         } else if self.tab == Tab::Code {
             self.show_code(ctx);
@@ -7507,6 +9079,12 @@ impl eframe::App for CoeusApp {
                             .id_salt("notes-tab")
                             .auto_shrink([false, false])
                             .show(ui, |ui| self.show_notes(ui));
+                    }
+                    Tab::Documentation => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("documentation-tab")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.show_documentation(ui));
                     }
                     Tab::Graph => {
                         egui::ScrollArea::vertical()
@@ -7530,12 +9108,42 @@ impl eframe::App for CoeusApp {
         self.show_note_editor(ctx);
         self.show_note_popup(ctx);
         self.show_alias_editor(ctx);
-        self.show_emulation_editor(ctx);
         self.show_emulation_result(ctx);
         self.show_graph_node_details(ctx);
         self.show_floating_debugger(ctx);
         ctx.request_repaint_after(Duration::from_millis(100));
     }
+}
+
+fn code_state_from_emulation(editor: &EmulationEditor) -> CodeState {
+    let mut state = CodeState::default();
+    state.method_id = Some(editor.method_id.clone());
+    state.method_key = Some(editor.method_label.clone());
+    state.kind = "method".to_string();
+    state.title = editor.method_label.clone();
+    state.identity_title = editor.method_label.clone();
+    state.code = editor.code.clone();
+    state.lines = editor.code.lines().map(str::to_string).collect();
+    state.line_method_ids = vec![Some(editor.method_id.clone()); state.lines.len()];
+    state.line_method_keys = vec![Some(editor.method_label.clone()); state.lines.len()];
+    state.instructions = editor.instructions.clone();
+    state.selected_offset = editor.selected_offset;
+    state.selected_method_id = Some(editor.method_id.clone());
+    state.edit_options = editor.edit_options.clone();
+    state.edit_form = editor.edit_form.clone();
+    state.edit_dex_name = editor.edit_dex_name.clone();
+    state.edit_available = editor.edit_available;
+    state.edit_reason = editor.edit_reason.clone();
+    state
+}
+
+fn apply_emulation_code_state(editor: &mut EmulationEditor, state: &CodeState) {
+    editor.selected_offset = state.selected_offset;
+    editor.edit_options = state.edit_options.clone();
+    editor.edit_form = state.edit_form.clone();
+    editor.edit_dex_name = state.edit_dex_name.clone();
+    editor.edit_available = state.edit_available;
+    editor.edit_reason = state.edit_reason.clone();
 }
 
 fn parse_method_descriptors(signature: &str) -> Vec<String> {
@@ -7680,6 +9288,81 @@ fn search_validation(query: &str) -> Result<(), String> {
                 .unwrap_or("check the syntax")
         )
     })
+}
+
+fn instruction_rows_from_json(data: &Value) -> Vec<InstructionRow> {
+    data.get("instructions")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| InstructionRow {
+                    offset: value_u64(item, "offset"),
+                    size: value_u64(item, "size"),
+                    mnemonic: value_string(item, "mnemonic"),
+                    text: value_string(item, "text"),
+                    targets: item
+                        .get("targets")
+                        .and_then(Value::as_array)
+                        .map(|targets| {
+                            targets
+                                .iter()
+                                .map(|target| {
+                                    let kind = value_string(target, "kind");
+                                    let label = value_string(target, "label");
+                                    let note_key = value_string(target, "note_key");
+                                    NavigationTarget {
+                                        id: value_string(target, "id"),
+                                        note_key: if note_key.is_empty() {
+                                            annotation_key(&kind, &label)
+                                        } else {
+                                            note_key
+                                        },
+                                        kind,
+                                        label,
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn edit_options_from_json(data: &Value) -> Vec<EditOption> {
+    data.get("options")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| EditOption {
+                    id: value_string(item, "id"),
+                    group: value_string(item, "group"),
+                    label: value_string(item, "label"),
+                    action: value_string(item, "action"),
+                    width: item.get("width").and_then(Value::as_u64).unwrap_or(0),
+                    arguments: item
+                        .get("arguments")
+                        .and_then(Value::as_array)
+                        .map(|arguments| {
+                            arguments
+                                .iter()
+                                .map(|argument| EditArgument {
+                                    name: value_string(argument, "name"),
+                                    label: value_string(argument, "label"),
+                                    kind: value_string(argument, "kind"),
+                                    value: value_string(argument, "value"),
+                                    picker: edit_picker_kind(argument),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn value_string(value: &Value, key: &str) -> String {
@@ -7892,6 +9575,137 @@ fn parse_code_offset(line: &str) -> Option<u64> {
         .take_while(|character| character.is_ascii_hexdigit())
         .collect::<String>();
     u64::from_str_radix(&digits, 16).ok()
+}
+
+fn char_index_to_byte_offset(source: &str, index: usize) -> usize {
+    source
+        .char_indices()
+        .nth(index)
+        .map(|(offset, _)| offset)
+        .unwrap_or(source.len())
+}
+
+fn expand_typst_snippet(snippet: &str) -> String {
+    let mut expanded = String::with_capacity(snippet.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = snippet[cursor..].find("${") {
+        let start = cursor + relative_start;
+        expanded.push_str(&snippet[cursor..start]);
+        let Some(relative_end) = snippet[start + 2..].find('}') else {
+            expanded.push_str(&snippet[start..]);
+            return expanded;
+        };
+        let end = start + 2 + relative_end;
+        let placeholder = &snippet[start + 2..end];
+        let value = placeholder
+            .split_once(':')
+            .map(|(_, value)| value)
+            .filter(|value| !value.chars().all(|character| character.is_ascii_digit()))
+            .or_else(|| {
+                (!placeholder.chars().all(|character| character.is_ascii_digit()))
+                    .then_some(placeholder)
+            })
+            .unwrap_or("");
+        expanded.push_str(value);
+        cursor = end + 1;
+    }
+    expanded.push_str(&snippet[cursor..]);
+    expanded
+}
+
+fn highlight_typst(source: &str) -> LayoutJob {
+    let font = FontId::monospace(12.0);
+    let mut job = LayoutJob::default();
+    let mut cursor = 0;
+    for span in documentation::typst_highlight_spans(source) {
+        if span.start < cursor || span.start > source.len() {
+            continue;
+        }
+        if span.start > cursor {
+            job.append(
+                &source[cursor..span.start],
+                0.0,
+                TextFormat {
+                    font_id: font.clone(),
+                    color: Color32::from_rgb(215, 220, 225),
+                    ..Default::default()
+                },
+            );
+        }
+        let end = span.end.min(source.len());
+        if end > span.start {
+            job.append(
+                &source[span.start..end],
+                0.0,
+                TextFormat {
+                    font_id: font.clone(),
+                    color: typst_tag_color(span.tag),
+                    ..Default::default()
+                },
+            );
+            cursor = end;
+        }
+    }
+    if cursor < source.len() {
+        job.append(
+            &source[cursor..],
+            0.0,
+            TextFormat {
+                font_id: font,
+                color: Color32::from_rgb(215, 220, 225),
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
+fn upload_documentation_previews(
+    ctx: &egui::Context,
+    generation: u64,
+    pages: &[Vec<u8>],
+) -> Result<Vec<egui::TextureHandle>, String> {
+    pages
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+                .map_err(|error| {
+                    format!("could not decode PNG preview page {}: {error}", index + 1)
+                })?
+                .to_rgba8();
+            let size = [image.width() as usize, image.height() as usize];
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+            Ok(ctx.load_texture(
+                format!("coeus-documentation-preview-{generation}-{index}"),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            ))
+        })
+        .collect()
+}
+
+fn typst_tag_color(tag: typst::syntax::Tag) -> Color32 {
+    use typst::syntax::Tag;
+    match tag {
+        Tag::Comment => Color32::from_rgb(115, 125, 135),
+        Tag::Punctuation => Color32::from_rgb(180, 190, 200),
+        Tag::Escape => Color32::from_rgb(215, 175, 105),
+        Tag::Strong => Color32::from_rgb(250, 220, 150),
+        Tag::Emph => Color32::from_rgb(225, 185, 220),
+        Tag::Link | Tag::Ref => Color32::from_rgb(105, 190, 230),
+        Tag::Raw => Color32::from_rgb(150, 205, 145),
+        Tag::Label => Color32::from_rgb(190, 160, 235),
+        Tag::Heading => Color32::from_rgb(120, 210, 220),
+        Tag::ListMarker | Tag::ListTerm => Color32::from_rgb(240, 185, 105),
+        Tag::MathDelimiter | Tag::MathOperator => Color32::from_rgb(220, 170, 230),
+        Tag::Keyword | Tag::Operator => Color32::from_rgb(235, 160, 180),
+        Tag::Number => Color32::from_rgb(215, 190, 125),
+        Tag::String => Color32::from_rgb(145, 210, 140),
+        Tag::Function => Color32::from_rgb(115, 195, 235),
+        Tag::Interpolated => Color32::from_rgb(235, 200, 120),
+        Tag::Error => Color32::from_rgb(245, 115, 115),
+    }
 }
 
 fn highlight_smali_with_alias(line: &str, alias_range: Option<(usize, usize)>) -> LayoutJob {

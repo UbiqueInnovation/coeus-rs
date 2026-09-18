@@ -6,7 +6,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -18,11 +18,11 @@ use rayon::iter::ParallelIterator;
 
 use coeus_macros::iterator;
 
-use self::runtime::{invoke_runtime, invoke_runtime_with_method, StringClass};
+use self::runtime::{invoke_runtime, invoke_runtime_with_method, synthetic_class, StringClass};
 
 use coeus_models::models::{
-    BinaryObject, Class, CodeItem, DexFile, Instruction, InstructionOffset, InstructionSize,
-    Method, MethodData, ValueType,
+    BinaryObject, Class, CodeItem, DexFile, Instruction, InstructionOffset, InstructionSize, Method,
+    MethodData, ValueType,
 };
 
 pub mod dynamic_runtime;
@@ -175,6 +175,8 @@ pub struct VM {
     stack_frames: Vec<VMState>,
     heap: HashMap<u32, Value>,
     instances: HashMap<String, (NodeIndex, u32)>,
+    initialized_classes: HashSet<String>,
+    initializing_classes: HashSet<String>,
     dex_file: Arc<DexFile>,
     runtime: Vec<Arc<DexFile>>,
     resources: Arc<HashMap<String, Arc<BinaryObject>>>,
@@ -275,6 +277,8 @@ impl VM {
             stack_frames: vec![],
             heap: HashMap::new(),
             instances: HashMap::new(),
+            initialized_classes: HashSet::new(),
+            initializing_classes: HashSet::new(),
             dex_file,
             runtime,
             resources,
@@ -336,6 +340,8 @@ impl VM {
         self.stack_frames.clear();
         self.heap.clear();
         self.instances.clear();
+        self.initialized_classes.clear();
+        self.initializing_classes.clear();
         self.skip_next_breakpoint = false;
     }
     pub fn new_instance(&mut self, ty: String, value: Value) -> Result<Register, VMException> {
@@ -352,6 +358,7 @@ impl VM {
     /// an instance method. Constructors are invoked separately, just like
     /// they are in dex bytecode (`new-instance` followed by `invoke-direct`).
     pub fn new_class_instance(&mut self, class_name: &str) -> Result<Register, VMException> {
+        self.ensure_class_initialized(class_name, self.dex_file.clone())?;
         let class = self
             .dex_file
             .get_class_by_name(class_name)
@@ -361,6 +368,7 @@ impl VM {
                     .find_map(|dex| dex.get_class_by_name(class_name))
             })
             .or_else(|| self.builtins.get(class_name).cloned())
+            .or_else(|| synthetic_class(class_name))
             .ok_or(VMException::ClassNotFound(0))?;
 
         self.new_instance(
@@ -368,6 +376,123 @@ impl VM {
             Value::Object(ClassInstance::new(class)),
         )
     }
+
+    /// Allocate an emulation receiver even when the class initializer throws.
+    ///
+    /// A method invoked from the GUI is often useful to inspect independently
+    /// of a failing application startup initializer. Normal bytecode execution
+    /// remains strict; this opt-in path records the class as initialized only
+    /// after `new_class_instance` reports `ExceptionThrown`, then allocates the
+    /// receiver so the requested method can still be emulated.
+    pub fn new_class_instance_for_emulation(
+        &mut self,
+        class_name: &str,
+    ) -> Result<Register, VMException> {
+        match self.new_class_instance(class_name) {
+            Ok(receiver) => Ok(receiver),
+            Err(VMException::ExceptionThrown) => {
+                self.initialized_classes.insert(class_name.to_string());
+                self.new_class_instance(class_name)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Run a class initializer once before the class is actively used.
+    ///
+    /// Android framework classes normally have no DEX-backed initializer in
+    /// this VM, while application classes can.  Keeping initialization state
+    /// separately from static field storage is important: a class with no
+    /// static fields still has to run `<clinit>`, and a recursive reference
+    /// from its own initializer must not run it a second time.
+    fn ensure_class_initialized(
+        &mut self,
+        class_name: &str,
+        dex_file: Arc<DexFile>,
+    ) -> Result<(), VMException> {
+        if self.initialized_classes.contains(class_name)
+            || self.initializing_classes.contains(class_name)
+        {
+            return Ok(());
+        }
+
+        let class_and_dex = dex_file
+            .get_class_by_name(class_name)
+            .map(|class| (dex_file.clone(), class))
+            .or_else(|| {
+                self.runtime.iter().find_map(|runtime_dex| {
+                    runtime_dex
+                        .get_class_by_name(class_name)
+                        .map(|class| (runtime_dex.clone(), class))
+                })
+            });
+
+        let Some((initializer_dex, class)) = class_and_dex else {
+            // Synthetic framework classes have no code to execute.
+            if synthetic_class(class_name).is_some() || self.builtins.contains_key(class_name) {
+                self.initialized_classes.insert(class_name.to_string());
+                return Ok(());
+            }
+            return Err(VMException::ClassNotFound(0));
+        };
+
+        // JVM/ART initializes a superclass before the first active use of a
+        // subclass.  The sentinel is used by the synthetic builtin classes.
+        let superclass_name = if class.super_class != 0xff_ff_ff_ff {
+            initializer_dex
+                .get_type_name(class.super_class as usize)
+                .map(str::to_string)
+        } else {
+            None
+        };
+        if let Some(superclass_name) = superclass_name
+            .filter(|name| name.starts_with('L') || name.starts_with('['))
+        {
+            self.ensure_class_initialized(&superclass_name, initializer_dex.clone())?;
+        }
+
+        let initializer = class
+            .codes
+            .iter()
+            .find(|method| method.name == "<clinit>")
+            .and_then(|method| method.code.clone().map(|code| (method.method.method_idx, code)));
+
+        self.initializing_classes.insert(class_name.to_string());
+        let result = if let Some((method_idx, code)) = initializer {
+            let saved_state = self.current_state.clone();
+            let saved_stack_frames = self.stack_frames.clone();
+
+            self.current_state.current_dex_file = initializer_dex;
+            self.current_state.current_method_index = method_idx as u32;
+            self.current_state.pc = 0.into();
+            self.current_state.last_instruction_size = 0.into();
+            self.current_state.current_stackframe = vec![Register::Empty; code.register_size as usize];
+            self.current_state.return_reg = Register::Empty;
+            self.current_state.num_params = 0;
+            self.current_state.num_registers = code.register_size as usize;
+            self.current_state.current_instructions = code
+                .insns
+                .into_iter()
+                .map(|instruction| (instruction.1, (instruction.0, instruction.2)))
+                .collect();
+            self.current_state.vm_state = ExecutionState::StaticInitializer;
+            self.stack_frames.clear();
+
+            let result = self.execute(InstructionOffset(0));
+            self.current_state = saved_state;
+            self.stack_frames = saved_stack_frames;
+            result
+        } else {
+            Ok(())
+        };
+
+        self.initializing_classes.remove(class_name);
+        if result.is_ok() {
+            self.initialized_classes.insert(class_name.to_string());
+        }
+        result
+    }
+
     pub fn get_registers(&self) -> Vec<Register> {
         self.current_state.current_stackframe.clone()
     }
@@ -392,6 +517,22 @@ impl VM {
         code_item: &CodeItem,
         arguments: Vec<Register>,
     ) -> Result<(), VMException> {
+        let start_dex = if self.dex_file.identifier == dex_file {
+            self.dex_file.clone()
+        } else {
+            self.runtime
+                .iter()
+                .find(|file| file.identifier == dex_file)
+                .cloned()
+                .ok_or(VMException::LinkerError)?
+        };
+        if let Some(method) = start_dex.methods.get(method_idx as usize) {
+            if let Some(class_name) = start_dex.get_type_name(method.class_idx as usize) {
+                if method.method_name != "<clinit>" {
+                    self.ensure_class_initialized(class_name, start_dex.clone())?;
+                }
+            }
+        }
         self.current_state.pc = 0.into();
         self.current_state.return_reg = Register::Empty;
         self.current_state.current_stackframe = vec![];
@@ -615,6 +756,10 @@ impl VM {
             .first()
         {
             return Ok(class.clone());
+        }
+
+        if let Some(class) = synthetic_class(class_name) {
+            return Ok(class);
         }
 
         Err(VMException::ClassNotFound(type_idx as u16))
@@ -1814,17 +1959,17 @@ impl VM {
                     }
                 }
                 Instruction::NewInstance(dst, type_idx) => {
+                    let class_name = dex_file
+                        .get_type_name((*type_idx) as usize)
+                        .ok_or(VMException::ClassNotFound(*type_idx as u16))?
+                        .to_string();
+                    self.ensure_class_initialized(&class_name, dex_file.clone())?;
                     let class = self.get_class(dex_file.clone(), (*type_idx) as u32)?;
 
                     if let Some(heap_address) = self.malloc() {
                         self.heap
                             .insert(heap_address, Value::Object(ClassInstance::new(class)));
-                        let new_register =
-                            if let Some(type_name) = dex_file.get_type_name((*type_idx) as usize) {
-                                Register::Reference(type_name.to_owned(), heap_address)
-                            } else {
-                                return Err(VMException::OutOfMemory);
-                            };
+                        let new_register = Register::Reference(class_name, heap_address);
                         let dst = self
                             .current_state
                             .current_stackframe
@@ -2065,6 +2210,12 @@ impl VM {
                         return Err(VMException::StackOverflow);
                     }
 
+                    if let Some(method) = dex_file.methods.get(*method_ref as usize) {
+                        if let Some(class_name) = dex_file.get_type_name(method.class_idx as usize) {
+                            self.ensure_class_initialized(class_name, dex_file.clone())?;
+                        }
+                    }
+
                     let mut arguments = vec![];
                     for (regs, &arg) in argument_registers.iter().enumerate() {
                         let reg = self
@@ -2219,8 +2370,24 @@ impl VM {
                         }
                     }
                 }
-                Instruction::InvokeInterface(_, _, _) => {
-                    return Err(VMException::LinkerError);
+                Instruction::InvokeInterface(_, method_ref, argument_registers) => {
+                    // Interface methods are often declared by Android/Kotlin
+                    // runtime classes that are not present in the APK.  The
+                    // concrete implementation is therefore not always
+                    // resolvable through the DEX method table.  Give the
+                    // builtin runtime the same opportunity as virtual and
+                    // static calls instead of failing every invoke-interface.
+                    let mut arguments = Vec::with_capacity(argument_registers.len());
+                    for &arg in argument_registers {
+                        arguments.push(
+                            self.current_state
+                                .current_stackframe
+                                .get(arg as usize)
+                                .ok_or(VMException::RegisterNotFound(arg as usize))?
+                                .clone(),
+                        );
+                    }
+                    self.invoke_runtime(dex_file.clone(), *method_ref as u32, arguments)?;
                 }
 
                 Instruction::NotImpl(_, _) => {
@@ -2240,6 +2407,7 @@ impl VM {
                         } else {
                             return Err(VMException::ClassNotFound(field.class_idx as u16));
                         };
+                    self.ensure_class_initialized(&class_name, dex_file.clone())?;
                     let field_name = format!("{}->{}", class_name, field.name);
                     let new_register = match self
                         .instances
@@ -2266,6 +2434,7 @@ impl VM {
                     } else {
                         return Err(VMException::ClassNotFound(field.class_idx as u16));
                     };
+                    self.ensure_class_initialized(&class_name, dex_file.clone())?;
                     let field_name = format!("{}->{}", class_name, field.name);
                     let value = self
                         .instances
@@ -2290,6 +2459,7 @@ impl VM {
                         } else {
                             return Err(VMException::ClassNotFound(field.class_idx as u16));
                         };
+                    self.ensure_class_initialized(&class_name, dex_file.clone())?;
                     let field_name = format!("{}->{}", class_name, field.name);
                     if !self.instances.contains_key(&field_name)
                         && !matches!(
@@ -2330,70 +2500,74 @@ impl VM {
                                     }
                                 }
                             }
-                            if let Some(class) = iterator!(self.dex_file.classes)
-                                .find_any(|c| c.class_idx == field.class_idx as u32)
+                            if !self.initialized_classes.contains(&class_name)
+                                && !self.initializing_classes.contains(&class_name)
                             {
-                                if let Some(static_init) =
-                                    iterator!(class.codes).find_any(|m| m.name == "<clinit>")
+                                if let Some(class) = iterator!(self.dex_file.classes)
+                                    .find_any(|c| c.class_idx == field.class_idx as u32)
                                 {
-                                    // set pc one back so we can come bakc here
-
-                                    // if self.current_state.pc - self.current_state.last_instruction_size
-                                    //     >= 0
-                                    // {
-                                    //     self.current_state.pc -=
-                                    //         self.current_state.last_instruction_size;
-                                    // }
-                                    self.current_state.vm_state =
-                                        ExecutionState::RunningStaticInitializer;
-                                    self.stack_frames.push(self.current_state.clone());
-
-                                    self.current_state.pc = 0.into();
-                                    self.current_state.num_params = 0;
-                                    self.current_state.vm_state = ExecutionState::StaticInitializer;
-                                    self.current_state.num_registers =
-                                        if let Some(c) = static_init.code.as_ref() {
-                                            c.register_size as usize
-                                        } else {
-                                            return Err(VMException::LinkerError);
-                                        };
-
-                                    let mut registers =
-                                        Vec::with_capacity(self.current_state.num_registers);
-                                    for _ in 0..self.current_state.num_registers {
-                                        registers.push(Register::Empty);
-                                    }
-                                    self.current_state.current_stackframe = registers;
-                                    //TODO: refactor to use shared codeitem
-                                    // but here we know thart code item must exist, as we would early return else
-                                    let the_code_hash = static_init
-                                        .code
-                                        .as_ref()
-                                        .unwrap()
-                                        .insns
-                                        .clone()
-                                        .into_iter()
-                                        .map(|ele| (ele.1, (ele.0, ele.2)))
-                                        .collect();
-
-                                    self.current_state.last_instruction_size = 0.into();
-                                    log::debug!("Field not found, run static initializer");
+                                    if let Some(static_init) =
+                                        iterator!(class.codes).find_any(|m| m.name == "<clinit>")
                                     {
-                                        self.current_state.current_method_index =
-                                            static_init.method.method_idx as u32;
-                                        method_idx = self.current_state.current_method_index;
-                                        //push new instructions
-                                        self.current_state.current_instructions = the_code_hash;
+                                        // set pc one back so we can come bakc here
 
-                                        dex_file = self.current_state.current_dex_file.clone();
-                                        code_item = self.current_state.current_instructions.clone();
-                                        current_instruction = code_item
-                                            .get(&self.current_state.pc)
-                                            .ok_or(VMException::NoInstructionAtAddress(
-                                                self.current_state.current_method_index,
-                                                self.current_state.pc.into(),
-                                            ))?;
-                                        continue;
+                                        // if self.current_state.pc - self.current_state.last_instruction_size
+                                        //     >= 0
+                                        // {
+                                        //     self.current_state.pc -=
+                                        //         self.current_state.last_instruction_size;
+                                        // }
+                                        self.current_state.vm_state =
+                                            ExecutionState::RunningStaticInitializer;
+                                        self.stack_frames.push(self.current_state.clone());
+
+                                        self.current_state.pc = 0.into();
+                                        self.current_state.num_params = 0;
+                                        self.current_state.vm_state = ExecutionState::StaticInitializer;
+                                        self.current_state.num_registers =
+                                            if let Some(c) = static_init.code.as_ref() {
+                                                c.register_size as usize
+                                            } else {
+                                                return Err(VMException::LinkerError);
+                                            };
+
+                                        let mut registers =
+                                            Vec::with_capacity(self.current_state.num_registers);
+                                        for _ in 0..self.current_state.num_registers {
+                                            registers.push(Register::Empty);
+                                        }
+                                        self.current_state.current_stackframe = registers;
+                                        //TODO: refactor to use shared codeitem
+                                        // but here we know thart code item must exist, as we would early return else
+                                        let the_code_hash = static_init
+                                            .code
+                                            .as_ref()
+                                            .unwrap()
+                                            .insns
+                                            .clone()
+                                            .into_iter()
+                                            .map(|ele| (ele.1, (ele.0, ele.2)))
+                                            .collect();
+
+                                        self.current_state.last_instruction_size = 0.into();
+                                        log::debug!("Field not found, run static initializer");
+                                        {
+                                            self.current_state.current_method_index =
+                                                static_init.method.method_idx as u32;
+                                            method_idx = self.current_state.current_method_index;
+                                            //push new instructions
+                                            self.current_state.current_instructions = the_code_hash;
+
+                                            dex_file = self.current_state.current_dex_file.clone();
+                                            code_item = self.current_state.current_instructions.clone();
+                                            current_instruction = code_item
+                                                .get(&self.current_state.pc)
+                                                .ok_or(VMException::NoInstructionAtAddress(
+                                                    self.current_state.current_method_index,
+                                                    self.current_state.pc.into(),
+                                                ))?;
+                                            continue;
+                                        }
                                     }
                                 }
                             }
@@ -2463,6 +2637,7 @@ impl VM {
                     let class_name = dex_file
                         .get_type_name(field.class_idx as usize)
                         .ok_or(VMException::ClassNotFound(field.class_idx as u16))?;
+                    self.ensure_class_initialized(class_name, dex_file.clone())?;
                     let field_name = format!("{}->{}", class_name, field.name);
                     let value = self
                         .instances
@@ -2487,6 +2662,7 @@ impl VM {
                         .get_type_name(field.class_idx as usize)
                         .ok_or(VMException::ClassNotFound(field.class_idx as u16))?
                         .to_string();
+                    self.ensure_class_initialized(&class_name, dex_file.clone())?;
                     let field_name = format!("{}->{}", class_name, field.name);
                     if let Some(&Register::Literal(lit)) =
                         self.current_state.current_stackframe.get(src as usize)
@@ -2502,7 +2678,16 @@ impl VM {
                         entry.1 = addr;
                     }
                 }
-                Instruction::StaticPutWide(_, _) => {}
+                &Instruction::StaticPutWide(_, field_idx) => {
+                    let field = dex_file
+                        .fields
+                        .get(field_idx as usize)
+                        .ok_or(VMException::ClassNotFound(0))?;
+                    let class_name = dex_file
+                        .get_type_name(field.class_idx as usize)
+                        .ok_or(VMException::ClassNotFound(field.class_idx as u16))?;
+                    self.ensure_class_initialized(class_name, dex_file.clone())?;
+                }
                 &Instruction::StaticPutObject(src, field_idx) => {
                     let field = if let Some(field) = dex_file.fields.get(field_idx as usize) {
                         field
@@ -2513,6 +2698,7 @@ impl VM {
                         .get_type_name(field.class_idx as usize)
                         .ok_or(VMException::ClassNotFound(field.class_idx as u16))?
                         .to_string();
+                    self.ensure_class_initialized(&class_name, dex_file.clone())?;
                     let field_name = format!("{}->{}", class_name, field.name);
 
                     match self.current_state.current_stackframe.get(src as usize) {
@@ -2578,6 +2764,7 @@ impl VM {
                     let class_name = dex_file
                         .get_type_name(field.class_idx as usize)
                         .ok_or(VMException::ClassNotFound(field.class_idx as u16))?;
+                    self.ensure_class_initialized(class_name, dex_file.clone())?;
                     let field_name = format!("{}->{}", class_name, field.name);
                     let Some(Register::Literal(value)) = self
                         .current_state
@@ -3322,7 +3509,7 @@ impl Register {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coeus_models::models::{CodeItem, DexHeader, Field, StringEntry};
+    use coeus_models::models::{AccessFlags, CodeItem, DexHeader, Field, StringEntry};
 
     fn test_dex(class: Arc<Class>) -> Arc<DexFile> {
         Arc::new(DexFile {
@@ -3395,6 +3582,180 @@ mod tests {
             .unwrap();
         assert_eq!(vm.get_heap_ref().len(), heap_size);
         assert_eq!(vm.get_current_state().return_reg, object);
+    }
+
+    #[test]
+    fn object_hash_code_is_identity_based() {
+        let class = Arc::new(Class::new(
+            "test.dex".to_string(),
+            0,
+            "Ltest/Receiver;".to_string(),
+        ));
+        let dex = test_dex(class);
+        let mut vm = VM::new(dex, Vec::new(), Arc::new(HashMap::new()));
+        let object = vm.new_class_instance("Ljava/lang/Object;").unwrap();
+        let Register::Reference(_, address) = object.clone() else {
+            panic!("object did not return a reference");
+        };
+        let method = Arc::new(Method {
+            class_idx: 0,
+            method_idx: 0,
+            proto_idx: 0,
+            name_idx: 0,
+            method_name: "hashCode".to_string(),
+            proto_name: "()I".to_string(),
+        });
+        vm.invoke_runtime_with_method("Ljava/lang/Object;", method, vec![object])
+            .unwrap();
+        assert_eq!(vm.get_current_state().return_reg, Register::Literal(address as i32));
+    }
+
+    #[test]
+    fn url_constructor_and_components_are_builtin() {
+        let class = Arc::new(Class::new(
+            "test.dex".to_string(),
+            0,
+            "Ltest/Receiver;".to_string(),
+        ));
+        let dex = test_dex(class);
+        let mut vm = VM::new(dex, Vec::new(), Arc::new(HashMap::new()));
+        let url = vm.new_class_instance("Ljava/net/URL;").unwrap();
+        let raw = vm.new_instance(
+            StringClass::class_name().to_string(),
+            Value::Object(StringClass::new(
+                "https://example.com/path?q=1".to_string(),
+            )),
+        ).unwrap();
+        let init = Arc::new(Method {
+            class_idx: 0,
+            method_idx: 0,
+            proto_idx: 0,
+            name_idx: 0,
+            method_name: "<init>".to_string(),
+            proto_name: "(Ljava/lang/String;)V".to_string(),
+        });
+        vm.invoke_runtime_with_method("Ljava/net/URL;", init, vec![url.clone(), raw])
+            .unwrap();
+
+        let get_host = Arc::new(Method {
+            class_idx: 0,
+            method_idx: 0,
+            proto_idx: 0,
+            name_idx: 0,
+            method_name: "getHost".to_string(),
+            proto_name: "()Ljava/lang/String;".to_string(),
+        });
+        vm.invoke_runtime_with_method("Ljava/net/URL;", get_host, vec![url])
+            .unwrap();
+        let Register::Reference(_, result) = vm.get_current_state().return_reg else {
+            panic!("URL.getHost did not return a string");
+        };
+        assert_eq!(vm.get_heap_ref().get(&result).and_then(Value::as_string), Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn serializer_interface_string_method_gets_placeholder() {
+        let class = Arc::new(Class::new(
+            "test.dex".to_string(),
+            0,
+            "Ltest/Receiver;".to_string(),
+        ));
+        let dex = test_dex(class);
+        let mut vm = VM::new(dex, Vec::new(), Arc::new(HashMap::new()));
+        let receiver = vm.new_class_instance("Ljava/lang/Object;").unwrap();
+        let method = Arc::new(Method {
+            class_idx: 0,
+            method_idx: 0,
+            proto_idx: 0,
+            name_idx: 0,
+            method_name: "u".to_string(),
+            proto_name: "()Ljava/lang/String;".to_string(),
+        });
+        vm.invoke_runtime_with_method("Ly92;", method, vec![receiver])
+            .unwrap();
+        let Register::Reference(_, result) = vm.get_current_state().return_reg else {
+            panic!("serializer method did not return a string");
+        };
+        assert_eq!(
+            vm.get_heap_ref().get(&result).and_then(Value::as_string),
+            Some("https://example.invalid/".to_string())
+        );
+    }
+
+    #[test]
+    fn class_initializer_runs_once_before_active_use() {
+        let class_name = "Ltest/Initialized;";
+        let class = Arc::new(Class::new(
+            "test.dex".to_string(),
+            0,
+            class_name.to_string(),
+        ));
+        let initializer = Arc::new(MethodData {
+            name: "<clinit>".to_string(),
+            method: Arc::new(Method {
+                class_idx: 0,
+                method_idx: 0,
+                proto_idx: 0,
+                name_idx: 3,
+                method_name: "<clinit>".to_string(),
+                proto_name: "()V".to_string(),
+            }),
+            method_idx: 0,
+            access_flags: AccessFlags::PUBLIC,
+            code: Some(CodeItem {
+                code_off: 0,
+                register_size: 1,
+                ins_size: 0,
+                outs_size: 0,
+                tries_size: 0,
+                debug_info_off: 0,
+                insns_size: 6,
+                insns: vec![
+                    (InstructionSize(6), InstructionOffset(0), Instruction::ConstLit32(0, 7)),
+                    (InstructionSize(4), InstructionOffset(3), Instruction::StaticPut(0, 0)),
+                    (InstructionSize(2), InstructionOffset(5), Instruction::ReturnVoid),
+                ],
+                array_data: Vec::new(),
+                switch_data: Vec::new(),
+            }),
+            call_graph: None,
+        });
+        let mut class_data = (*class).clone();
+        class_data.codes = vec![initializer];
+        let class = Arc::new(class_data);
+        let dex = Arc::new(DexFile {
+            identifier: "test.dex".to_string(),
+            raw_data: Vec::new(),
+            file_name: "test.dex".to_string(),
+            header: unsafe { std::mem::zeroed::<DexHeader>() },
+            strings: vec![
+                StringEntry { utf16_size: class_name.len() as u32, dat: class_name.as_bytes().to_vec() },
+                StringEntry { utf16_size: 1, dat: b"I".to_vec() },
+                StringEntry { utf16_size: 5, dat: b"VALUE".to_vec() },
+                StringEntry { utf16_size: 8, dat: b"<clinit>".to_vec() },
+            ],
+            types: vec![0, 1],
+            methods: vec![Arc::new(Method {
+                class_idx: 0,
+                method_idx: 0,
+                proto_idx: 0,
+                name_idx: 3,
+                method_name: "<clinit>".to_string(),
+                proto_name: "()V".to_string(),
+            })],
+            protos: Vec::new(),
+            fields: vec![Arc::new(Field { class_idx: 0, type_idx: 1, name_idx: 2, name: "VALUE".to_string() })],
+            classes: vec![class],
+            interface_table: HashMap::new(),
+            superclass_table: HashMap::new(),
+        });
+        let mut vm = VM::new(dex.clone(), Vec::new(), Arc::new(HashMap::new()));
+        vm.new_class_instance(class_name).unwrap();
+        let heap_size = vm.get_heap_ref().len();
+        vm.ensure_class_initialized(class_name, dex).unwrap();
+        assert_eq!(vm.get_heap_ref().len(), heap_size);
+        let (_, address) = vm.instances.get("Ltest/Initialized;->VALUE").unwrap();
+        assert!(matches!(vm.get_heap_ref().get(address), Some(Value::Int(7))));
     }
 
     #[test]
