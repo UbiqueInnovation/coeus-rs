@@ -24,3 +24,4 @@ typst-ide = { git = "https://github.com/typst/typst.git", tag = "v0.14.2", packa
 time = "0.3"
 ux = "0.1.3"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+clap = { version = "4.6.7", features = ["derive"] }

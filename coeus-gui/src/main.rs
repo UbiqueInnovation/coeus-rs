@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use clap::Parser;
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{self, Color32, FontId, Key, Rect, RichText, Sense, Stroke, Vec2};
 use regex::Regex;
@@ -653,7 +654,7 @@ impl Default for AdbState {
             serial: String::new(),
             package_filter: String::new(),
             selected_package: String::new(),
-            output_dir: String::new(),
+            output_dir: ".".into(),
             devices: Vec::new(),
             packages: Vec::new(),
         }
@@ -783,8 +784,15 @@ impl CoeusApp {
         theme::install(&cc.egui_ctx);
         Self::with_bridge(Bridge::spawn())
     }
-
+    fn new_with_path(cc: &eframe::CreationContext<'_>, workdir: Option<String>) -> Self {
+        theme::install(&cc.egui_ctx);
+        Self::with_bridge_with_workdir(Bridge::spawn(), workdir)
+    }
     fn with_bridge(bridge: Result<Bridge, String>) -> Self {
+        Self::with_bridge_with_workdir(bridge, None)
+    }
+
+    fn with_bridge_with_workdir(bridge: Result<Bridge, String>, workdir: Option<String>) -> Self {
         match bridge {
             Ok(bridge) => {
                 let backend_name = bridge.name();
@@ -852,7 +860,10 @@ impl CoeusApp {
                     deploy: DeployState::default(),
                     split_mode: false,
                     split_members: Vec::new(),
-                    adb: AdbState::default(),
+                    adb: AdbState {
+                        output_dir: workdir.unwrap_or(".".to_string()),
+                        ..Default::default()
+                    },
                 }
             }
             Err(error) => Self {
@@ -1234,9 +1245,8 @@ impl CoeusApp {
                             self.documentation_preview_textures = textures;
                             self.documentation_preview_generation = generation;
                             self.documentation.render_error = None;
-                            self.status = format!(
-                                "Rendered documentation PDF and {page_count} PNG page(s)"
-                            );
+                            self.status =
+                                format!("Rendered documentation PDF and {page_count} PNG page(s)");
                         }
                         Err(error) => {
                             self.documentation.render_error = Some(error.clone());
@@ -1950,11 +1960,7 @@ impl CoeusApp {
                                     );
                                 }
                             }
-                            self.finish(
-                                request_id,
-                                "load_split_from_adb".to_string(),
-                                Ok(loaded),
-                            );
+                            self.finish(request_id, "load_split_from_adb".to_string(), Ok(loaded));
                             // Carry the selected device settings into the
                             // split deploy tab for the next sign/install.
                             self.deploy.serial = pulled_serial;
@@ -4723,14 +4729,12 @@ impl CoeusApp {
                 .code_editor()
                 .layouter(&mut typst_layouter),
         );
-        let documentation_cursor = egui::text_edit::TextEditState::load(
-            ui.ctx(),
-            source_response.id,
-        )
-        .and_then(|state| state.cursor.char_range())
-        .map(|range| range.primary.index)
-        .map(|index| char_index_to_byte_offset(&self.documentation.source, index))
-        .unwrap_or(self.documentation.source.len());
+        let documentation_cursor =
+            egui::text_edit::TextEditState::load(ui.ctx(), source_response.id)
+                .and_then(|state| state.cursor.char_range())
+                .map(|range| range.primary.index)
+                .map(|index| char_index_to_byte_offset(&self.documentation.source, index))
+                .unwrap_or(self.documentation.source.len());
         if source_response.changed() {
             self.session_dirty = true;
             self.schedule_documentation_render(ui.ctx());
@@ -4778,14 +4782,9 @@ impl CoeusApp {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         for completion in self.documentation_completions.iter().take(32) {
-                            let response = ui
-                                .small_button(&completion.label)
-                                .on_hover_text(
-                                    completion
-                                        .detail
-                                        .as_deref()
-                                        .unwrap_or(&completion.kind),
-                                );
+                            let response = ui.small_button(&completion.label).on_hover_text(
+                                completion.detail.as_deref().unwrap_or(&completion.kind),
+                            );
                             if response.clicked() {
                                 chosen_completion = Some(completion.clone());
                             }
@@ -4798,7 +4797,9 @@ impl CoeusApp {
                     .min(self.documentation.source.len());
                 let from = completion.from.min(cursor);
                 let replacement = expand_typst_snippet(&completion.apply);
-                self.documentation.source.replace_range(from..cursor, &replacement);
+                self.documentation
+                    .source
+                    .replace_range(from..cursor, &replacement);
                 self.documentation_completions.clear();
                 self.schedule_documentation_render(ui.ctx());
                 self.session_dirty = true;
@@ -4924,7 +4925,6 @@ impl CoeusApp {
             self.session_dirty = true;
             self.schedule_documentation_render(ui.ctx());
         }
-
     }
 
     fn show_documentation_workspace(&mut self, ctx: &egui::Context) {
@@ -5143,7 +5143,8 @@ impl CoeusApp {
                     if ui.button("Render now").clicked() {
                         self.render_documentation(ui.ctx());
                     }
-                    if self.documentation_render.is_some() || self.documentation_render_due.is_some()
+                    if self.documentation_render.is_some()
+                        || self.documentation_render_due.is_some()
                     {
                         ui.spinner();
                         ui.label(if self.documentation_render.is_some() {
@@ -9602,8 +9603,10 @@ fn expand_typst_snippet(snippet: &str) -> String {
             .map(|(_, value)| value)
             .filter(|value| !value.chars().all(|character| character.is_ascii_digit()))
             .or_else(|| {
-                (!placeholder.chars().all(|character| character.is_ascii_digit()))
-                    .then_some(placeholder)
+                (!placeholder
+                    .chars()
+                    .all(|character| character.is_ascii_digit()))
+                .then_some(placeholder)
             })
             .unwrap_or("");
         expanded.push_str(value);
@@ -10899,6 +10902,16 @@ fn shorten(value: &str, max: usize) -> String {
     )
 }
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Working dir
+    #[arg(name = "WORKDIR")]
+    workdir: Option<String>,
+    #[arg(short, long)]
+    project: Option<String>,
+}
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -10908,10 +10921,11 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
+    let workdir_arg = std::env::args().nth(2);
     eframe::run_native(
         "Coeus Explorer",
         options,
-        Box::new(|context| Ok(Box::new(CoeusApp::new(context)))),
+        Box::new(|context| Ok(Box::new(CoeusApp::new_with_path(context, workdir_arg)))),
     )
 }
 
