@@ -10921,11 +10921,11 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
-    let workdir_arg = std::env::args().nth(2);
+    let args = Args::parse();
     eframe::run_native(
         "Coeus Explorer",
         options,
-        Box::new(|context| Ok(Box::new(CoeusApp::new_with_path(context, workdir_arg)))),
+        Box::new(|context| Ok(Box::new(CoeusApp::new_with_path(context, args.workdir)))),
     )
 }
 
