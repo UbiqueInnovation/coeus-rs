@@ -662,6 +662,11 @@ impl DexInstruction {
         self.size
     }
 
+    /// Return the written register even when textual disassembly is incomplete.
+    pub fn get_destination_register(&self) -> Option<u16> {
+        self.instruction.destination_register()
+    }
+
     pub fn mnemonic(&self) -> String {
         match &self.instruction {
             DexInstructionModel::Test(function, ..) => match function {
@@ -2117,6 +2122,16 @@ const {function_name} = {class_without_pkg}.{function_name}.overload({arguments}
     /// Return the archive-facing DEX name, e.g. `classes.dex`.
     pub fn get_dex_name(&self) -> String {
         self.file.get_dex_name().to_string()
+    }
+
+    /// Return (total register words, incoming parameter words) from the code item.
+    /// Incoming words include the receiver for instance methods and both words
+    /// of wide parameters. Methods without code have no register layout.
+    pub fn get_register_layout(&self) -> Option<(u16, u16)> {
+        self.method_data
+            .as_ref()
+            .and_then(|data| data.code.as_ref())
+            .map(|code| (code.register_size, code.ins_size))
     }
 
     /// Return concrete decoded instructions suitable for object-based edits.

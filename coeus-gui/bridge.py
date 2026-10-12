@@ -1138,15 +1138,58 @@ class Backend:
             cache[text] = list(targets)
         return targets
 
+    @staticmethod
+    def _method_register_layout(method):
+        """Return the physical start and size of the DEX incoming register area."""
+        if not hasattr(method, "get_register_layout"):
+            return None
+        layout = method.get_register_layout()
+        if layout is None:
+            return None
+        total, incoming = layout
+        if not 0 <= incoming <= total <= 65535:
+            return None
+        return total - incoming, incoming
+
+    @staticmethod
+    def _register_label(register, layout):
+        if layout is not None:
+            base, count = layout
+            if base <= register < base + count:
+                return "p{}".format(register - base)
+        return "v{}".format(register)
+
+    @staticmethod
+    def _parameter_register_listing(text, layout):
+        if layout is None or layout[1] == 0:
+            return text
+
+        def line_with_parameters(line):
+            # Only the leading operand registers are eligible. Everything after
+            # them (quoted strings, reference names, labels and comments) stays
+            # byte-for-byte unchanged, as do directives and method signatures.
+            match = re.match(r"(\s*[a-z][a-z0-9/-]*\s+)(\{[v0-9,\s.]*\}|v[0-9]+(?:\s*,\s*v[0-9]+)*)(?=\s|,|$)", line)
+            if match is None:
+                return line
+            operands = re.sub(
+                r"\bv([0-9]+)\b",
+                lambda register: Backend._register_label(int(register.group(1)), layout),
+                match.group(2),
+            )
+            return line[:match.start(2)] + operands + line[match.end(2):]
+
+        return "".join(line_with_parameters(line) for line in text.splitlines(keepends=True))
+
     def _instructions(self, method, cache=None):
         instructions = []
+        layout = self._method_register_layout(method)
         for instruction in method.get_instructions():
             instructions.append(
                 {
                     "offset": instruction.get_offset(),
                     "size": instruction.get_size(),
                     "mnemonic": instruction.mnemonic(),
-                    "text": str(instruction),
+                    "text": self._parameter_register_listing(str(instruction), layout),
                     "targets": self._instruction_targets(instruction, cache),
                 }
             )
@@ -1189,7 +1232,7 @@ class Backend:
         if annotation_key:
             data["note_key"] = annotation_key
         if kind == "method":
-            code = obj.code()
+            code = self._parameter_register_listing(obj.code(), self._method_register_layout(obj))
             target_cache = {}
             instructions = self._instructions(obj, target_cache)
             line_targets = [self._instruction_targets(line, target_cache) for line in code.splitlines()]
@@ -1238,7 +1281,14 @@ class Backend:
                 for index in range(start, start + len(method_lines)):
                     line_method_ids[index] = method_id
                     line_method_keys[index] = method.signature()
+                layout = self._method_register_layout(method)
+                source_lines[start:start + len(method_lines)] = [
+                    self._parameter_register_listing(line, layout) for line in method_lines
+                ]
                 search_from = start + len(method_lines)
+            # Transform only the matched method spans, retaining class fields,
+            # signatures and line-to-method/target mappings.
+            code = "\n".join(source_lines) + ("\n" if code.endswith("\n") else "")
             data.update(
                 {
                     "code": code,
@@ -1604,6 +1654,36 @@ class Backend:
         return count
 
     @staticmethod
+    def _normalize_edit_register_arguments(arguments, layout):
+        """Resolve pN before encoding and recording an edit for portable replay."""
+        def physical_register(raw):
+            text = str(raw).strip()
+            if not text.startswith("p"):
+                return raw
+            if not re.fullmatch(r"p[0-9]+", text):
+                raise RuntimeError("register must be an integer, vN, or pN")
+            if layout is None:
+                raise RuntimeError("parameter registers require a method register layout")
+            base, count = layout
+            parameter = int(text[1:], 10)
+            if parameter >= count:
+                raise RuntimeError("{} is outside this method's {} parameter register words".format(text, count))
+            return "v{}".format(base + parameter)
+
+        normalized = dict(arguments)
+        for name in {"register", "source_register", "first_register", "object_register", "left_register", "right_register"}:
+            if name in normalized:
+                normalized[name] = physical_register(normalized[name])
+        if "registers" in normalized:
+            raw = str(normalized["registers"]).strip()
+            if raw.startswith("{") and raw.endswith("}"):
+                raw = raw[1:-1]
+            normalized["registers"] = ", ".join(
+                str(physical_register(value)) for value in re.split(r"[\s,]+", raw) if value
+            )
+        return normalized
+
+    @staticmethod
     def _edit_destination_register(instruction_text):
         """Return only a written register, never an invoke/return/store operand."""
         match = re.match(r"\s*([^\s]+)\s+v([0-9]+)(?=[,\s]|$)", instruction_text)
@@ -1615,7 +1695,7 @@ class Backend:
             "move", "const", "aget", "iget", "sget", "cmp", "cmpl", "cmpg",
             "add", "sub", "rsub", "mul", "div", "rem", "and", "or", "xor",
             "shl", "shr", "ushr", "neg", "not",
-        } or mnemonic in {"new-instance", "new-array", "array-length", "instance-of"}
+        } or mnemonic in {"new-instance", "new-array", "array-length", "instance-of", "check-cast"}
                 or re.fullmatch(r"(?:int|long|float|double)-to-(?:byte|char|short|int|long|float|double)", mnemonic)):
             return int(register)
         return None
@@ -1642,8 +1722,9 @@ class Backend:
             return "Basic"
         return "Other"
 
-    def _build_edit_instruction(self, factory, arguments, after_selected):
+    def _build_edit_instruction(self, factory, arguments, after_selected, parameter_layout=None):
         """Build one typed replacement from GUI argument values."""
+        arguments = self._normalize_edit_register_arguments(arguments, parameter_layout)
         if factory == "nop":
             return DexInstruction.nop()
         if factory == "return_void":
@@ -1795,9 +1876,15 @@ class Backend:
         editor = self.ao.edit_method(entry["object"])
         after_selected = editor.label_after(target)
         target_text = str(target)
+        parameter_layout = self._method_register_layout(entry["object"])
         registers = [int(value) for value in re.findall(r"\bv(\d+)\b", target_text)]
         first_register = registers[0] if registers else 0
-        destination_register = self._edit_destination_register(target_text)
+        # Prefer the decoded operand: some opcodes have only a raw text view.
+        destination_register = (
+            target.get_destination_register()
+            if hasattr(target, "get_destination_register")
+            else self._edit_destination_register(target_text)
+        )
         register_count = len(registers)
         if ".." in target_text and len(registers) >= 2:
             register_count = max(1, registers[-1] - registers[0] + 1)
@@ -1817,10 +1904,10 @@ class Backend:
                 except Exception:
                     pass
 
-        register_list = ", ".join("v{}".format(value) for value in registers)
+        register_list = ", ".join(self._register_label(value, parameter_layout) for value in registers)
 
         integer = lambda name, label, value: self._edit_argument(name, label, value)
-        register = lambda name, label, value: self._edit_argument(name, label, "v{}".format(value), "register")
+        register = lambda name, label, value: self._edit_argument(name, label, self._register_label(value, parameter_layout), "register")
         destination = lambda: register("register", "Destination register", destination_register or 0)
         candidates = [
             {"factory": "nop", "label": "Replace with NOP", "action": "replace", "arguments": []},
@@ -1834,7 +1921,7 @@ class Backend:
             {"factory": "move_from16", "label": "move/from16", "action": "replace", "arguments": [destination(), register("source_register", "Source register", 0)]},
             {"factory": "move_object_from16", "label": "move-object/from16", "action": "replace", "arguments": [destination(), register("source_register", "Source register", 0)]},
             {"factory": "new_instance", "label": "new-instance", "action": "replace", "arguments": [destination(), self._edit_argument("type_index", "Class/type entry", 0, picker="classes")]},
-            {"factory": "check_cast", "label": "check-cast", "action": "replace", "arguments": [register("register", "Register", 0), self._edit_argument("type_index", "Class/type entry", 0, picker="classes")]},
+            {"factory": "check_cast", "label": "check-cast", "action": "replace", "arguments": [destination(), self._edit_argument("type_index", "Class/type entry", 0, picker="classes")]},
             {"factory": "insert_nop", "label": "Insert NOP before", "action": "insert_before", "arguments": []},
             {"factory": "insert_nop", "label": "Insert NOP after", "action": "insert_after", "arguments": []},
             {"factory": "prepend_nop", "label": "Prepend NOP at method entry", "action": "prepend", "arguments": []},
@@ -1975,6 +2062,10 @@ class Backend:
 
         options = []
         for candidate in candidates:
+            if parameter_layout is not None:
+                for argument in candidate["arguments"]:
+                    if argument["kind"] == "register" or argument["name"] == "registers":
+                        argument["parameter_base"], argument["parameter_count"] = parameter_layout
             default_arguments = {
                 argument["name"]: argument["value"]
                 for argument in candidate["arguments"]
@@ -1984,7 +2075,7 @@ class Backend:
                 factory = "nop"
             try:
                 replacement = self._build_edit_instruction(
-                    factory, default_arguments, after_selected
+                    factory, default_arguments, after_selected, parameter_layout
                 )
             except (RuntimeError, OverflowError, ValueError):
                 # A prefilled operand may exceed this candidate's encoding.
@@ -2036,6 +2127,9 @@ class Backend:
             argument["name"]: arguments.get(argument["name"], argument["value"])
             for argument in option.get("argument_specs", [])
         }
+        argument_values = self._normalize_edit_register_arguments(
+            argument_values, self._method_register_layout(method)
+        )
         option["object"] = self._build_edit_instruction(
             option["factory"], argument_values, editor.label_after(option["target"])
         )

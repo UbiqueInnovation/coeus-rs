@@ -13,6 +13,8 @@ fn option(value: &str) -> EditOption {
             kind: "register".to_string(),
             value: value.to_string(),
             picker: None,
+            parameter_base: None,
+            parameter_count: None,
         }],
     }
 }
@@ -212,4 +214,66 @@ fn disassembly_does_not_consume_keys_for_a_hidden_edit_form() {
     frame(&ctx, &mut app, vec![key(Key::Escape)]);
     assert!(app.code.edit_form.is_some());
     assert_eq!(app.next_request_id, 0);
+}
+
+#[test]
+fn popup_accepts_parameter_aliases_only_with_valid_method_metadata() {
+    for (value, base, count, expected_requests) in [
+        ("p0", Some(6), Some(2), 1),
+        ("p1", Some(6), Some(2), 1),
+        ("p2", Some(6), Some(2), 0),
+        ("p0", Some(6), Some(0), 0),
+        ("p0", None, None, 0),
+        ("p0", Some(6), None, 0),
+        ("p-1", Some(6), Some(2), 0),
+        ("p", Some(6), Some(2), 0),
+        ("v6", None, None, 1),
+        ("6", None, None, 1),
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let argument = &mut app.code.edit_form.as_mut().unwrap().arguments[0];
+        argument.value = value.to_string();
+        argument.parameter_base = base;
+        argument.parameter_count = count;
+        frame(&ctx, &mut app, Vec::new());
+        focus_register(&ctx, false);
+        frame(&ctx, &mut app, vec![key(Key::Enter)]);
+        assert_eq!(
+            app.next_request_id, expected_requests,
+            "Input {value} with base {base:?} and count {count:?}"
+        );
+        assert_eq!(
+            app.code.edit_form.as_ref().unwrap().arguments[0].value,
+            value
+        );
+    }
+}
+
+#[test]
+fn parameter_metadata_survives_edit_option_parsing() {
+    let options = edit_options_from_json(&json!({
+        "options": [{
+            "id": "replacement",
+            "arguments": [
+                {"name": "destination_register", "kind": "register", "value": "p1", "parameter_base": 6, "parameter_count": 2},
+                {"name": "source_register", "kind": "register", "value": "v0"},
+                {"name": "register", "kind": "register", "value": "v1", "parameter_base": 4294967296_u64, "parameter_count": -1}
+            ]
+        }]
+    }));
+    let arguments = &options[0].arguments;
+    assert_eq!(
+        (arguments[0].parameter_base, arguments[0].parameter_count),
+        (Some(6), Some(2))
+    );
+    assert_eq!(arguments[0].value, "p1");
+    assert_eq!(
+        (arguments[1].parameter_base, arguments[1].parameter_count),
+        (None, None)
+    );
+    assert_eq!(
+        (arguments[2].parameter_base, arguments[2].parameter_count),
+        (None, None)
+    );
 }

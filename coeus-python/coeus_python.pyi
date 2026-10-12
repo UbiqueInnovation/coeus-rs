@@ -372,6 +372,8 @@ class Method:
         """Return the method-id used by the DEX encoder."""
     def get_dex_name(self) -> str:
         """Return the archive-facing DEX name."""
+    def get_register_layout(self) -> tuple[int, int] | None:
+        """Return (total register words, incoming parameter words), or None without code."""
     def get_instructions(self) -> list[DexInstruction]:
         """Return concrete decoded instructions for object-based editing."""
     def replace_instruction(

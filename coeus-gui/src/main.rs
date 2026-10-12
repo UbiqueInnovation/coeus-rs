@@ -260,6 +260,8 @@ struct EditArgument {
     kind: String,
     value: String,
     picker: Option<SearchKind>,
+    parameter_base: Option<u32>,
+    parameter_count: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -9106,6 +9108,8 @@ fn edit_options_from_json(data: &Value) -> Vec<EditOption> {
                                     kind: value_string(argument, "kind"),
                                     value: value_string(argument, "value"),
                                     picker: edit_picker_kind(argument),
+                                    parameter_base: argument.get("parameter_base").and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok()),
+                                    parameter_count: argument.get("parameter_count").and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok()),
                                 })
                                 .collect()
                         })

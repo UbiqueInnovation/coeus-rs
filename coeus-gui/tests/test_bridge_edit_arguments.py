@@ -48,10 +48,11 @@ class RegisterArgumentsTest(unittest.TestCase):
     def build(self, factory, **arguments):
         return self.backend._build_edit_instruction(factory, arguments, "after")
 
-    def options(self, text):
+    def options(self, text, register_layout=None):
         instruction = Instruction(text=text)
         method = types.SimpleNamespace(
             get_instructions=lambda: [instruction], get_dex_name=lambda: "classes.dex",
+            get_register_layout=lambda: register_layout,
         )
         self.backend.ao = types.SimpleNamespace(
             edit_method=lambda method: types.SimpleNamespace(label_after=lambda target: "after")
@@ -145,6 +146,110 @@ class RegisterArgumentsTest(unittest.TestCase):
                 script = self.backend._script_instruction(factory, arguments)
                 replayed = eval(script, {"DexInstruction": extension.DexInstruction})
                 self.assertEqual(replayed.arguments, expected)
+
+    def test_parameter_layout_uses_register_words_including_receiver_and_wide_values(self):
+        method = types.SimpleNamespace(get_register_layout=lambda: (10, 4))
+        self.assertEqual(self.backend._method_register_layout(method), (6, 4))
+        # p0 is v6, and a wide argument occupies two successive p registers.
+        self.assertEqual(self.backend._register_label(6, (6, 4)), "p0")
+        self.assertEqual(self.backend._register_label(9, (6, 4)), "p3")
+        self.assertEqual(self.backend._register_label(5, (6, 4)), "v5")
+        self.assertIsNone(self.backend._method_register_layout(object()))
+        self.assertIsNone(self.backend._method_register_layout(types.SimpleNamespace(get_register_layout=lambda: None)))
+        self.assertIsNone(self.backend._method_register_layout(types.SimpleNamespace(get_register_layout=lambda: (1, 2))))
+
+    def test_parameter_listing_preserves_non_operands(self):
+        original = (
+            '.method public v6(Lv6;)V\n'
+            '    .registers v6 # v6\n'
+            '    :v6\n'
+            '    # move v6, v7\n'
+            '    const-string v6, "v6 and \\\"v7\\\"" # v7\n'
+            '    iget v1, v7, Lfoo/v7;->v6:I # v6\n'
+            '    invoke-virtual {v5, v6, v7}, Lv6;->v7()V # v7\n'
+            '    invoke-static/range {v6 .. v9}, Lv6;->v7()V\n'
+            '    move v6,v7\n'
+            '    if-eqz v7, :v6\n'
+            '    return v6\n'
+            '.end method\n'
+        )
+        expected = (
+            '.method public v6(Lv6;)V\n'
+            '    .registers v6 # v6\n'
+            '    :v6\n'
+            '    # move v6, v7\n'
+            '    const-string p0, "v6 and \\\"v7\\\"" # v7\n'
+            '    iget v1, p1, Lfoo/v7;->v6:I # v6\n'
+            '    invoke-virtual {v5, p0, p1}, Lv6;->v7()V # v7\n'
+            '    invoke-static/range {p0 .. p3}, Lv6;->v7()V\n'
+            '    move p0,p1\n'
+            '    if-eqz p1, :v6\n'
+            '    return p0\n'
+            '.end method\n'
+        )
+        self.assertEqual(self.backend._parameter_register_listing(original, (6, 4)), expected)
+        self.assertEqual(self.backend._parameter_register_listing(original, None), original)
+        self.assertEqual(self.backend._parameter_register_listing(original, (10, 0)), original)
+
+    def test_parameter_prefills_and_validation_metadata(self):
+        options = self.options("move/from16 v7, v6", (10, 4))
+        destination = options["const literal"]["register"]
+        self.assertEqual(destination["value"], "p1")
+        self.assertEqual(destination["parameter_base"], 6)
+        self.assertEqual(destination["parameter_count"], 4)
+        registers = options["invoke-static"]["registers"]
+        self.assertEqual(registers["value"], "p1, p0")
+        self.assertEqual(registers["parameter_base"], 6)
+        self.assertNotIn("parameter_base", options["invoke-static"]["register_count"])
+        self.assertNotIn("parameter_base", options["invoke-static"]["method_index"])
+
+    def test_parameter_inputs_resolve_before_encoding_and_script_recording(self):
+        arguments = {"register": "p1", "source_register": "p003"}
+        normalized = self.backend._normalize_edit_register_arguments(arguments, (6, 4))
+        self.assertEqual(normalized, {"register": "v7", "source_register": "v9"})
+        instruction = self.backend._build_edit_instruction("move_from16", arguments, "after", (6, 4))
+        self.assertEqual(instruction.arguments, (7, 9))
+        script = self.backend._script_instruction("move_from16", normalized)
+        self.assertEqual(eval(script, {"DexInstruction": extension.DexInstruction}).arguments, (7, 9))
+        invoke = self.backend._build_edit_instruction(
+            "invoke_static", {"register_count": "3", "registers": "{p0, v2, 3}"}, "after", (6, 4)
+        )
+        self.assertEqual(invoke.arguments, (3, 0, [6, 2, 3]))
+        ranged = self.backend._build_edit_instruction(
+            "invoke_static_range", {"register_count": "2", "first_register": "p1"}, "after", (300, 3)
+        )
+        self.assertEqual(ranged.arguments, (2, 0, 301))
+
+    def test_invalid_parameter_inputs_and_encoding_limits(self):
+        for value, layout in (("p4", (6, 4)), ("p-1", (6, 4)), ("pp1", (6, 4)), ("p0x1", (6, 4)), ("p0", (4, 0)), ("p0", None)):
+            with self.subTest(value=value, layout=layout), self.assertRaises(RuntimeError):
+                self.backend._build_edit_instruction("return_value", {"register": value}, "after", layout)
+        # Aliases must still satisfy the selected instruction's operand width.
+        with self.assertRaises(RuntimeError):
+            self.backend._build_edit_instruction("instance_get", {"register": "p0"}, "after", (20, 2))
+        with self.assertRaises(RuntimeError):
+            self.backend._build_edit_instruction("invoke_static_range", {"register_count": "p1"}, "after", (6, 4))
+
+    def test_apply_edit_records_physical_registers_for_parameter_inputs(self):
+        self.options("move/from16 v7, v6", (10, 4))
+        option_id, option = next(
+            (object_id, option) for object_id, option in self.backend.objects.items()
+            if option.get("factory") == "move_from16"
+        )
+        method = self.backend.objects[option["method_id"]]["object"]
+        method.signature = lambda: "LExample;->method(J)V"
+        replacements = []
+        editor = types.SimpleNamespace(
+            label_after=lambda target: "after",
+            replace=lambda target, instructions: replacements.extend(instructions),
+            commit=lambda ao: method,
+        )
+        self.backend.ao.edit_method = lambda method: editor
+        self.backend.ao.get_history = lambda: []
+        self.backend.describe = lambda object_id: {}
+        result = self.backend.apply_edit(option_id, {"register": "p2", "source_register": "p0"})
+        self.assertEqual(replacements[0].arguments, (8, 6))
+        self.assertEqual(result["events"][-1]["arguments"], {"register": "v8", "source_register": "v6"})
 
 
 if __name__ == "__main__":

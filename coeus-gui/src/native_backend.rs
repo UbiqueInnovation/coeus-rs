@@ -47,8 +47,12 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 #[path = "native_lookup.rs"]
 mod lookup;
 
-use lookup::LookupIndex;
+#[cfg(test)]
+#[path = "native_edit_tests.rs"]
+mod edit_tests;
+
 use crate::edit_arguments;
+use lookup::LookupIndex;
 
 type BackendResult = Result<Value, String>;
 
@@ -335,7 +339,10 @@ impl NativeAnalysis {
         };
         let editable = if factory == "switch" {
             let register = edit_arguments::register_number(
-                typed_arguments.get("register").and_then(Value::as_str).unwrap_or("0"),
+                typed_arguments
+                    .get("register")
+                    .and_then(Value::as_str)
+                    .unwrap_or("0"),
                 u8::MAX as u32,
             )? as u8;
             let case_value = typed_arguments
@@ -401,7 +408,10 @@ impl NativeAnalysis {
             })
             .filter(|dex| dex.get_dex_name() == dex_name || dex.file_name == dex_name)
             .find_map(|file| {
-                let class = file.classes.iter().find(|class| class.class_name == class_name)?;
+                let class = file
+                    .classes
+                    .iter()
+                    .find(|class| class.class_name == class_name)?;
                 let data = class.codes.iter().find(|data| {
                     data.method.method_name == method_name
                         && data.method.proto_name.strip_prefix('(') == Some(prototype)
@@ -603,10 +613,60 @@ impl MethodObject {
             .collect()
     }
 
+    fn parameter_layout(&self) -> Option<(u32, u32)> {
+        let code = self.data.as_ref()?.code.as_ref()?;
+        Some((
+            code.register_size.checked_sub(code.ins_size)? as u32,
+            code.ins_size as u32,
+        ))
+    }
+
+    fn label_parameters(&self, text: &str) -> String {
+        match self.parameter_layout() {
+            Some((base, count)) => edit_arguments::parameter_labels(text, base, count),
+            None => text.to_string(),
+        }
+    }
+
+    fn normalize_edit_arguments(&self, arguments: &Value) -> Result<Value, String> {
+        let mut arguments = arguments.clone();
+        let (base, count) = self
+            .parameter_layout()
+            .map(|(base, count)| (Some(base), Some(count)))
+            .unwrap_or_default();
+        if let Some(values) = arguments.as_object_mut() {
+            for (name, value) in values {
+                let Some(raw) = value.as_str() else {
+                    continue;
+                };
+                if edit_arguments::is_register(name) && !raw.trim().is_empty() {
+                    *value =
+                        json!(
+                            edit_arguments::resolve_register(raw, u16::MAX as u32, base, count)?
+                                .to_string()
+                        );
+                } else if name == "registers" {
+                    let registers = raw
+                        .trim()
+                        .trim_matches(['{', '}'])
+                        .split(|ch: char| ch == ',' || ch.is_whitespace())
+                        .filter(|part| !part.is_empty())
+                        .map(|part| {
+                            edit_arguments::resolve_register(part, u16::MAX as u32, base, count)
+                                .map(|number| number.to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    *value = json!(registers.join(", "));
+                }
+            }
+        }
+        Ok(arguments)
+    }
+
     fn code(&self) -> String {
         self.data
             .as_ref()
-            .map(|data| data.get_disassembly(&self.file))
+            .map(|data| self.label_parameters(&data.get_disassembly(&self.file)))
             .unwrap_or_default()
     }
 }
@@ -802,7 +862,9 @@ impl RustBackend {
         let mut objects = HashMap::new();
         for key in ["id", "method_id"] {
             if let Some(id) = request.get(key).and_then(Value::as_str) {
-                if let Some(entry) = self.objects.get(id) { objects.insert(id.to_string(), entry.clone()); }
+                if let Some(entry) = self.objects.get(id) {
+                    objects.insert(id.to_string(), entry.clone());
+                }
             }
         }
         Self {
@@ -830,7 +892,9 @@ impl RustBackend {
     }
 
     fn merge_parallel(&mut self, worker: Self) {
-        if self.lookup_index.is_none() { self.lookup_index = worker.lookup_index; }
+        if self.lookup_index.is_none() {
+            self.lookup_index = worker.lookup_index;
+        }
         self.objects.extend(worker.objects);
         match (&mut self.session, worker.session) {
             (Some(Session::Single(current)), Some(Session::Single(worker))) => {
@@ -857,7 +921,15 @@ impl RustBackend {
             .get("op")
             .and_then(Value::as_str)
             .ok_or_else(|| "request has no operation".to_string())?;
-        if matches!(operation, "load" | "load_split" | "load_split_from_adb" | "load_project" | "apply_edit" | "replace_string") {
+        if matches!(
+            operation,
+            "load"
+                | "load_split"
+                | "load_split_from_adb"
+                | "load_project"
+                | "apply_edit"
+                | "replace_string"
+        ) {
             self.lookup_index = None;
         }
         self.navigation_ids.clear();
@@ -1533,7 +1605,9 @@ impl RustBackend {
 
     fn lookup_index(&mut self) -> Result<Arc<LookupIndex>, String> {
         if let Some(index) = &self.lookup_index {
-            if index.matches(&self.analysis()?.files) { return Ok(index.clone()); }
+            if index.matches(&self.analysis()?.files) {
+                return Ok(index.clone());
+            }
         }
         let index = Arc::new(LookupIndex::new(&self.analysis()?.files));
         self.lookup_index = Some(index.clone());
@@ -1546,8 +1620,13 @@ impl RustBackend {
         let index = object_index(&object);
         let dex = object_dex_name(&object);
         let key = format!("{kind}:{dex:?}:{index:?}:{label}");
-        let id = if let Some(id) = self.navigation_ids.get(&key) { id.clone() } else {
-            let id = self.store(ObjectEntry { object, evidence: None });
+        let id = if let Some(id) = self.navigation_ids.get(&key) {
+            id.clone()
+        } else {
+            let id = self.store(ObjectEntry {
+                object,
+                evidence: None,
+            });
             self.navigation_ids.insert(key, id.clone());
             id
         };
@@ -1995,6 +2074,10 @@ impl RustBackend {
         };
 
         let lines = code.lines().collect::<Vec<_>>();
+        let mut displayed_lines = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
         let mut line_method_ids = vec![None; lines.len()];
         let mut line_method_keys = vec![None; lines.len()];
         let mut target_cache = HashMap::new();
@@ -2035,6 +2118,11 @@ impl RustBackend {
             };
             let start = search_from + relative_start;
             let method = method_object(&file, &method_data.method);
+            if let Some(method) = &method {
+                for (offset, line) in method_lines.iter().enumerate() {
+                    displayed_lines[start + offset] = method.label_parameters(line);
+                }
+            }
             let method_key = method.as_ref().map(MethodObject::signature);
             let method_id = method.map(|method| {
                 self.store(ObjectEntry {
@@ -2058,7 +2146,16 @@ impl RustBackend {
             }
             search_from = start + method_lines.len();
         }
-        Ok((code, line_method_ids, line_method_keys, line_targets))
+        let mut displayed_code = displayed_lines.join("\n");
+        if code.ends_with('\n') {
+            displayed_code.push('\n');
+        }
+        Ok((
+            displayed_code,
+            line_method_ids,
+            line_method_keys,
+            line_targets,
+        ))
     }
 
     fn instructions_json(&mut self, method: &MethodObject) -> Result<Vec<Value>, String> {
@@ -2074,7 +2171,7 @@ impl RustBackend {
             .instructions()
             .into_iter()
             .map(|instruction| {
-                let text = instruction_text(&instruction, &method.file);
+                let text = method.label_parameters(&instruction_text(&instruction, &method.file));
                 let targets = self.instruction_targets_cached(&text, cache)?;
                 Ok(json!({
                     "offset": instruction.offset,
@@ -2200,7 +2297,9 @@ impl RustBackend {
         let label = expected.as_deref().unwrap_or(&query);
         if let Some(object) = self.lookup_index()?.find(kind, label) {
             let key = (object_kind(&object), object_label(&object));
-            if seen.insert(key) { targets.push(self.navigation_target(object)); }
+            if seen.insert(key) {
+                targets.push(self.navigation_target(object));
+            }
         }
         Ok(())
     }
@@ -2241,7 +2340,11 @@ impl RustBackend {
         if let NativeObject::Method(method) = self.listing_object(&self.entry(&id)?.object) {
             let callers = self.lookup_index()?.callers(&method);
             let count = callers.len();
-            let results = callers.into_iter().take(MAX_RESULTS).map(|object| self.navigation_target(object)).collect::<Vec<_>>();
+            let results = callers
+                .into_iter()
+                .take(MAX_RESULTS)
+                .map(|object| self.navigation_target(object))
+                .collect::<Vec<_>>();
             return Ok(json!({"results": results, "count": count}));
         }
         let entry = self.entry(&id)?;
@@ -2442,9 +2545,7 @@ impl RustBackend {
         // its target is defined in a different DEX.
         let method_index = invoke_method_index(&target.instruction).unwrap_or(0) as u32;
         let field_index = field_instruction_index(&target.instruction).unwrap_or(0) as u32;
-        let destination = edit_arguments::destination_register(
-            target_text.split_whitespace().next().unwrap_or_default(), &target_text,
-        );
+        let destination = target.instruction.destination_register().map(u32::from);
         let integer = |name: &str, label: &str, value: u32| json!({"name": name, "label": label, "kind": "integer", "value": value.to_string()});
         let text = |name: &str, label: &str, value: &str| json!({"name": name, "label": label, "kind": "text", "value": value});
         let picker = |name: &str, label: &str, value: u32, kind: &str| json!({"name": name, "label": label, "kind": "integer", "value": value.to_string(), "picker": kind});
@@ -2723,7 +2824,23 @@ impl RustBackend {
                     } else {
                         value_string(argument, "value").parse::<u32>().unwrap_or(0)
                     };
-                    argument["value"] = json!(format!("v{value}"));
+                    argument["value"] = json!(match method.parameter_layout() {
+                        Some((base, count)) => edit_arguments::register_label(value, base, count),
+                        None => format!("v{value}"),
+                    });
+                }
+                if edit_arguments::is_register(&name) || name == "registers" {
+                    if let Some((base, count)) = method.parameter_layout() {
+                        argument["parameter_base"] = json!(base);
+                        argument["parameter_count"] = json!(count);
+                        if name == "registers" {
+                            argument["value"] = json!(edit_arguments::parameter_labels(
+                                &value_string(argument, "value"),
+                                base,
+                                count
+                            ));
+                        }
+                    }
                 }
             }
             let spec = EditSpec {
@@ -2760,7 +2877,8 @@ impl RustBackend {
         let spec = spec.clone();
         if spec.emulation {
             let current = self.emulation_method(&spec.method_id)?;
-            let arguments = request.get("arguments").unwrap_or(&Value::Null);
+            let arguments = current
+                .normalize_edit_arguments(request.get("arguments").unwrap_or(&Value::Null))?;
             let mut scratch = self.analysis()?.clone();
             scratch.replace_loaded_dex(
                 current.file.get_dex_name(),
@@ -2771,7 +2889,7 @@ impl RustBackend {
                 spec.offset,
                 &spec.action,
                 &spec.factory,
-                arguments,
+                &arguments,
             )?;
             self.emulation_overlays
                 .insert(spec.method_id.clone(), edited);
@@ -2785,13 +2903,14 @@ impl RustBackend {
         let NativeObject::Method(method) = object else {
             return Err("edit target is not a method".to_string());
         };
-        let arguments = request.get("arguments").unwrap_or(&Value::Null);
+        let arguments =
+            method.normalize_edit_arguments(request.get("arguments").unwrap_or(&Value::Null))?;
         let edited = self.analysis_mut()?.edit_method(
             &method,
             spec.offset,
             &spec.action,
             &spec.factory,
-            arguments,
+            &arguments,
         )?;
         if let Some(entry) = self.objects.get_mut(&spec.method_id) {
             entry.object = NativeObject::Method(edited);
@@ -4151,20 +4270,34 @@ fn copy_debug_string_type(
 
 fn field_instruction_index(instruction: &Instruction) -> Option<u16> {
     match instruction {
-        Instruction::InstanceGet(_, _, index) | Instruction::InstanceGetWide(_, _, index)
-        | Instruction::InstanceGetObject(_, _, index) | Instruction::InstanceGetBoolean(_, _, index)
-        | Instruction::InstanceGetByte(_, _, index) | Instruction::InstanceGetChar(_, _, index)
-        | Instruction::InstanceGetShort(_, _, index) | Instruction::InstancePut(_, _, index)
-        | Instruction::InstancePutWide(_, _, index) | Instruction::InstancePutObject(_, _, index)
-        | Instruction::InstancePutBoolean(_, _, index) | Instruction::InstancePutByte(_, _, index)
-        | Instruction::InstancePutChar(_, _, index) | Instruction::InstancePutShort(_, _, index)
-        | Instruction::StaticGet(_, index) | Instruction::StaticGetWide(_, index)
-        | Instruction::StaticGetObject(_, index) | Instruction::StaticGetBoolean(_, index)
-        | Instruction::StaticGetByte(_, index) | Instruction::StaticGetChar(_, index)
-        | Instruction::StaticGetShort(_, index) | Instruction::StaticPut(_, index)
-        | Instruction::StaticPutWide(_, index) | Instruction::StaticPutObject(_, index)
-        | Instruction::StaticPutBoolean(_, index) | Instruction::StaticPutByte(_, index)
-        | Instruction::StaticPutChar(_, index) | Instruction::StaticPutShort(_, index) => Some(*index),
+        Instruction::InstanceGet(_, _, index)
+        | Instruction::InstanceGetWide(_, _, index)
+        | Instruction::InstanceGetObject(_, _, index)
+        | Instruction::InstanceGetBoolean(_, _, index)
+        | Instruction::InstanceGetByte(_, _, index)
+        | Instruction::InstanceGetChar(_, _, index)
+        | Instruction::InstanceGetShort(_, _, index)
+        | Instruction::InstancePut(_, _, index)
+        | Instruction::InstancePutWide(_, _, index)
+        | Instruction::InstancePutObject(_, _, index)
+        | Instruction::InstancePutBoolean(_, _, index)
+        | Instruction::InstancePutByte(_, _, index)
+        | Instruction::InstancePutChar(_, _, index)
+        | Instruction::InstancePutShort(_, _, index)
+        | Instruction::StaticGet(_, index)
+        | Instruction::StaticGetWide(_, index)
+        | Instruction::StaticGetObject(_, index)
+        | Instruction::StaticGetBoolean(_, index)
+        | Instruction::StaticGetByte(_, index)
+        | Instruction::StaticGetChar(_, index)
+        | Instruction::StaticGetShort(_, index)
+        | Instruction::StaticPut(_, index)
+        | Instruction::StaticPutWide(_, index)
+        | Instruction::StaticPutObject(_, index)
+        | Instruction::StaticPutBoolean(_, index)
+        | Instruction::StaticPutByte(_, index)
+        | Instruction::StaticPutChar(_, index)
+        | Instruction::StaticPutShort(_, index) => Some(*index),
         _ => None,
     }
 }
@@ -4378,7 +4511,10 @@ fn python_literal(value: &Value) -> String {
 }
 
 fn script_integer(arguments: &Value, name: &str, default: &str) -> String {
-    let value = arguments.get(name).and_then(Value::as_str).unwrap_or(default);
+    let value = arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or(default);
     if edit_arguments::is_register(name) {
         // Successful edits already validated the operand. Emit decimal so v3
         // and leading-zero forms replay identically in Python.
@@ -4386,7 +4522,10 @@ fn script_integer(arguments: &Value, name: &str, default: &str) -> String {
             return register.to_string();
         }
     }
-    format!("int({}, 0)", python_literal(&Value::String(value.to_string())))
+    format!(
+        "int({}, 0)",
+        python_literal(&Value::String(value.to_string()))
+    )
 }
 
 fn script_text(arguments: &Value, name: &str, default: &str) -> String {
@@ -4409,7 +4548,10 @@ fn script_instruction(factory: &str, arguments: &Value) -> Option<String> {
                 let raw = value.trim().trim_matches(['{', '}']);
                 match edit_arguments::register_number(raw, 15) {
                     Ok(register) => register.to_string(),
-                    Err(_) => format!("int({}, 0)", python_literal(&Value::String(raw.to_string()))),
+                    Err(_) => format!(
+                        "int({}, 0)",
+                        python_literal(&Value::String(raw.to_string()))
+                    ),
                 }
             })
             .collect::<Vec<_>>()
@@ -4822,7 +4964,8 @@ fn build_instruction(
             .filter(|part| !part.trim().is_empty())
             .map(|part| {
                 let part = part.trim().trim_matches(['{', '}']);
-                edit_arguments::register_number(part, 15).map(|register| register as u8)
+                edit_arguments::register_number(part, 15)
+                    .map(|register| register as u8)
                     .map_err(|error| format!("invalid invoke register {part:?}: {error}"))
             })
             .collect()
@@ -4844,6 +4987,13 @@ fn build_instruction(
         }
         Ok((count, method, registers))
     };
+    if factory.ends_with("_range") && factory.starts_with("invoke_") {
+        let first = integer("first_register", 0)?;
+        let count = register("register_count")? as u32;
+        if first + count > u16::MAX as u32 + 1 {
+            return Err("invoke register range exceeds v65535".to_string());
+        }
+    }
     Ok(match factory {
         "nop" => Instruction::Nop,
         "return_void" => Instruction::ReturnVoid,
@@ -5345,33 +5495,74 @@ mod tests {
     #[test]
     #[ignore = "manual workflow timing using an APK fixture"]
     fn gui_workflow_timings() {
-        let path = std::env::var("COEUS_BENCH_APK").unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/debugger_test/app-debug.apk").display().to_string());
+        let path = std::env::var("COEUS_BENCH_APK").unwrap_or_else(|_| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../examples/debugger_test/app-debug.apk")
+                .display()
+                .to_string()
+        });
         let backend = RustBackendHandle::new();
         backend.call(json!({"op":"load", "path":path})).unwrap();
-        let results = backend.call(json!({"op":"search", "kind":"methods", "query":"onCreate"})).unwrap();
+        let results = backend
+            .call(json!({"op":"search", "kind":"methods", "query":"onCreate"}))
+            .unwrap();
         let methods = results["results"].as_array().unwrap();
-        let method = methods.iter().find(|method| value_string(method, "label").contains("MainActivity;")).unwrap_or(&methods[0]);
+        let method = methods
+            .iter()
+            .find(|method| value_string(method, "label").contains("MainActivity;"))
+            .unwrap_or(&methods[0]);
         let id = value_string(method, "id");
         let started = std::time::Instant::now();
         let code = backend.call(json!({"op":"describe", "id":id})).unwrap();
-        eprintln!("method describe: {:?}; {} lines", started.elapsed(), value_string(&code, "code").lines().count());
+        eprintln!(
+            "method describe: {:?}; {} lines",
+            started.elapsed(),
+            value_string(&code, "code").lines().count()
+        );
         let started = std::time::Instant::now();
         let class_id = value_string(&code["class_target"], "id");
-        let class = backend.call(json!({"op":"describe", "id":class_id})).unwrap();
-        eprintln!("class describe: {:?}; {} lines", started.elapsed(), value_string(&class, "code").lines().count());
+        let class = backend
+            .call(json!({"op":"describe", "id":class_id}))
+            .unwrap();
+        eprintln!(
+            "class describe: {:?}; {} lines",
+            started.elapsed(),
+            value_string(&class, "code").lines().count()
+        );
         let started = std::time::Instant::now();
         let xrefs = backend.call(json!({"op":"xrefs", "id":id})).unwrap();
-        eprintln!("xrefs: {:?}; {} references", started.elapsed(), xrefs["count"]);
-        if let Some(offset) = code["instructions"].as_array().unwrap().first().and_then(|i| i["offset"].as_u64()) {
+        eprintln!(
+            "xrefs: {:?}; {} references",
+            started.elapsed(),
+            xrefs["count"]
+        );
+        if let Some(offset) = code["instructions"]
+            .as_array()
+            .unwrap()
+            .first()
+            .and_then(|i| i["offset"].as_u64())
+        {
             let started = std::time::Instant::now();
-            let options = backend.call(json!({"op":"edit_options", "id":id, "offset":offset})).unwrap();
+            let options = backend
+                .call(json!({"op":"edit_options", "id":id, "offset":offset}))
+                .unwrap();
             eprintln!("edit options: {:?}", started.elapsed());
-            let nop = options["options"].as_array().unwrap().iter().find(|o| o["label"] == "Replace with NOP").unwrap();
+            let nop = options["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["label"] == "Replace with NOP")
+                .unwrap();
             let started = std::time::Instant::now();
-            backend.call(json!({"op":"apply_edit", "id":nop["id"], "arguments":{}})).unwrap();
+            backend
+                .call(json!({"op":"apply_edit", "id":nop["id"], "arguments":{}}))
+                .unwrap();
             eprintln!("apply edit: {:?}", started.elapsed());
         }
-        eprintln!("retained objects: {}", backend.state.lock().unwrap().objects.len());
+        eprintln!(
+            "retained objects: {}",
+            backend.state.lock().unwrap().objects.len()
+        );
     }
 
     #[test]
@@ -5381,44 +5572,97 @@ mod tests {
             .join("../examples/cross-references/test-noproguard.apk");
         let mut backend = RustBackend::new();
         backend.load(path.to_string_lossy().into_owned()).unwrap();
-        let class = backend.analysis().unwrap().files.multi_dex.iter()
+        let class = backend
+            .analysis()
+            .unwrap()
+            .files
+            .multi_dex
+            .iter()
             .flat_map(|multi| std::iter::once(&multi.primary).chain(multi.secondary.iter()))
             .flat_map(|file| file.classes.iter().map(move |class| (file, class)))
             .find(|(_, class)| class.class_name.contains("MainActivity"))
-            .map(|(file, class)| ClassObject { class: class.clone(), file: file.clone() }).unwrap();
-        let class_id = value_string(&backend.navigation_target(NativeObject::Class(class.clone())), "id");
-        let method = class.class.codes.iter().max_by_key(|method| method.code.as_ref().map_or(0, |code| code.insns.len())).unwrap();
+            .map(|(file, class)| ClassObject {
+                class: class.clone(),
+                file: file.clone(),
+            })
+            .unwrap();
+        let class_id = value_string(
+            &backend.navigation_target(NativeObject::Class(class.clone())),
+            "id",
+        );
+        let method = class
+            .class
+            .codes
+            .iter()
+            .max_by_key(|method| method.code.as_ref().map_or(0, |code| code.insns.len()))
+            .unwrap();
         let method = method_object(&class.file, &method.method).unwrap();
-        let method_id = value_string(&backend.navigation_target(NativeObject::Method(method.clone())), "id");
+        let method_id = value_string(
+            &backend.navigation_target(NativeObject::Method(method.clone())),
+            "id",
+        );
         for (name, id) in [("class", class_id), ("method", method_id.clone())] {
             for run in 0..2 {
                 let start = std::time::Instant::now();
                 let description = backend.describe(id.clone()).unwrap();
-                eprintln!("BENCH {name} run={run} elapsed={:?} lines={} objects={}", start.elapsed(), description["code"].as_str().unwrap().lines().count(), backend.objects.len());
+                eprintln!(
+                    "BENCH {name} run={run} elapsed={:?} lines={} objects={}",
+                    start.elapsed(),
+                    description["code"].as_str().unwrap().lines().count(),
+                    backend.objects.len()
+                );
             }
         }
         for run in 0..2 {
             let start = std::time::Instant::now();
             let result = backend.cross_references(method_id.clone()).unwrap();
-            eprintln!("BENCH xrefs run={run} elapsed={:?} count={}", start.elapsed(), result["count"]);
+            eprintln!(
+                "BENCH xrefs run={run} elapsed={:?} count={}",
+                start.elapsed(),
+                result["count"]
+            );
         }
         let offset = method.instructions()[0].offset;
         let start = std::time::Instant::now();
-        backend.analysis().unwrap().method_by_identity(&method.signature(), method.file.get_dex_name()).unwrap();
+        backend
+            .analysis()
+            .unwrap()
+            .method_by_identity(&method.signature(), method.file.get_dex_name())
+            .unwrap();
         eprintln!("BENCH method_by_identity elapsed={:?}", start.elapsed());
         let start = std::time::Instant::now();
-        let edited_bytes = rewrite_method_code(&method.file, method.method.method_idx as u32, &[MethodEdit {
-            anchor: offset, position: EditPosition::Replace,
-            instructions: vec![EditableInstruction::Concrete(Instruction::Nop)],
-        }]).unwrap();
+        let edited_bytes = rewrite_method_code(
+            &method.file,
+            method.method.method_idx as u32,
+            &[MethodEdit {
+                anchor: offset,
+                position: EditPosition::Replace,
+                instructions: vec![EditableInstruction::Concrete(Instruction::Nop)],
+            }],
+        )
+        .unwrap();
         eprintln!("BENCH rewrite elapsed={:?}", start.elapsed());
         let start = std::time::Instant::now();
-        let _parsed = parse_dex_buf(method.file.get_dex_name(), &ArrayView::new(&edited_bytes), false).unwrap();
+        let _parsed = parse_dex_buf(
+            method.file.get_dex_name(),
+            &ArrayView::new(&edited_bytes),
+            false,
+        )
+        .unwrap();
         eprintln!("BENCH reparse elapsed={:?}", start.elapsed());
-        let options = backend.edit_options(&json!({"id": method_id, "offset": offset})).unwrap();
-        let option = options["options"].as_array().unwrap().iter().find(|option| option["label"] == "Replace with NOP").unwrap();
+        let options = backend
+            .edit_options(&json!({"id": method_id, "offset": offset}))
+            .unwrap();
+        let option = options["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["label"] == "Replace with NOP")
+            .unwrap();
         let start = std::time::Instant::now();
-        backend.apply_edit(&json!({"id": option["id"], "arguments": {}})).unwrap();
+        backend
+            .apply_edit(&json!({"id": option["id"], "arguments": {}}))
+            .unwrap();
         eprintln!("BENCH apply_edit elapsed={:?}", start.elapsed());
         let start = std::time::Instant::now();
         let _snapshot = backend.snapshot(&json!({"id": method_id}));
@@ -5439,21 +5683,43 @@ mod tests {
     fn read_snapshot_shares_apk_bytes_and_preserves_original_code_during_edits() {
         let mut backend = example_backend();
         let snapshot = backend.snapshot(&json!({"op": "history"}));
-        assert!(Arc::ptr_eq(&backend.analysis().unwrap().files, &snapshot.analysis().unwrap().files));
-        let file = backend.analysis().unwrap().files.multi_dex[0].primary.clone();
-        let method_data = file.classes.iter().flat_map(|class| &class.codes)
-            .find(|data| data.method.method_name == "doPrint").unwrap();
+        assert!(Arc::ptr_eq(
+            &backend.analysis().unwrap().files,
+            &snapshot.analysis().unwrap().files
+        ));
+        let file = backend.analysis().unwrap().files.multi_dex[0]
+            .primary
+            .clone();
+        let method_data = file
+            .classes
+            .iter()
+            .flat_map(|class| &class.codes)
+            .find(|data| data.method.method_name == "doPrint")
+            .unwrap();
         let method = method_object(&file, &method_data.method).unwrap();
         let offset = method.instructions()[0].offset;
         let before = method.code();
-        let edited = backend.analysis_mut().unwrap()
-            .edit_method(&method, offset, "insert_before", "insert_nop", &json!({})).unwrap();
+        let edited = backend
+            .analysis_mut()
+            .unwrap()
+            .edit_method(&method, offset, "insert_before", "nop", &json!({}))
+            .unwrap();
         assert_ne!(edited.code(), before);
-        let original = snapshot.analysis().unwrap()
-            .method_by_identity(&method.signature(), file.get_dex_name()).unwrap();
+        let original = snapshot
+            .analysis()
+            .unwrap()
+            .method_by_identity(&method.signature(), file.get_dex_name())
+            .unwrap();
         assert_eq!(original.code(), before);
-        assert!(!Arc::ptr_eq(&backend.analysis().unwrap().files, &snapshot.analysis().unwrap().files));
-        assert!(backend.analysis().unwrap().method_by_identity(&method.signature(), "absent.dex").is_none());
+        assert!(!Arc::ptr_eq(
+            &backend.analysis().unwrap().files,
+            &snapshot.analysis().unwrap().files
+        ));
+        assert!(backend
+            .analysis()
+            .unwrap()
+            .method_by_identity(&method.signature(), "absent.dex")
+            .is_none());
     }
 
     #[test]

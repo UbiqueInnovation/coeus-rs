@@ -56,6 +56,17 @@ collapsed. The Code / Edit tab separates **Disassembly** from **Edit instruction
 Browsing a class or method uses the full code area; the method editor attaches
 replacement nodes on the left. Right-click a function in a class listing and
 choose **Edit method**, or select a method and choose **Edit instructions**.
+Selecting a replacement opens its configuration in a popup with Apply and Cancel.
+Register fields accept `3`, `v3`, or an incoming argument alias such as `p0`;
+destination fields start with the selected instruction's destination when it
+has one. Listings use `p0`, `p1`, etc. for incoming registers: `p0` is
+`v(total registers - incoming registers)`. Instance methods include `this` as
+`p0`, and `long`/`double` arguments occupy two registers. Invalid register sizes are
+rejected instead of being truncated, and failed edits keep the entered values.
+
+The native backend indexes navigation targets and caches method cross-references
+per loaded DEX revision. Edits invalidate those lookups, while concurrent
+inspection requests share the loaded APK data.
 
 ## Workspace controls
 

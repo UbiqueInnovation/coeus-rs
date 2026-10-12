@@ -82,6 +82,17 @@ impl CoeusApp {
                             .small()
                             .color(theme::MUTED),
                     );
+                    if let Some((base, count)) = form.arguments.iter().find_map(|argument| {
+                        argument.parameter_base.zip(argument.parameter_count)
+                    }) {
+                        if count > 0 {
+                            ui.label(
+                                RichText::new(format!("Parameter names p0–p{} refer to the incoming register area. p0 is v{base}.", count - 1))
+                                    .small()
+                                    .color(theme::MUTED),
+                            );
+                        }
+                    }
                 }
                 let mut valid = true;
                 let mut submit = false;
@@ -109,7 +120,13 @@ impl CoeusApp {
                                                 } else {
                                                     220.0
                                                 })
-                                                .hint_text(if register { "3 or v3" } else { "" }),
+                                                .hint_text(if register {
+                                                    if argument.parameter_base.is_some() && argument.parameter_count.is_some_and(|count| count > 0) {
+                                                        "3, v3 or p0"
+                                                    } else {
+                                                        "3 or v3"
+                                                    }
+                                                } else { "" }),
                                         );
                                         submit |= response.lost_focus()
                                             && ui.input(|input| input.key_pressed(Key::Enter));
@@ -128,12 +145,20 @@ impl CoeusApp {
                                     if argument.kind == "register"
                                         || edit_arguments::is_register(&argument.name)
                                     {
-                                        if let Err(error) = edit_arguments::register_number(
+                                        match edit_arguments::resolve_register(
                                             &argument.value,
                                             u16::MAX as u32,
+                                            argument.parameter_base,
+                                            argument.parameter_count,
                                         ) {
-                                            valid = false;
-                                            ui.colored_label(theme::ERROR, error);
+                                            Ok(register) if argument.value.trim().starts_with('p') => {
+                                                ui.label(RichText::new(format!("Uses v{register}")).small().color(theme::MUTED));
+                                            }
+                                            Ok(_) => {}
+                                            Err(error) => {
+                                                valid = false;
+                                                ui.colored_label(theme::ERROR, error);
+                                            }
                                         }
                                     }
                                     ui.add_space(6.0);
