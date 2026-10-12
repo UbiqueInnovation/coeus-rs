@@ -14,9 +14,14 @@ use eframe::egui::{self, Color32, FontId, Key, Rect, RichText, Sense, Stroke, Ve
 use regex::Regex;
 use serde_json::{json, Value};
 
+mod disassembly;
 mod documentation;
 mod native_backend;
+mod search_ui;
+mod start_page;
 mod theme;
+#[cfg(test)]
+mod workspace_tests;
 use documentation::{DocumentationCodeSample, DocumentationState};
 use native_backend::RustBackendHandle;
 
@@ -145,7 +150,9 @@ impl Bridge {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Start,
     Search,
+    Xrefs,
     Notes,
     Documentation,
     Code,
@@ -159,6 +166,7 @@ enum Tab {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CodeViewTab {
     Source,
+    Edit,
     Emulation,
 }
 
@@ -221,40 +229,10 @@ struct NavigationTarget {
     note_key: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NavigationKind {
-    Automatic,
-    Class,
-    Method,
-    Field,
-    String,
-}
-
-impl NavigationKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Automatic => "Automatic",
-            Self::Class => "Class",
-            Self::Method => "Method",
-            Self::Field => "Field",
-            Self::String => "String",
-        }
-    }
-
-    fn matches(self, kind: &str) -> bool {
-        match self {
-            Self::Automatic => true,
-            Self::Class => kind == "class",
-            Self::Method => kind == "method",
-            Self::Field => kind == "field",
-            Self::String => kind == "string",
-        }
-    }
-}
-
 #[derive(Clone)]
 enum CodeAction {
     Navigate(NavigationTarget),
+    EditMethod(NavigationTarget),
     Emulate(NavigationTarget),
     EmulateWithStaticArguments {
         target: NavigationTarget,
@@ -262,7 +240,6 @@ enum CodeAction {
         offset: Option<u64>,
     },
     Xrefs(NavigationTarget),
-    EnclosingMethodXrefs,
     ToggleBreakpoint,
     EditNote(NavigationTarget),
 }
@@ -372,6 +349,10 @@ struct CodeState {
     lines: Vec<String>,
     line_method_ids: Vec<Option<String>>,
     line_method_keys: Vec<Option<String>>,
+    line_targets: Vec<Vec<NavigationTarget>>,
+    class_target: Option<NavigationTarget>,
+    collapsed_methods: HashSet<usize>,
+    code_reason: String,
     search_query: String,
     search_matches: Vec<usize>,
     search_index: usize,
@@ -404,6 +385,10 @@ impl Default for CodeState {
             lines: Vec::new(),
             line_method_ids: Vec::new(),
             line_method_keys: Vec::new(),
+            line_targets: Vec::new(),
+            class_target: None,
+            collapsed_methods: HashSet::new(),
+            code_reason: String::new(),
             search_query: String::new(),
             search_matches: Vec::new(),
             search_index: 0,
@@ -628,6 +613,7 @@ struct DeployState {
     alias: String,
     store_password: String,
     key_password: String,
+    show_passwords: bool,
     apksigner: String,
     adb_path: String,
     serial: String,
@@ -668,6 +654,7 @@ impl Default for DeployState {
             alias: "androiddebugkey".to_string(),
             store_password: String::new(),
             key_password: String::new(),
+            show_passwords: false,
             apksigner: String::new(),
             adb_path: String::new(),
             serial: String::new(),
@@ -717,6 +704,9 @@ struct CoeusApp {
     pending: Vec<PendingRequest>,
     next_request_id: u64,
     latest_view_request: u64,
+    latest_search_request: u64,
+    latest_xrefs_request: u64,
+    latest_edit_request: u64,
     tab: Tab,
     code_view_tab: CodeViewTab,
     path: String,
@@ -728,6 +718,10 @@ struct CoeusApp {
     selected_id: Option<String>,
     described_result: Option<ResultRow>,
     xrefs: Vec<ResultRow>,
+    xrefs_target: Option<ResultRow>,
+    xrefs_loaded: bool,
+    xrefs_error: Option<String>,
+    edit_after_describe: Option<String>,
     info: Option<Value>,
     session_history: Vec<String>,
     graph: GraphState,
@@ -741,7 +735,6 @@ struct CoeusApp {
     focus_search: bool,
     sidebar_collapsed: bool,
     instruction_pane_collapsed: bool,
-    navigation_kind: NavigationKind,
     navigation_history: Vec<NavigationEntry>,
     navigation_cursor: Option<usize>,
     navigation_replay: Option<String>,
@@ -802,7 +795,10 @@ impl CoeusApp {
                     pending: Vec::new(),
                     next_request_id: 0,
                     latest_view_request: 0,
-                    tab: Tab::Search,
+                    latest_search_request: 0,
+                    latest_xrefs_request: 0,
+                    latest_edit_request: 0,
+                    tab: Tab::Start,
                     code_view_tab: CodeViewTab::Source,
                     path: String::new(),
                     output_path: String::new(),
@@ -813,6 +809,10 @@ impl CoeusApp {
                     selected_id: None,
                     described_result: None,
                     xrefs: Vec::new(),
+                    xrefs_target: None,
+                    xrefs_loaded: false,
+                    xrefs_error: None,
+                    edit_after_describe: None,
                     info: None,
                     session_history: Vec::new(),
                     graph: GraphState::default(),
@@ -826,7 +826,6 @@ impl CoeusApp {
                     focus_search: false,
                     sidebar_collapsed: false,
                     instruction_pane_collapsed: false,
-                    navigation_kind: NavigationKind::Automatic,
                     navigation_history: Vec::new(),
                     navigation_cursor: None,
                     navigation_replay: None,
@@ -872,7 +871,10 @@ impl CoeusApp {
                 pending: Vec::new(),
                 next_request_id: 0,
                 latest_view_request: 0,
-                tab: Tab::Search,
+                latest_search_request: 0,
+                latest_xrefs_request: 0,
+                latest_edit_request: 0,
+                tab: Tab::Start,
                 code_view_tab: CodeViewTab::Source,
                 path: String::new(),
                 output_path: String::new(),
@@ -883,6 +885,10 @@ impl CoeusApp {
                 selected_id: None,
                 described_result: None,
                 xrefs: Vec::new(),
+                xrefs_target: None,
+                xrefs_loaded: false,
+                xrefs_error: None,
+                edit_after_describe: None,
                 info: None,
                 session_history: Vec::new(),
                 graph: GraphState::default(),
@@ -896,7 +902,6 @@ impl CoeusApp {
                 focus_search: false,
                 sidebar_collapsed: false,
                 instruction_pane_collapsed: false,
-                navigation_kind: NavigationKind::Automatic,
                 navigation_history: Vec::new(),
                 navigation_cursor: None,
                 navigation_replay: None,
@@ -980,10 +985,16 @@ impl CoeusApp {
             return None;
         }
         if source.starts_with("ADB:") {
-            return Some("coeus-session.coeus".to_string());
+            return Some(".".to_string());
         }
         let path = Path::new(source);
-        path.parent().map(|parent| parent.display().to_string())
+        path.parent().map(|parent| {
+            if parent.as_os_str().is_empty() {
+                ".".to_string()
+            } else {
+                parent.display().to_string()
+            }
+        })
     }
 
     fn request_generate_keystore(&mut self) {
@@ -998,12 +1009,6 @@ impl CoeusApp {
                 "op": "generate_keystore",
                 "directory": directory,
                 "alias": self.deploy.alias,
-                "store_password": self.deploy.store_password,
-                "key_password": if self.deploy.key_password.is_empty() {
-                    Value::Null
-                } else {
-                    Value::String(self.deploy.key_password.clone())
-                },
                 "filename": "debug.keystore",
             }),
         );
@@ -1159,10 +1164,15 @@ impl CoeusApp {
         }
         self.next_request_id = self.next_request_id.wrapping_add(1);
         let request_id = self.next_request_id;
-        if matches!(op, "describe" | "graph") {
+        if matches!(op, "describe" | "graph" | "resolve") {
             self.latest_view_request = request_id;
         }
         if op == "describe" {
+            if request.get("reload").and_then(Value::as_bool) == Some(true) {
+                // A class and its methods share underlying DEX data. Drop all
+                // descriptions so subsequent navigation also sees fresh data.
+                self.description_cache.clear();
+            }
             if let Some(id) = request.get("id").and_then(Value::as_str) {
                 if let Some(data) = self.description_cache.get(id).cloned() {
                     self.status = "Loaded disassembly from the GUI cache".to_string();
@@ -1176,10 +1186,17 @@ impl CoeusApp {
             return;
         };
         if op == "search" {
+            self.latest_search_request = request_id;
             self.submitted_search = request
                 .get("query")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+        }
+        if op == "xrefs" {
+            self.latest_xrefs_request = request_id;
+        }
+        if op == "edit_options" {
+            self.latest_edit_request = request_id;
         }
         let (sender, receiver) = mpsc::channel();
         let name = op.to_string();
@@ -1338,8 +1355,14 @@ impl CoeusApp {
         // response for an older view request so a slow disassembly cannot
         // switch the UI back to Code after a newer graph request completed
         // (and vice versa).
-        if matches!(operation.as_str(), "describe" | "graph")
+        if matches!(operation.as_str(), "describe" | "graph" | "resolve")
             && request_id != self.latest_view_request
+        {
+            return;
+        }
+        if (operation == "search" && request_id != self.latest_search_request)
+            || (operation == "xrefs" && request_id != self.latest_xrefs_request)
+            || (operation == "edit_options" && request_id != self.latest_edit_request)
         {
             return;
         }
@@ -1398,11 +1421,19 @@ impl CoeusApp {
                         self.documentation_preview_textures.clear();
                         self.documentation_completions.clear();
                         self.info = Some(data);
+                        self.latest_view_request = 0;
+                        self.latest_search_request = 0;
+                        self.latest_xrefs_request = 0;
+                        self.latest_edit_request = 0;
                         self.results.clear();
                         self.result_count = 0;
                         self.completed_search = None;
-                        self.tab = Tab::Search;
+                        self.tab = Tab::Start;
                         self.xrefs.clear();
+                        self.xrefs_target = None;
+                        self.xrefs_loaded = false;
+                        self.xrefs_error = None;
+                        self.edit_after_describe = None;
                         self.selected_id = None;
                         self.described_result = None;
                         self.code = CodeState::default();
@@ -1493,6 +1524,9 @@ impl CoeusApp {
                     }
                     "generate_keystore" => {
                         self.deploy.keystore = value_string(&data, "path");
+                        self.deploy.store_password = value_string(&data, "store_password");
+                        self.deploy.key_password = value_string(&data, "key_password");
+                        self.deploy.show_passwords = true;
                         self.status =
                             format!("Generated keystore at {}", value_string(&data, "path"));
                     }
@@ -1500,7 +1534,8 @@ impl CoeusApp {
                         let id = value_string(&data, "id");
                         if id.is_empty() {
                             self.pending_note_navigation = None;
-                            self.status = "Could not resolve the note location".to_string();
+                            self.status =
+                                "The class or member was not found in the loaded APK".to_string();
                         } else {
                             self.selected_id = Some(id.clone());
                             self.tab = Tab::Code;
@@ -1707,7 +1742,7 @@ impl CoeusApp {
                     }
                     "describe" => {
                         let id = value_string(&data, "id");
-                        if !id.is_empty() {
+                        if !id.is_empty() && description_is_cacheable(&data) {
                             self.description_cache.insert(id, data.clone());
                         }
                         self.apply_description(&data);
@@ -1751,6 +1786,7 @@ impl CoeusApp {
                     }
                     "xrefs" => {
                         self.xrefs = result_rows(&data);
+                        self.xrefs_loaded = true;
                         self.status = format!("Found {} cross-reference(s)", self.xrefs.len());
                     }
                     "edit_options" => {
@@ -2226,8 +2262,12 @@ impl CoeusApp {
                 }
             }
             Err(error) => {
+                if operation == "xrefs" {
+                    self.xrefs_error = Some(error.clone());
+                }
                 if operation == "describe" {
                     self.navigation_replay = None;
+                    self.edit_after_describe = None;
                 }
                 if matches!(operation.as_str(), "search" | "resolve" | "describe") {
                     self.pending_note_navigation = None;
@@ -2295,10 +2335,13 @@ impl CoeusApp {
     }
 
     fn apply_description(&mut self, data: &Value) {
+        self.latest_edit_request = 0;
         let id = value_string(data, "id");
         let kind = value_string(data, "kind");
         let code = value_string(data, "code");
         let label = value_string(data, "label");
+        let keep_editor = self.code_view_tab == CodeViewTab::Edit
+            && self.code.method_id.as_deref() == Some(id.as_str());
         // A stopped frame requests its method description asynchronously. A
         // later description response must not clear the execution marker that
         // was set when the frame arrived; ordinary navigation still resets it.
@@ -2330,6 +2373,7 @@ impl CoeusApp {
             ..result
         };
         self.described_result = Some(result.clone());
+        self.selected_id = Some(id.clone());
         self.record_navigation(result);
         if kind == "string" {
             let value = value_string(data, "value");
@@ -2377,6 +2421,30 @@ impl CoeusApp {
                     .collect()
             })
             .unwrap_or_default();
+        self.code.line_targets = data
+            .get("line_targets")
+            .and_then(Value::as_array)
+            .map(|lines| {
+                lines
+                    .iter()
+                    .map(|line| {
+                        line.as_array()
+                            .map(|targets| {
+                                targets
+                                    .iter()
+                                    .filter_map(navigation_target_from_json)
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.code.class_target = data
+            .get("class_target")
+            .and_then(navigation_target_from_json);
+        self.code.collapsed_methods.clear();
+        self.code.code_reason = value_string(data, "code_reason");
         self.code.highlighted_offset = debug_highlight.and_then(|(offset, _)| offset);
         self.code.highlight_scroll_pending =
             debug_highlight.map(|(_, pending)| pending).unwrap_or(false);
@@ -2445,10 +2513,14 @@ impl CoeusApp {
         self.code.edit_dex_name.clear();
         self.code.edit_available = false;
         self.code.edit_reason = "Loading instruction nodes…".to_string();
-        self.tab = if kind == "string" {
-            Tab::Search
+        self.tab = Tab::Code;
+        self.code_view_tab = if (self.edit_after_describe.take().as_deref() == Some(id.as_str())
+            || keep_editor)
+            && kind == "method"
+        {
+            CodeViewTab::Edit
         } else {
-            Tab::Code
+            CodeViewTab::Source
         };
         if kind == "method" {
             if let (Some(method_id), Some(offset)) =
@@ -2622,33 +2694,6 @@ impl CoeusApp {
             "debug_set_value",
             json!({"op":"debug_set_value", "slot":slot, "value":value}),
         );
-    }
-
-    fn selected_result(&self) -> Option<ResultRow> {
-        let id = self.selected_id.as_ref()?;
-        if let Some(result) = &self.described_result {
-            if &result.id == id {
-                return Some(result.clone());
-            }
-        }
-        self.results
-            .iter()
-            .chain(self.xrefs.iter())
-            .find(|result| &result.id == id)
-            .cloned()
-    }
-
-    fn preferred_navigation_target(&self, offset: u64) -> Option<NavigationTarget> {
-        let instruction = self
-            .code
-            .instructions
-            .iter()
-            .find(|instruction| instruction.offset == offset)?;
-        instruction
-            .targets
-            .iter()
-            .find(|target| self.navigation_kind.matches(&target.kind))
-            .cloned()
     }
 
     fn open_note_editor(&mut self, target: &ResultRow) {
@@ -3876,7 +3921,7 @@ impl CoeusApp {
                 });
             }
             ui.add_space(8.0);
-            if ui.link("Browse apps on a connected device").clicked() {
+            if ui.link("Pull APK from device…").clicked() {
                 self.tab = Tab::Adb;
             }
         });
@@ -4137,6 +4182,14 @@ impl CoeusApp {
                 ui.separator();
                 ui.add_space(4.0);
                 theme::eyebrow(ui, "EXPLORE");
+                if self.tab == Tab::Search {
+                    ui.label("Search methods, classes, fields and strings in the workspace.");
+                    return;
+                }
+                if ui.button("Open full search").clicked() {
+                    self.tab = Tab::Search;
+                    self.focus_search = true;
+                }
                 ui.add_enabled_ui(self.info.is_some(), |ui| {
                     egui::ComboBox::from_id_salt("search-kind")
                         .width(ui.available_width())
@@ -4258,11 +4311,7 @@ impl CoeusApp {
                                 );
                             }
                             SearchAction::Xrefs(result) => {
-                                self.selected_id = Some(result.id.clone());
-                                self.request(
-                                    "xrefs",
-                                    json!({"op":"xrefs", "id":result.id}),
-                                );
+                                self.request_xrefs(result);
                             }
                             SearchAction::EditNote(result) => self.open_note_editor(&result),
                             SearchAction::EditAlias(result) => self.open_alias_editor(&result),
@@ -4400,7 +4449,9 @@ impl CoeusApp {
                     }
                     ui.separator();
                     for (tab, label) in [
+                        (Tab::Start, "Start"),
                         (Tab::Search, "Search"),
+                        (Tab::Xrefs, "Cross-references"),
                         (Tab::Notes, "Notes"),
                         (Tab::Documentation, "Documentation"),
                         (Tab::Code, "Code / Edit"),
@@ -4415,6 +4466,8 @@ impl CoeusApp {
                             .clicked()
                         {
                             self.tab = tab;
+                            self.latest_view_request = 0;
+                            self.pending_note_navigation = None;
                         }
                     }
                     if self.tab != Tab::Debugger
@@ -4431,162 +4484,6 @@ impl CoeusApp {
                     }
                 });
             });
-    }
-
-    fn show_search(&mut self, ui: &mut egui::Ui) {
-        theme::eyebrow(ui, "EXPLORE / INSPECT");
-        ui.heading("Search & cross-references");
-        ui.label(
-            RichText::new("Follow methods, classes and strings through your application.")
-                .color(theme::MUTED),
-        );
-        if self.selected_result().is_none() {
-            theme::empty_state(ui, "Find your starting point", "Search in the sidebar, then select a result to inspect its source. Right-click a result to find cross-references or add a note.");
-            ui.add_space(16.0);
-            ui.horizontal_wrapped(|ui| {
-                for (label, query, kind) in [
-                    (
-                        "Entry points",
-                        "onCreate|onStart|onResume",
-                        SearchKind::Methods,
-                    ),
-                    (
-                        "Cryptography",
-                        "encrypt|decrypt|Cipher",
-                        SearchKind::Methods,
-                    ),
-                    ("URLs", "https?://", SearchKind::Strings),
-                ] {
-                    if ui
-                        .add_enabled(!self.busy(), egui::Button::new(label))
-                        .clicked()
-                    {
-                        self.search = query.to_string();
-                        self.search_kind = kind;
-                        self.sidebar_collapsed = false;
-                        self.request(
-                            "search",
-                            json!({"op":"search", "kind":kind.api_name(), "query":query}),
-                        );
-                    }
-                }
-            });
-        }
-        let mut string_replacement = None;
-        if let Some(result) = self.selected_result() {
-            let display_label = self.display_label(&result.kind, &result.label);
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::Label::new(RichText::new(&display_label).strong().monospace()).truncate(),
-                );
-                self.show_note_chip(ui, &result.kind, &result.note_key, &display_label);
-                if !result.note_key.is_empty()
-                    && ui
-                        .button(if self.notes.contains_key(&result.note_key) {
-                            "Edit note"
-                        } else {
-                            "Add note"
-                        })
-                        .clicked()
-                {
-                    self.open_note_editor(&result);
-                }
-                if matches!(result.kind.as_str(), "method" | "class")
-                    && ui
-                        .button(if self.alias_for(&result.kind, &result.label).is_some() {
-                            "Edit alias"
-                        } else {
-                            "Assign alias"
-                        })
-                        .clicked()
-                {
-                    self.open_alias_editor(&result);
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Open code").clicked() {
-                    self.request("describe", json!({"op":"describe", "id":result.id}));
-                }
-                if ui.button("Find xrefs").clicked() {
-                    self.request("xrefs", json!({"op":"xrefs", "id":result.id}));
-                }
-            });
-            if result.kind == "string" && self.string_editor.id.as_ref() == Some(&result.id) {
-                ui.collapsing("String pool editor", |ui| {
-                    ui.label(
-                        "This replaces the DEX string-pool entry and updates all references to it.",
-                    );
-                    ui.label(
-                        RichText::new(format!("Original: {}", self.string_editor.original))
-                            .monospace()
-                            .small(),
-                    );
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.string_editor.replacement)
-                            .desired_rows(3)
-                            .desired_width(f32::INFINITY),
-                    );
-                    if ui.button("Apply string-pool replacement").clicked() {
-                        string_replacement =
-                            Some((result.id.clone(), self.string_editor.replacement.clone()));
-                    }
-                });
-            }
-        }
-        if let Some((id, value)) = string_replacement {
-            self.request(
-                "replace_string",
-                json!({"op":"replace_string", "id":id, "value":value}),
-            );
-        }
-        if !self.xrefs.is_empty() {
-            ui.separator();
-            ui.heading(format!("Cross-references ({})", self.xrefs.len()));
-            let mut picked = None;
-            egui::CollapsingHeader::new("References")
-                .default_open(true)
-                .show(ui, |ui| {
-                    for result in self.xrefs.clone() {
-                        let display_label = self.display_label(&result.kind, &result.label);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(
-                                    false,
-                                    RichText::new(&display_label).monospace().color(
-                                        if self.notes.contains_key(&result.note_key) {
-                                            Color32::from_rgb(255, 220, 125)
-                                        } else {
-                                            Color32::WHITE
-                                        },
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                picked = Some(result.clone());
-                            }
-                            self.show_note_chip(ui, &result.kind, &result.note_key, &display_label);
-                            if matches!(result.kind.as_str(), "method" | "class")
-                                && ui
-                                    .small_button(
-                                        if self.alias_for(&result.kind, &result.label).is_some() {
-                                            "alias"
-                                        } else {
-                                            "＋ alias"
-                                        },
-                                    )
-                                    .clicked()
-                            {
-                                self.open_alias_editor(&result);
-                            }
-                        });
-                    }
-                });
-            if let Some(result) = picked {
-                self.selected_id = Some(result.id.clone());
-                self.request("describe", json!({"op":"describe", "id":result.id}));
-            }
-        }
     }
 
     fn show_notes(&mut self, ui: &mut egui::Ui) {
@@ -5208,13 +5105,14 @@ impl CoeusApp {
         let has_method = self.code.method_id.is_some();
         let emulation_active =
             self.code_view_tab == CodeViewTab::Emulation && self.emulation_editor.is_some();
+        let editing = has_method && self.code_view_tab == CodeViewTab::Edit;
         let mut code_interaction = None;
         let mut chosen_edit: Option<EditRequest> = None;
 
         // Keep the edit nodes in a real side panel so they remain attached to
         // the code view while the source itself scrolls. This also lets the
         // panel use the complete height of the central work area.
-        if (has_method || emulation_active) && self.instruction_pane_collapsed {
+        if (editing || emulation_active) && self.instruction_pane_collapsed {
             egui::SidePanel::left("instruction-node-pane-collapsed")
                 .resizable(false)
                 .exact_width(36.0)
@@ -5227,7 +5125,7 @@ impl CoeusApp {
                         self.instruction_pane_collapsed = false;
                     }
                 });
-        } else if has_method || emulation_active {
+        } else if editing || emulation_active {
             egui::SidePanel::left("instruction-node-pane")
                 .resizable(true)
                 .default_width(340.0)
@@ -5260,24 +5158,69 @@ impl CoeusApp {
         }
 
         egui::CentralPanel::default().frame(theme::workspace()).show(ctx, |ui| {
-            theme::eyebrow(ui, "SOURCE / EDIT");
-            ui.heading(if self.code.kind == "class" { "Class source" } else { "Smali source" });
+            theme::eyebrow(ui, "CODE / EDIT");
+            ui.heading(if self.code.kind == "class" { "Class disassembly" } else if self.code.kind == "string" { "String" } else if editing { "Method editor" } else { "Disassembly" });
             if !self.code.title.is_empty() {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(&self.code.title)
-                            .monospace()
-                            .color(Color32::from_rgb(160, 210, 255)),
-                    )
-                    .wrap(),
-                );
+                ui.horizontal_wrapped(|ui| {
+                    if self.code.kind == "method" {
+                        if let Some(class) = self.code.class_target.clone() {
+                            if ui.link(RichText::new(self.display_label("class", &class.label)).monospace())
+                                .on_hover_text("Open the declaring class").clicked() {
+                                self.request("describe", json!({"op":"describe", "id":class.id}));
+                            }
+                            ui.label("→");
+                        }
+                    }
+                    let display = if self.code.kind == "method" {
+                        let member = self.code.title.split_once("->").map_or(self.code.title.as_str(), |(_, member)| member);
+                        disassembly::readable_line(&format!(".method {member}"))
+                            .trim_start_matches(".method ").to_string()
+                    } else { self.code.title.clone() };
+                    let title = ui.link(RichText::new(display).monospace())
+                        .on_hover_text("Show cross-references to this object");
+                    if title.clicked() {
+                        if let Some(target) = self.current_annotation_target() { self.request_xrefs(target); }
+                    }
+                    title.context_menu(|ui| {
+                        if ui.button("Cross-references").clicked() {
+                            if let Some(target) = self.current_annotation_target() { self.request_xrefs(target); }
+                            ui.close_menu();
+                        }
+                    });
+                });
             }
-            self.show_code_view_tabs(ui);
+            if self.code.kind != "string" { self.show_code_view_tabs(ui); }
             if emulation_active {
                 self.show_emulation_code_panel(ui);
                 return;
             }
             ui.horizontal_wrapped(|ui| {
+                if let Some(target) = self.described_result.clone() {
+                    if ui.add_enabled(!self.busy(), egui::Button::new("Reload code"))
+                        .on_hover_text("Discard cached disassembly and load this object again").clicked() {
+                        self.request("describe", json!({"op":"describe", "id":target.id, "reload":true}));
+                    }
+                    if ui.button("Cross-references").clicked() { self.request_xrefs(target); }
+                }
+                if let Some(class) = self.code.class_target.clone() {
+                    if ui.button("Open class").clicked() {
+                        self.request("describe", json!({"op":"describe", "id":class.id}));
+                    }
+                }
+                if self.code.kind == "class" {
+                    if ui.button("Collapse methods").clicked() {
+                        self.code.collapsed_methods = self.code.lines.iter().enumerate()
+                            .filter(|(_, line)| line.trim_start().starts_with(".method "))
+                            .map(|(index, _)| index).collect();
+                    }
+                    if ui.button("Expand methods").clicked() { self.code.collapsed_methods.clear(); }
+                    if let Some(id) = self.code.selected_method_id.clone() {
+                        if ui.button("Edit selected method").clicked() {
+                            self.edit_after_describe = Some(id.clone());
+                            self.request("describe", json!({"op":"describe", "id":id}));
+                        }
+                    }
+                }
                 if let Some(target) = self.current_annotation_target() {
                     let display_label = self.display_label(&target.kind, &target.label);
                     self.show_note_chip(
@@ -5325,7 +5268,7 @@ impl CoeusApp {
                     }
                 }
                 if ui
-                    .add_enabled(has_method, egui::Button::new(if self.instruction_pane_collapsed {
+                    .add_enabled(editing, egui::Button::new(if self.instruction_pane_collapsed {
                         "Show nodes"
                     } else {
                         "Hide nodes"
@@ -5342,11 +5285,15 @@ impl CoeusApp {
             });
             ui.label(
                 RichText::new(
-                    "Inspection is syntax-highlighted. Select an instruction to see typed method-change nodes.",
+                    if editing { "Select an instruction to edit it with the replacement controls." }
+                    else { "Click a class or member name to navigate. Click a function declaration for cross-references; right-click for more actions." },
                 )
                 .small()
                 .color(theme::MUTED),
             );
+            if !self.code.code_reason.is_empty() {
+                ui.label(RichText::new(&self.code.code_reason).color(theme::WARNING));
+            }
             ui.horizontal_wrapped(|ui| {
                 ui.label("Find in code");
                 let changed = ui
@@ -5399,24 +5346,14 @@ impl CoeusApp {
             });
             ui.add_space(6.0);
 
-            if has_method {
-                ui.horizontal(|ui| {
-                    ui.label("Command-click / right-click navigation target:");
-                    egui::ComboBox::from_id_salt("code-navigation-kind")
-                        .selected_text(self.navigation_kind.label())
-                        .show_ui(ui, |ui| {
-                            for kind in [
-                                NavigationKind::Automatic,
-                                NavigationKind::Class,
-                                NavigationKind::Method,
-                                NavigationKind::Field,
-                                NavigationKind::String,
-                            ] {
-                                ui.selectable_value(&mut self.navigation_kind, kind, kind.label());
-                            }
-                        });
-                });
-                ui.add_space(4.0);
+            if self.code.kind == "string" {
+                self.show_string_editor(ui);
+            } else if self.code.lines.is_empty() && self.described_result.is_some() {
+                let reason = if self.code.code_reason.is_empty() {
+                    "This object has no decoded instructions. It may be abstract, native, or supplied by another APK. Use Reload code to retry.".to_string()
+                } else { self.code.code_reason.clone() };
+                theme::empty_state(ui, "No disassembly available", &reason);
+            } else if has_method {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("smali (read-only)")
@@ -5441,7 +5378,7 @@ impl CoeusApp {
                         code_interaction = self.render_code_lines(ui);
                     },
                 );
-            } else if self.code.kind == "class" && !self.code.lines.is_empty() {
+            } else if !self.code.lines.is_empty() {
                 ui.label(
                     RichText::new("class source (read-only)")
                         .small()
@@ -5458,6 +5395,7 @@ impl CoeusApp {
             } else {
                 theme::empty_state(ui, "Select a method or class", "Open a search result to inspect its decoded source. Method instructions can be selected to reveal available edits.");
                 if ui.button("Focus search").clicked() {
+                    self.tab = Tab::Search;
                     self.sidebar_collapsed = false;
                     self.focus_search = true;
                 }
@@ -5465,11 +5403,19 @@ impl CoeusApp {
         });
 
         if let Some(interaction) = code_interaction {
-            self.code.selected_offset = Some(interaction.offset);
-            self.code.selected_method_id = interaction.method_id.clone();
+            if interaction.action.is_none()
+                || matches!(&interaction.action, Some(CodeAction::ToggleBreakpoint))
+            {
+                self.code.selected_offset = Some(interaction.offset);
+                self.code.selected_method_id = interaction.method_id.clone();
+            }
             match interaction.action {
                 Some(CodeAction::Navigate(target)) => {
                     self.selected_id = Some(target.id.clone());
+                    self.request("describe", json!({"op":"describe", "id":target.id}));
+                }
+                Some(CodeAction::EditMethod(target)) => {
+                    self.edit_after_describe = Some(target.id.clone());
                     self.request("describe", json!({"op":"describe", "id":target.id}));
                 }
                 Some(CodeAction::Emulate(target)) => {
@@ -5489,12 +5435,7 @@ impl CoeusApp {
                     );
                 }
                 Some(CodeAction::Xrefs(target)) => {
-                    self.request("xrefs", json!({"op":"xrefs", "id":target.id}));
-                }
-                Some(CodeAction::EnclosingMethodXrefs) => {
-                    if let Some(method_id) = self.code.method_id.clone() {
-                        self.request("xrefs", json!({"op":"xrefs", "id":method_id}));
-                    }
+                    self.request_target_xrefs(target);
                 }
                 Some(CodeAction::ToggleBreakpoint) => {
                     if let Some(method_id) = interaction
@@ -5535,7 +5476,12 @@ impl CoeusApp {
     fn show_code_view_tabs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("CODE VIEW").small().strong().color(theme::MUTED));
-            ui.selectable_value(&mut self.code_view_tab, CodeViewTab::Source, "Source");
+            ui.selectable_value(&mut self.code_view_tab, CodeViewTab::Source, "Disassembly");
+            if self.code.method_id.is_some() {
+                ui.selectable_value(&mut self.code_view_tab, CodeViewTab::Edit, "Edit instructions");
+            } else if self.code.kind == "class" {
+                ui.label(RichText::new("Right-click a function → Edit method").small().color(theme::MUTED));
+            }
             if self.emulation_editor.is_some() {
                 ui.selectable_value(
                     &mut self.code_view_tab,
@@ -6320,15 +6266,53 @@ impl CoeusApp {
         let lines = self.code.lines.clone();
         let breakpoints = self.code.breakpoints.clone();
         let selected = self.code.selected_offset;
+        let selected_method_id = self
+            .code
+            .selected_method_id
+            .clone()
+            .or_else(|| self.code.method_id.clone());
         let highlighted = self.code.highlighted_offset;
+        let highlighted_method_id = self.code.method_id.clone().or_else(|| {
+            self.debug
+                .frame
+                .as_ref()
+                .map(|frame| value_string(frame, "method_id"))
+        });
         let should_scroll = self.code.highlight_scroll_pending;
         let annotated_line = self.code.annotated_line;
         let should_scroll_annotation = self.code.annotated_line_scroll_pending;
         let search_matches = self.code.search_matches.clone();
-        let search_index = self.code.search_index;
+        let current_search_line = search_matches.get(self.code.search_index).copied();
         let should_scroll_search = self.code.search_scroll_pending;
         let can_change_breakpoint =
             self.debug.connected && !self.busy() && !self.debug_breakpoint_pending();
+        let sections = disassembly::method_sections(&lines);
+        let mut section_for_line = vec![None; lines.len()];
+        for section in &sections {
+            for index in section.clone() {
+                section_for_line[index] = Some(section.start);
+            }
+            let reveal_search = should_scroll_search
+                && current_search_line.is_some_and(|index| section.contains(&index));
+            let reveal_note = should_scroll_annotation
+                && annotated_line.is_some_and(|index| section.contains(&index));
+            let reveal_execution = should_scroll
+                && highlighted.is_some()
+                && section.clone().any(|index| {
+                    let method_id = self
+                        .code
+                        .line_method_ids
+                        .get(index)
+                        .and_then(|id| id.as_ref())
+                        .or(self.code.method_id.as_ref());
+                    method_id.is_some()
+                        && method_id == highlighted_method_id.as_ref()
+                        && parse_code_offset(&lines[index]) == highlighted
+                });
+            if reveal_search || reveal_note || reveal_execution {
+                self.code.collapsed_methods.remove(&section.start);
+            }
+        }
         let mut interaction = None;
         let mut highlighted_visible = false;
         let mut annotated_visible = false;
@@ -6339,7 +6323,7 @@ impl CoeusApp {
             .corner_radius(8)
             .inner_margin(8)
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.spacing_mut().item_spacing.y = 3.0;
                 ui.spacing_mut().interact_size.y = 20.0;
                 ui.spacing_mut().button_padding = Vec2::new(4.0, 2.0);
                 egui::ScrollArea::both()
@@ -6348,49 +6332,93 @@ impl CoeusApp {
                     .show(ui, |ui| {
                         ui.vertical(|ui| {
                             for (index, line) in lines.iter().enumerate() {
-                                let disassembly_alias = self.disassembly_alias(line);
-                                let displayed_line = disassembly_alias
+                                let section = section_for_line[index];
+                                let is_method_header = section == Some(index);
+                                let is_collapsed = section
+                                    .is_some_and(|header| self.code.collapsed_methods.contains(&header));
+                                if is_collapsed && !is_method_header {
+                                    continue;
+                                }
+                                if is_method_header {
+                                    ui.add_space(10.0);
+                                    ui.separator();
+                                    ui.add_space(3.0);
+                                } else if line.trim_start().starts_with(".field ") {
+                                    ui.add_space(5.0);
+                                }
+                                let alias = self.disassembly_alias(line);
+                                let aliased_line = alias
                                     .as_ref()
                                     .map(|alias| alias.line.as_str())
                                     .unwrap_or(line.as_str());
-                                let alias_range =
-                                    disassembly_alias.as_ref().map(|alias| alias.range);
-                                let alias_hover = disassembly_alias
-                                    .as_ref()
-                                    .map(|alias| format!("Alias for {}", alias.canonical));
+                                let displayed_line = disassembly::readable_line(aliased_line);
+                                let alias_range = alias.as_ref().map(|alias| alias.range);
                                 let offset = parse_code_offset(line);
-                                let line_method_id = self
-                                    .code
-                                    .line_method_ids
-                                    .get(index)
-                                    .cloned()
-                                    .flatten()
-                                    .or_else(|| self.code.method_id.clone());
-                                let line_method_key = self
-                                    .code
-                                    .line_method_keys
-                                    .get(index)
-                                    .cloned()
-                                    .flatten()
-                                    .or_else(|| self.code.method_key.clone())
+                                let line_method_id = self.code.line_method_ids.get(index)
+                                    .cloned().flatten().or_else(|| self.code.method_id.clone());
+                                let line_method_key = self.code.line_method_keys.get(index)
+                                    .cloned().flatten().or_else(|| self.code.method_key.clone())
                                     .or_else(|| line_method_id.clone());
-                                let is_selected = offset.is_some() && offset == selected;
-                                let is_highlighted = offset.is_some() && offset == highlighted;
+                                let enclosing_method_target = line_method_id.clone().map(|id| {
+                                    let label = line_method_key.clone().unwrap_or_else(|| line.clone());
+                                    NavigationTarget {
+                                        id,
+                                        kind: "method".to_owned(),
+                                        note_key: alias_key("method", &label),
+                                        label,
+                                    }
+                                });
+                                let mut targets = self.code.line_targets.get(index).cloned().unwrap_or_default();
+                                // Older descriptions only exposed targets on method instructions.
+                                if targets.is_empty() && self.code.kind == "method" {
+                                    if let Some(offset) = offset {
+                                        targets = self.code.instructions.iter()
+                                            .find(|instruction| instruction.offset == offset)
+                                            .map(|instruction| instruction.targets.clone())
+                                            .unwrap_or_default();
+                                    }
+                                }
+                                if is_method_header {
+                                    if let Some(target) = enclosing_method_target.clone() {
+                                        if !targets.iter().any(|candidate| candidate.id == target.id) {
+                                            targets.push(target);
+                                        }
+                                    }
+                                }
+                                if line.trim_start().starts_with(".class ") {
+                                    if let Some(target) = self.code.class_target.clone() {
+                                        if !targets.iter().any(|candidate| candidate.id == target.id) {
+                                            targets.push(target);
+                                        }
+                                    }
+                                }
+                                let mut navigation_spans = Vec::new();
+                                for (target_index, target) in targets.iter().enumerate() {
+                                    for range in disassembly::navigation_ranges(
+                                        &displayed_line, &target.kind, &target.label,
+                                    ) {
+                                        navigation_spans.push((range, target_index));
+                                    }
+                                    if let Some(alias) = &alias {
+                                        if alias.canonical == target.label {
+                                            navigation_spans.push((alias.range.0..alias.range.1, target_index));
+                                        }
+                                    }
+                                }
+                                let is_selected = offset.is_some() && offset == selected
+                                    && line_method_id.is_some() && line_method_id == selected_method_id;
+                                let is_highlighted = offset.is_some() && offset == highlighted
+                                    && line_method_id.is_some() && line_method_id == highlighted_method_id;
                                 let is_annotated = annotated_line == Some(index);
                                 let is_search_match = search_matches.contains(&index);
-                                let is_current_search_match =
-                                    search_matches.get(search_index).copied() == Some(index);
+                                let is_current_search_match = current_search_line == Some(index);
                                 let line_note_key = self.code_line_note_key(index, line);
-                                let line_note_label =
-                                    format!("{} · line {}", self.code.title, index + 1);
+                                let line_note_label = format!("{} · line {}", self.code.title, index + 1);
                                 let has_line_note = self.notes.contains_key(&line_note_key);
                                 let can_toggle_breakpoint = can_change_breakpoint
-                                    && offset.is_some()
-                                    && line_method_id.is_some();
+                                    && offset.is_some() && line_method_id.is_some();
                                 let is_breakpoint = match (offset, line_method_key.as_ref()) {
-                                    (Some(offset), Some(method_key)) => {
-                                        breakpoints.contains(&(method_key.clone(), offset))
-                                    }
+                                    (Some(offset), Some(method_key)) => breakpoints.contains(&(method_key.clone(), offset)),
                                     _ => false,
                                 };
                                 let fill = if is_highlighted {
@@ -6403,14 +6431,14 @@ impl CoeusApp {
                                     Color32::from_rgb(36, 52, 38)
                                 } else if is_selected {
                                     Color32::from_rgb(30, 58, 82)
+                                } else if is_method_header {
+                                    Color32::from_rgb(25, 35, 46)
                                 } else {
                                     Color32::TRANSPARENT
                                 };
                                 let line_response = egui::Frame::NONE
                                     .fill(fill)
-                                    .stroke(if is_highlighted {
-                                        Stroke::new(1.0, theme::WARNING)
-                                    } else if is_annotated {
+                                    .stroke(if is_highlighted || is_annotated {
                                         Stroke::new(1.0, theme::WARNING)
                                     } else if is_current_search_match {
                                         Stroke::new(1.0, theme::SUCCESS)
@@ -6419,445 +6447,207 @@ impl CoeusApp {
                                     })
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            ui.add_sized(
-                                                [34.0, 20.0],
-                                                egui::Label::new(
-                                                    RichText::new(format!("{}", index + 1))
-                                                        .small()
-                                                        .color(if is_highlighted {
-                                                            theme::WARNING
-                                                        } else {
-                                                            theme::MUTED
-                                                        }),
-                                                ),
-                                            );
-                                            if let Some(offset) = offset {
-                                                let marker_response = ui.add_enabled(
-                                                    can_toggle_breakpoint,
-                                                    egui::Button::new("")
-                                                        .frame(false)
-                                                        .min_size(Vec2::new(22.0, 20.0)),
-                                                );
-                                                let marker_color = if is_breakpoint {
-                                                    theme::ERROR
-                                                } else {
-                                                    theme::MUTED
-                                                };
-                                                if is_breakpoint {
-                                                    ui.painter().circle_filled(
-                                                        marker_response.rect.center(),
-                                                        4.0,
-                                                        marker_color,
-                                                    );
-                                                } else {
-                                                    ui.painter().circle_stroke(
-                                                        marker_response.rect.center(),
-                                                        4.0,
-                                                        Stroke::new(1.0, marker_color),
-                                                    );
-                                                }
-                                                marker_response.widget_info(|| {
-                                                    egui::WidgetInfo::labeled(
-                                                        egui::WidgetType::Button,
-                                                        can_toggle_breakpoint,
-                                                        if is_breakpoint {
-                                                            "Clear breakpoint"
-                                                        } else {
-                                                            "Set breakpoint"
-                                                        },
-                                                    )
-                                                });
-                                                if marker_response
-                                            .on_hover_text(if can_toggle_breakpoint {
-                                                if is_breakpoint {
-                                                    "Clear breakpoint"
-                                                } else {
-                                                    "Set breakpoint"
-                                                }
-                                            } else if !self.debug.connected {
-                                                "Connect the debugger before changing breakpoints"
-                                            } else {
-                                                "This line is not associated with a method"
-                                            })
-                                            .clicked()
-                                        {
-                                            interaction = Some(CodeInteraction {
-                                                offset,
-                                                method_id: line_method_id.clone(),
-                                                action: Some(CodeAction::ToggleBreakpoint),
-                                            });
-                                        }
-                                                let mut response = ui.add(
-                                                    egui::Label::new(highlight_smali_with_alias(
-                                                        displayed_line,
-                                                        alias_range,
-                                                    ))
-                                                    .sense(Sense::click()),
-                                                );
-                                                if let Some(hover) = alias_hover.clone() {
-                                                    response = response.on_hover_text(hover);
-                                                }
-                                                if response.clicked() {
-                                                    let command_click =
-                                                        ui.input(|input| input.modifiers.command);
-                                                    let action = if command_click {
-                                                        self.preferred_navigation_target(offset)
-                                                            .map(CodeAction::Navigate)
-                                                    } else {
-                                                        None
-                                                    };
-                                                    interaction = Some(CodeInteraction {
-                                                        offset,
-                                                        method_id: line_method_id.clone(),
-                                                        action,
-                                                    });
-                                                }
-                                                if has_line_note {
-                                                    self.show_note_chip(
-                                                        ui,
-                                                        "code line",
-                                                        &line_note_key,
-                                                        &line_note_label,
-                                                    );
-                                                } else if ui
-                                                    .small_button("＋ note")
-                                                    .on_hover_text("Add a note to this line")
+                                            ui.add_sized([34.0, 20.0], egui::Label::new(
+                                                RichText::new(format!("{}", index + 1)).small()
+                                                    .color(if is_highlighted { theme::WARNING } else { theme::MUTED }),
+                                            ));
+                                            if is_method_header {
+                                                if ui.add_sized([22.0, 20.0], egui::Button::new(
+                                                    if is_collapsed { "▶" } else { "▼" },
+                                                ).frame(false))
+                                                    .on_hover_text(if is_collapsed { "Expand method" } else { "Collapse method" })
                                                     .clicked()
                                                 {
-                                                    self.open_code_line_note_editor(index, line);
+                                                    if is_collapsed {
+                                                        self.code.collapsed_methods.remove(&index);
+                                                    } else {
+                                                        self.code.collapsed_methods.insert(index);
+                                                    }
                                                 }
-                                                let targets = self
-                                                    .code
-                                                    .instructions
-                                                    .iter()
-                                                    .find(|instruction| {
-                                                        instruction.offset == offset
-                                                    })
-                                                    .map(|instruction| instruction.targets.clone())
-                                                    .unwrap_or_default();
-                                                let enclosing_method_target = line_method_id
-                                                    .clone()
-                                                    .map(|id| NavigationTarget {
-                                                        id,
-                                                        kind: "method".to_string(),
-                                                        label: line_method_key
-                                                            .clone()
-                                                            .unwrap_or_else(|| line.clone()),
-                                                        note_key: String::new(),
+                                            } else if let Some(offset) = offset {
+                                                let marker = ui.add_enabled(can_toggle_breakpoint,
+                                                    egui::Button::new("").frame(false).min_size(Vec2::new(22.0, 20.0)));
+                                                if is_breakpoint {
+                                                    ui.painter().circle_filled(marker.rect.center(), 4.0, theme::ERROR);
+                                                } else {
+                                                    ui.painter().circle_stroke(marker.rect.center(), 4.0, Stroke::new(1.0, theme::MUTED));
+                                                }
+                                                marker.widget_info(|| egui::WidgetInfo::labeled(
+                                                    egui::WidgetType::Button, can_toggle_breakpoint,
+                                                    if is_breakpoint { "Clear breakpoint" } else { "Set breakpoint" },
+                                                ));
+                                                if marker.on_hover_text(if can_toggle_breakpoint {
+                                                    if is_breakpoint { "Clear breakpoint" } else { "Set breakpoint" }
+                                                } else if !self.debug.connected {
+                                                    "Connect the debugger before changing breakpoints"
+                                                } else {
+                                                    "This line is not associated with a method"
+                                                }).clicked() {
+                                                    interaction = Some(CodeInteraction {
+                                                        offset, method_id: line_method_id.clone(),
+                                                        action: Some(CodeAction::ToggleBreakpoint),
                                                     });
-                                                response.context_menu(|ui| {
-                                                    if ui
-                                                        .button(if has_line_note {
-                                                            "Edit note for this line"
-                                                        } else {
-                                                            "Add note for this line"
-                                                        })
-                                                        .clicked()
-                                                    {
-                                                        self.open_code_line_note_editor(
-                                                            index, line,
-                                                        );
-                                                        ui.close_menu();
+                                                }
+                                            } else {
+                                                ui.allocate_space(Vec2::new(22.0, 20.0));
+                                            }
+                                            let job = highlight_smali_with_alias(&displayed_line, alias_range);
+                                            let galley = ui.fonts(|fonts| fonts.layout_job(job));
+                                            let (rect, mut response) = ui.allocate_exact_size(
+                                                galley.size().max(Vec2::new(0.0, 20.0)), Sense::click(),
+                                            );
+                                            let origin = egui::pos2(rect.min.x, rect.center().y - galley.size().y / 2.0);
+                                            ui.painter().galley(origin, galley.clone(), theme::TEXT);
+                                            let pointer = ui.input(|input| input.pointer.hover_pos());
+                                            let mut hovered_target = None;
+                                            for (range, target_index) in &navigation_spans {
+                                                let start = displayed_line[..range.start].chars().count();
+                                                let end = displayed_line[..range.end].chars().count();
+                                                let left = galley.pos_from_ccursor(egui::text::CCursor::new(start));
+                                                let right = galley.pos_from_ccursor(egui::text::CCursor::new(end));
+                                                let hit_rect = egui::Rect::from_min_max(
+                                                    origin + left.min.to_vec2(), origin + right.max.to_vec2(),
+                                                );
+                                                if response.hovered() && pointer.is_some_and(|point| hit_rect.contains(point)) {
+                                                    hovered_target = Some(targets[*target_index].clone());
+                                                    ui.painter().line_segment(
+                                                        [hit_rect.left_bottom(), hit_rect.right_bottom()],
+                                                        Stroke::new(1.0, theme::ACCENT),
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                            if let Some(target) = &hovered_target {
+                                                let label = self.display_label(&target.kind, &target.label);
+                                                response = response.on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                    .on_hover_text(if is_method_header && target.kind == "method" {
+                                                        format!("Cross references to {label}\nRight-click for method actions")
+                                                    } else {
+                                                        format!("Open {}: {label}\nRight-click for cross references", target.kind)
+                                                    });
+                                            } else if let Some(alias) = &alias {
+                                                response = response.on_hover_text(format!("Alias for {}", alias.canonical));
+                                            }
+                                            if response.clicked() {
+                                                let action = hovered_target.clone().map(|target| {
+                                                    if is_method_header && target.kind == "method" {
+                                                        CodeAction::Xrefs(target)
+                                                    } else {
+                                                        CodeAction::Navigate(target)
                                                     }
-                                                    if let Some(target) =
-                                                        enclosing_method_target.clone()
-                                                    {
-                                                        if ui
-                                                            .button("Open method disassembly")
-                                                            .clicked()
-                                                        {
-                                                            interaction = Some(CodeInteraction {
-                                                                offset,
-                                                                method_id: Some(target.id.clone()),
-                                                                action: Some(CodeAction::Navigate(
-                                                                    target.clone(),
-                                                                )),
-                                                            });
-                                                            ui.close_menu();
-                                                        }
-                                                        if ui
-                                                            .button("Emulate method")
-                                                            .clicked()
-                                                        {
-                                                            interaction = Some(CodeInteraction {
-                                                                offset,
-                                                                method_id: Some(target.id.clone()),
-                                                                action: Some(CodeAction::Emulate(
-                                                                    target.clone(),
-                                                                )),
-                                                            });
-                                                            ui.close_menu();
-                                                        }
-                                                        if ui
-                                                            .button("Emulate with static argument guesses")
-                                                            .clicked()
-                                                        {
-                                                            interaction = Some(CodeInteraction {
-                                                                offset,
-                                                                method_id: Some(target.id.clone()),
-                                                                action: Some(
-                                                                    CodeAction::EmulateWithStaticArguments {
-                                                                        target,
-                                                                        source_method_id: None,
-                                                                        offset: None,
-                                                                    },
-                                                                ),
-                                                            });
-                                                            ui.close_menu();
-                                                        }
-                                                    }
-                                                    ui.separator();
-                                                    if ui
-                                                        .button("Find xrefs for enclosing method")
-                                                        .clicked()
-                                                    {
+                                                });
+                                                if action.is_some() || offset.is_some() {
+                                                    interaction = Some(CodeInteraction {
+                                                        offset: offset.unwrap_or_default(),
+                                                        method_id: line_method_id.clone(), action,
+                                                    });
+                                                }
+                                            }
+                                            if is_collapsed {
+                                                let hidden_lines = sections.iter().find(|section| section.start == index)
+                                                    .map(|section| section.len().saturating_sub(1)).unwrap_or(0);
+                                                ui.label(RichText::new(format!("… {hidden_lines} lines")).small().color(theme::MUTED));
+                                            }
+                                            if has_line_note {
+                                                self.show_note_chip(ui, "code line", &line_note_key, &line_note_label);
+                                            } else if offset.is_some() && ui.small_button("＋ note")
+                                                .on_hover_text("Add a note to this line").clicked()
+                                            {
+                                                self.open_code_line_note_editor(index, line);
+                                            }
+                                            let mut menu_targets = targets.clone();
+                                            if let Some(target) = enclosing_method_target.clone() {
+                                                if !menu_targets.iter().any(|candidate| candidate.id == target.id) {
+                                                    menu_targets.push(target);
+                                                }
+                                            }
+                                            let context_target_id = ui.id().with(("code-context-target", &self.code.identity_title, index));
+                                            if response.secondary_clicked() {
+                                                ui.data_mut(|data| data.insert_temp(context_target_id, hovered_target.clone()));
+                                            }
+                                            let context_target = ui.data(|data| {
+                                                data.get_temp::<Option<NavigationTarget>>(context_target_id).flatten()
+                                            });
+                                            response.context_menu(|ui| {
+                                                // The pointer moves into the popup after opening it; retain the clicked symbol.
+                                                if let Some(target) = context_target.as_ref()
+                                                    .or_else(|| menu_targets.iter().find(|target| target.kind == "method"))
+                                                    .or_else(|| menu_targets.first())
+                                                {
+                                                    if ui.button("Cross references").clicked() {
                                                         interaction = Some(CodeInteraction {
-                                                            offset,
-                                                            method_id: line_method_id.clone(),
-                                                            action: Some(
-                                                                CodeAction::EnclosingMethodXrefs,
-                                                            ),
+                                                            offset: offset.unwrap_or_default(), method_id: line_method_id.clone(),
+                                                            action: Some(CodeAction::Xrefs(target.clone())),
                                                         });
                                                         ui.close_menu();
                                                     }
-                                                    if !targets.is_empty() {
-                                                        ui.separator();
-                                                        ui.label("Navigate to");
-                                                        for target in &targets {
-                                                            let display_label = self.display_label(
-                                                                &target.kind,
-                                                                &target.label,
-                                                            );
-                                                            if ui
-                                                                .button(format!(
-                                                                    "{}: {}",
-                                                                    target.kind,
-                                                                    shorten(&display_label, 46)
-                                                                ))
-                                                                .clicked()
-                                                            {
-                                                                interaction =
-                                                                    Some(CodeInteraction {
-                                                                        offset,
-                                                                        method_id: line_method_id
-                                                                            .clone(),
-                                                                        action: Some(
-                                                                            CodeAction::Navigate(
-                                                                                target.clone(),
-                                                                            ),
-                                                                        ),
-                                                                    });
-                                                                ui.close_menu();
-                                                            }
-                                                            if target.kind == "method" {
-                                                                if ui
-                                                                    .button(format!(
-                                                                        "Open method: {}",
-                                                                        shorten(&display_label, 42)
-                                                                    ))
-                                                                    .clicked()
-                                                                {
-                                                                    interaction =
-                                                                        Some(CodeInteraction {
-                                                                            offset,
-                                                                            method_id: line_method_id
-                                                                                .clone(),
-                                                                            action: Some(
-                                                                                CodeAction::Navigate(
-                                                                                    target.clone(),
-                                                                                ),
-                                                                            ),
-                                                                        });
-                                                                    ui.close_menu();
-                                                                }
-                                                                if ui
-                                                                    .button(format!(
-                                                                        "Emulate method: {}",
-                                                                        shorten(&display_label, 38)
-                                                                    ))
-                                                                    .clicked()
-                                                                {
-                                                                    interaction =
-                                                                        Some(CodeInteraction {
-                                                                            offset,
-                                                                            method_id: line_method_id
-                                                                                .clone(),
-                                                                            action: Some(
-                                                                                CodeAction::Emulate(
-                                                                                    target.clone(),
-                                                                                ),
-                                                                            ),
-                                                                        });
-                                                                    ui.close_menu();
-                                                                }
-                                                                if ui
-                                                                    .button(format!(
-                                                                        "Guess args and emulate: {}",
-                                                                        shorten(&display_label, 32)
-                                                                    ))
-                                                                    .clicked()
-                                                                {
-                                                                    interaction =
-                                                                        Some(CodeInteraction {
-                                                                            offset,
-                                                                            method_id: line_method_id
-                                                                                .clone(),
-                                                                            action: Some(
-                                                                                CodeAction::EmulateWithStaticArguments {
-                                                                                    target: target.clone(),
-                                                                                    source_method_id: line_method_id
-                                                                                        .clone(),
-                                                                                    offset: Some(offset),
-                                                                                },
-                                                                            ),
-                                                                        });
-                                                                    ui.close_menu();
-                                                                }
-                                                            }
+                                                }
+                                                if ui.button(if has_line_note { "Edit note for this line" } else { "Add note for this line" }).clicked() {
+                                                    self.open_code_line_note_editor(index, line);
+                                                    ui.close_menu();
+                                                }
+                                                for target in &menu_targets {
+                                                    ui.separator();
+                                                    let display_label = self.display_label(&target.kind, &target.label);
+                                                    ui.label(RichText::new(shorten(&display_label, 70)).small().color(theme::MUTED));
+                                                    let mut action = None;
+                                                    if ui.button(format!("Open {}", target.kind)).clicked() {
+                                                        action = Some(CodeAction::Navigate(target.clone()));
+                                                    }
+                                                    if target.kind == "method" {
+                                                        if ui.button("Edit method").clicked() {
+                                                            action = Some(CodeAction::EditMethod(target.clone()));
                                                         }
-                                                        ui.separator();
-                                                        ui.label("Find xrefs to");
-                                                        for target in &targets {
-                                                            let display_label = self.display_label(
-                                                                &target.kind,
-                                                                &target.label,
-                                                            );
-                                                            if ui
-                                                                .button(format!(
-                                                                    "{} xrefs: {}",
-                                                                    target.kind,
-                                                                    shorten(&display_label, 38)
-                                                                ))
-                                                                .clicked()
-                                                            {
-                                                                interaction =
-                                                                    Some(CodeInteraction {
-                                                                        offset,
-                                                                        method_id: line_method_id
-                                                                            .clone(),
-                                                                        action: Some(
-                                                                            CodeAction::Xrefs(
-                                                                                target.clone(),
-                                                                            ),
-                                                                        ),
-                                                                    });
-                                                                ui.close_menu();
-                                                            }
+                                                        if ui.button("Emulate method").clicked() {
+                                                            action = Some(CodeAction::Emulate(target.clone()));
                                                         }
-                                                        for target in &targets {
-                                                            let display_label = self.display_label(
-                                                                &target.kind,
-                                                                &target.label,
-                                                            );
-                                                            if !target.note_key.is_empty()
-                                                                && ui
-                                                                    .button(format!(
-                                                                        "{} note for {}",
-                                                                        if self.notes.contains_key(
-                                                                            &target.note_key
-                                                                        ) {
-                                                                            "Edit"
-                                                                        } else {
-                                                                            "Add"
-                                                                        },
-                                                                        shorten(&display_label, 38)
-                                                                    ))
-                                                                    .clicked()
-                                                            {
-                                                                interaction =
-                                                                    Some(CodeInteraction {
-                                                                        offset,
-                                                                        method_id: line_method_id
-                                                                            .clone(),
-                                                                        action: Some(
-                                                                            CodeAction::EditNote(
-                                                                                target.clone(),
-                                                                            ),
-                                                                        ),
-                                                                    });
-                                                                ui.close_menu();
-                                                            }
-                                                            if matches!(
-                                                                target.kind.as_str(),
-                                                                "method" | "class"
-                                                            ) && ui
-                                                                .button(
-                                                                    if self
-                                                                        .alias_for(
-                                                                            &target.kind,
-                                                                            &target.label,
-                                                                        )
-                                                                        .is_some()
-                                                                    {
-                                                                        format!(
-                                                                            "Edit alias for {}",
-                                                                            shorten(
-                                                                                &display_label,
-                                                                                32
-                                                                            )
-                                                                        )
-                                                                    } else {
-                                                                        format!(
-                                                                            "Assign alias to {}",
-                                                                            shorten(
-                                                                                &display_label,
-                                                                                30
-                                                                            )
-                                                                        )
-                                                                    },
-                                                                )
-                                                                .clicked()
-                                                            {
-                                                                self.open_alias_editor_target(
-                                                                    target,
-                                                                );
-                                                                ui.close_menu();
-                                                            }
+                                                        if ui.button("Guess arguments and emulate").clicked() {
+                                                            let is_enclosing = line_method_id.as_deref() == Some(target.id.as_str());
+                                                            action = Some(CodeAction::EmulateWithStaticArguments {
+                                                                target: target.clone(),
+                                                                source_method_id: if is_enclosing { None } else { line_method_id.clone() },
+                                                                offset: if is_enclosing { None } else { offset },
+                                                            });
                                                         }
                                                     }
-                                                });
-                                                for target in &targets {
-                                                    let display_label = self
-                                                        .display_label(&target.kind, &target.label);
-                                                    self.show_note_chip(
-                                                        ui,
-                                                        &target.kind,
-                                                        &target.note_key,
-                                                        &display_label,
-                                                    );
+                                                    if ui.button(format!("Cross references to this {}", target.kind)).clicked() {
+                                                        action = Some(CodeAction::Xrefs(target.clone()));
+                                                    }
+                                                    if !target.note_key.is_empty() && ui.button(
+                                                        if self.notes.contains_key(&target.note_key) { "Edit symbol note" } else { "Add symbol note" }
+                                                    ).clicked() {
+                                                        action = Some(CodeAction::EditNote(target.clone()));
+                                                    }
+                                                    if matches!(target.kind.as_str(), "method" | "class") && ui.button(
+                                                        if self.alias_for(&target.kind, &target.label).is_some() { "Edit alias" } else { "Assign alias" }
+                                                    ).clicked() {
+                                                        self.open_alias_editor_target(target);
+                                                        ui.close_menu();
+                                                    }
+                                                    if let Some(action) = action {
+                                                        interaction = Some(CodeInteraction {
+                                                            offset: offset.unwrap_or_default(), method_id: line_method_id.clone(), action: Some(action),
+                                                        });
+                                                        ui.close_menu();
+                                                    }
                                                 }
-                                            } else {
-                                                let response = ui.add(egui::Label::new(
-                                                    highlight_smali_with_alias(
-                                                        displayed_line,
-                                                        alias_range,
-                                                    ),
-                                                ));
-                                                if let Some(hover) = alias_hover {
-                                                    response.on_hover_text(hover);
-                                                }
+                                            });
+                                            for target in &targets {
+                                                let display_label = self.display_label(&target.kind, &target.label);
+                                                self.show_note_chip(ui, &target.kind, &target.note_key, &display_label);
                                             }
                                         });
                                     });
                                 if is_highlighted && should_scroll {
-                                    ui.scroll_to_rect(
-                                        line_response.response.rect,
-                                        Some(egui::Align::Center),
-                                    );
+                                    ui.scroll_to_rect(line_response.response.rect, Some(egui::Align::Center));
                                     highlighted_visible = true;
                                 }
                                 if is_annotated && should_scroll_annotation {
-                                    ui.scroll_to_rect(
-                                        line_response.response.rect,
-                                        Some(egui::Align::Center),
-                                    );
+                                    ui.scroll_to_rect(line_response.response.rect, Some(egui::Align::Center));
                                     annotated_visible = true;
                                 }
                                 if is_current_search_match && should_scroll_search {
-                                    ui.scroll_to_rect(
-                                        line_response.response.rect,
-                                        Some(egui::Align::Center),
-                                    );
+                                    ui.scroll_to_rect(line_response.response.rect, Some(egui::Align::Center));
                                     search_visible = true;
                                 }
                             }
@@ -8017,6 +7807,10 @@ impl CoeusApp {
             }
         });
         ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.deploy.show_passwords, "Show passwords");
+            if ui.button("Copy password").clicked() {
+                ui.ctx().copy_text(self.deploy.store_password.clone());
+            }
             ui.label("Alias");
             ui.add(
                 egui::TextEdit::singleline(&mut self.deploy.alias)
@@ -8030,7 +7824,7 @@ impl CoeusApp {
                     .min_size(Vec2::new(0.0, 30.0))
                     .margin(Vec2::new(8.0, 6.0))
                     .desired_width(180.0)
-                    .password(true),
+                    .password(!self.deploy.show_passwords),
             );
             ui.label("Key password");
             ui.add(
@@ -8038,7 +7832,7 @@ impl CoeusApp {
                     .min_size(Vec2::new(0.0, 30.0))
                     .margin(Vec2::new(8.0, 6.0))
                     .desired_width(180.0)
-                    .password(true),
+                    .password(!self.deploy.show_passwords),
             );
         });
         ui.horizontal_wrapped(|ui| {
@@ -8199,6 +7993,10 @@ impl CoeusApp {
             }
         });
         ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.deploy.show_passwords, "Show passwords");
+            if ui.button("Copy password").clicked() {
+                ui.ctx().copy_text(self.deploy.store_password.clone());
+            }
             ui.label("Alias");
             ui.add(
                 egui::TextEdit::singleline(&mut self.deploy.alias)
@@ -8212,7 +8010,7 @@ impl CoeusApp {
                     .min_size(Vec2::new(0.0, 30.0))
                     .margin(Vec2::new(8.0, 6.0))
                     .desired_width(180.0)
-                    .password(true),
+                    .password(!self.deploy.show_passwords),
             );
             ui.label("Key password");
             ui.add(
@@ -8220,7 +8018,7 @@ impl CoeusApp {
                     .min_size(Vec2::new(0.0, 30.0))
                     .margin(Vec2::new(8.0, 6.0))
                     .desired_width(180.0)
-                    .password(true),
+                    .password(!self.deploy.show_passwords),
             );
         });
         ui.horizontal_wrapped(|ui| {
@@ -8999,6 +8797,7 @@ impl eframe::App for CoeusApp {
             }
         }
         if find && self.info.is_some() {
+            self.tab = Tab::Search;
             self.sidebar_collapsed = false;
             self.focus_search = true;
         }
@@ -9052,7 +8851,7 @@ impl eframe::App for CoeusApp {
             egui::CentralPanel::default()
                 .frame(theme::workspace())
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| self.show_welcome(ui));
+                    egui::ScrollArea::vertical().show(ui, |ui| self.show_start(ui));
                 });
         } else if self.tab == Tab::Documentation {
             egui::CentralPanel::default()
@@ -9069,6 +8868,16 @@ impl eframe::App for CoeusApp {
             egui::CentralPanel::default()
                 .frame(theme::workspace())
                 .show(ctx, |ui| match self.tab {
+                    Tab::Start => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("start-tab")
+                            .show(ui, |ui| self.show_start(ui));
+                    }
+                    Tab::Xrefs => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("xrefs-tab")
+                            .show(ui, |ui| self.show_xrefs(ui));
+                    }
                     Tab::Search => {
                         egui::ScrollArea::both()
                             .id_salt("search-tab")
@@ -9372,6 +9181,36 @@ fn value_string(value: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+fn description_is_cacheable(data: &Value) -> bool {
+    if !value_string(data, "code_reason").is_empty() {
+        return false;
+    }
+    !matches!(
+        data.get("kind").and_then(Value::as_str),
+        Some("method" | "class")
+    ) || !value_string(data, "code").trim().is_empty()
+}
+
+fn navigation_target_from_json(data: &Value) -> Option<NavigationTarget> {
+    let id = value_string(data, "id");
+    if id.is_empty() {
+        return None;
+    }
+    let kind = value_string(data, "kind");
+    let label = value_string(data, "label");
+    let note_key = value_string(data, "note_key");
+    Some(NavigationTarget {
+        id,
+        note_key: if note_key.is_empty() {
+            annotation_key(&kind, &label)
+        } else {
+            note_key
+        },
+        kind,
+        label,
+    })
 }
 
 fn paint_navigation_arrow(

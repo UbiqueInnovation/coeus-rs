@@ -12,7 +12,7 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, LazyLock, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1448,8 +1448,73 @@ impl RustBackend {
             .ok_or_else(|| format!("unknown object: {id}"))
     }
 
+    /// Pool references can come from a different DEX than their definition.
+    /// Resolve against the current session every time a listing is requested,
+    /// so reloading also replaces wrappers made before a DEX was edited.
+    fn listing_object(&self, object: &NativeObject) -> NativeObject {
+        let Ok(analysis) = self.analysis() else {
+            return object.clone();
+        };
+        let class_name = match object {
+            NativeObject::Method(method) => &method.class.class_name,
+            NativeObject::Class(class) => &class.class.class_name,
+            _ => return object.clone(),
+        };
+        let definitions = analysis.files.multi_dex.iter().flat_map(|multi_dex| {
+            std::iter::once(&multi_dex.primary).chain(multi_dex.secondary.iter())
+        });
+        for file in definitions {
+            let Some(class) = file
+                .classes
+                .iter()
+                .find(|class| &class.class_name == class_name)
+            else {
+                continue;
+            };
+            match object {
+                NativeObject::Method(reference) => {
+                    if let Some(data) = class.codes.iter().find(|data| {
+                        data.method.method_name == reference.method.method_name
+                            && data.method.proto_name == reference.method.proto_name
+                    }) {
+                        return NativeObject::Method(MethodObject {
+                            method: data.method.clone(),
+                            data: Some(data.clone()),
+                            file: file.clone(),
+                            class: class.clone(),
+                        });
+                    }
+                }
+                NativeObject::Class(_) => {
+                    return NativeObject::Class(ClassObject {
+                        class: class.clone(),
+                        file: file.clone(),
+                    });
+                }
+                _ => unreachable!(),
+            }
+        }
+        object.clone()
+    }
+
+    fn navigation_target(&mut self, object: NativeObject) -> Value {
+        let kind = object_kind(&object);
+        let label = object_label(&object);
+        let index = object_index(&object);
+        let dex = object_dex_name(&object);
+        let id = self.store(ObjectEntry {
+            object,
+            evidence: None,
+        });
+        json!({"id": id, "kind": kind, "label": label, "index": index, "dex": dex})
+    }
+
     fn describe(&mut self, id: String) -> BackendResult {
-        let object = self.entry(&id)?.object.clone();
+        let object = self.listing_object(&self.entry(&id)?.object);
+        self.objects
+            .get_mut(&id)
+            .expect("object was checked")
+            .object = object.clone();
         let kind = object_kind(&object);
         let label = object_label(&object);
         let mut data = json!({"id": id, "kind": kind, "label": label});
@@ -1458,18 +1523,53 @@ impl RustBackend {
         }
         match &object {
             NativeObject::Method(method) => {
-                data["code"] = json!(method.code());
-                data["instructions"] = json!(self.instructions_json(&method)?);
+                let code = method.code();
+                let mut target_cache = HashMap::new();
+                let instructions = self.instructions_json_cached(method, &mut target_cache)?;
+                let mut line_targets = code
+                    .lines()
+                    .map(|line| self.instruction_targets_cached(line, &mut target_cache))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if let Some(declaration) = line_targets.first_mut() {
+                    declaration.push(json!({"id": id, "kind": "method", "label": label}));
+                }
+                data["code"] = json!(code);
+                data["line_targets"] = json!(line_targets);
+                data["instructions"] = json!(instructions);
                 data["class"] = json!(method.class.class_name);
                 data["method_key"] = json!(method.signature());
+                data["class_target"] = self.navigation_target(NativeObject::Class(ClassObject {
+                    class: method.class.clone(),
+                    file: method.file.clone(),
+                }));
+                if method
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.code.as_ref())
+                    .is_none()
+                {
+                    data["code_reason"] = json!(match method.data.as_ref() {
+                        Some(data) if data.access_flags.contains(AccessFlags::ABSTRACT) =>
+                            "This abstract method has no implementation in this class.",
+                        Some(data) if data.access_flags.contains(AccessFlags::NATIVE) =>
+                            "This native method is implemented in a native library, not DEX bytecode.",
+                        Some(_) => "This method declaration has no DEX instructions.",
+                        None => "No implementation was found in the loaded DEX files. This may be an external or inherited method.",
+                    });
+                }
             }
             NativeObject::Class(class) => {
-                let (code, line_method_ids, line_method_keys) =
+                let (code, line_method_ids, line_method_keys, line_targets) =
                     self.class_source_with_method_ids(class)?;
                 data["code"] = json!(code);
                 data["line_method_ids"] = json!(line_method_ids);
                 data["line_method_keys"] = json!(line_method_keys);
+                data["line_targets"] = json!(line_targets);
                 data["class"] = json!(class.class.class_name);
+                if code == "NO CLASS DEF FOUND" || code.is_empty() {
+                    data["code_reason"] =
+                        json!("No class definition was found in the loaded DEX files.");
+                }
             }
             NativeObject::FieldAccess(access) => {
                 if let Some(method) = method_from_location(&access.place) {
@@ -1813,7 +1913,15 @@ impl RustBackend {
     fn class_source_with_method_ids(
         &mut self,
         class: &ClassObject,
-    ) -> Result<(String, Vec<Option<String>>, Vec<Option<String>>), String> {
+    ) -> Result<
+        (
+            String,
+            Vec<Option<String>>,
+            Vec<Option<String>>,
+            Vec<Vec<Value>>,
+        ),
+        String,
+    > {
         let (source_class, file, code) = {
             let analysis = self.analysis()?;
             let Some(multi_dex) = analysis.files.multi_dex.iter().find(|multi_dex| {
@@ -1823,20 +1931,19 @@ impl RustBackend {
                         .iter()
                         .any(|dex| dex.identifier == class.file.identifier)
             }) else {
-                return Ok((String::new(), Vec::new(), Vec::new()));
+                return Ok((String::new(), Vec::new(), Vec::new(), Vec::new()));
             };
             let file = multi_dex
                 .dex_file_from_identifier(&class.file.identifier)
                 .unwrap_or_else(|| class.file.clone());
-            let source_class = if !class.class.codes.is_empty() {
-                class.class.clone()
+            let (file, source_class) = if class.class.class_data.is_some() {
+                (file, class.class.clone())
             } else {
                 multi_dex
                     .classes()
                     .into_iter()
                     .find(|(_, candidate)| candidate.class_name == class.class.class_name)
-                    .map(|(_, candidate)| candidate)
-                    .unwrap_or_else(|| class.class.clone())
+                    .unwrap_or_else(|| (file, class.class.clone()))
             };
             let code = source_class.get_disassembly(multi_dex);
             (source_class, file, code)
@@ -1845,6 +1952,29 @@ impl RustBackend {
         let lines = code.lines().collect::<Vec<_>>();
         let mut line_method_ids = vec![None; lines.len()];
         let mut line_method_keys = vec![None; lines.len()];
+        let mut target_cache = HashMap::new();
+        let mut line_targets = lines
+            .iter()
+            .map(|line| self.instruction_targets_cached(line, &mut target_cache))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (index, line) in lines.iter().enumerate() {
+            let Some(declaration) = line.trim().strip_prefix(".field ") else {
+                continue;
+            };
+            let Some(name) = declaration
+                .split_whitespace()
+                .find_map(|word| word.split_once(':').map(|(name, _)| name))
+            else {
+                continue;
+            };
+            if let Some(field) = file.fields.iter().find(|field| {
+                field.class_idx as u32 == source_class.class_idx && field.name == name
+            }) {
+                let target =
+                    self.navigation_target(NativeObject::Field(field_object(&file, field)));
+                line_targets[index].push(target);
+            }
+        }
         let mut search_from = 0usize;
         for method_data in &source_class.codes {
             let method_code = method_data.get_disassembly(&file);
@@ -1867,28 +1997,40 @@ impl RustBackend {
                     evidence: None,
                 })
             });
-            if let Some(method_id) = method_id {
+            if let Some(method_id) = &method_id {
                 for line_method_id in &mut line_method_ids[start..start + method_lines.len()] {
                     *line_method_id = Some(method_id.clone());
                 }
             }
-            if let Some(method_key) = method_key {
+            if let Some(method_key) = &method_key {
                 for line_method_key in &mut line_method_keys[start..start + method_lines.len()] {
                     *line_method_key = Some(method_key.clone());
                 }
             }
+            if let (Some(method_id), Some(method_key)) = (method_id, method_key) {
+                line_targets[start]
+                    .push(json!({"id": method_id, "kind": "method", "label": method_key}));
+            }
             search_from = start + method_lines.len();
         }
-        Ok((code, line_method_ids, line_method_keys))
+        Ok((code, line_method_ids, line_method_keys, line_targets))
     }
 
     fn instructions_json(&mut self, method: &MethodObject) -> Result<Vec<Value>, String> {
+        self.instructions_json_cached(method, &mut HashMap::new())
+    }
+
+    fn instructions_json_cached(
+        &mut self,
+        method: &MethodObject,
+        cache: &mut HashMap<String, Vec<Value>>,
+    ) -> Result<Vec<Value>, String> {
         method
             .instructions()
             .into_iter()
             .map(|instruction| {
                 let text = instruction_text(&instruction, &method.file);
-                let targets = self.instruction_targets(&text)?;
+                let targets = self.instruction_targets_cached(&text, cache)?;
                 Ok(json!({
                     "offset": instruction.offset,
                     "size": instruction.size,
@@ -1900,13 +2042,37 @@ impl RustBackend {
             .collect()
     }
 
+    fn instruction_targets_cached(
+        &mut self,
+        text: &str,
+        cache: &mut HashMap<String, Vec<Value>>,
+    ) -> Result<Vec<Value>, String> {
+        let text = text.trim();
+        let key = text
+            .rsplit_once(" #0x")
+            .filter(|(_, offset)| offset.chars().all(|ch| ch.is_ascii_hexdigit()))
+            .map_or(text, |(instruction, _)| instruction);
+        if let Some(targets) = cache.get(key) {
+            return Ok(targets.clone());
+        }
+        let targets = self.instruction_targets(key)?;
+        cache.insert(key.to_string(), targets.clone());
+        Ok(targets)
+    }
+
     fn instruction_targets(&mut self, text: &str) -> Result<Vec<Value>, String> {
         let mut targets = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let methods = Regex::new(r"(L[^\s,{}]+;->[^\s,{}(]+\([^)]*\)[^\s,{}]+)")
-            .expect("static method reference regex");
-        let fields = Regex::new(r"(L[^\s,{}]+;->[^\s,{}:]+:[^\s,{}]+)")
-            .expect("static field reference regex");
+        static METHODS: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(L[^\s,{}]+;->[^\s,{}(]+\([^)]*\)[^\s,{}]+)")
+                .expect("static method reference regex")
+        });
+        let methods = &*METHODS;
+        static FIELDS: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(L[^\s,{}]+;->[^\s,{}:]+:[^\s,{}]+)")
+                .expect("static field reference regex")
+        });
+        let fields = &*FIELDS;
         for reference in methods
             .captures_iter(text)
             .filter_map(|capture| capture.get(1).map(|value| value.as_str().to_string()))
@@ -1936,17 +2102,33 @@ impl RustBackend {
             self.add_reference_matches(
                 "fields",
                 field_name.to_string(),
-                Some(reference),
+                Some(
+                    reference
+                        .split(':')
+                        .next()
+                        .unwrap_or(&reference)
+                        .to_string(),
+                ),
                 &mut targets,
                 &mut seen,
             )?;
         }
-        let classes = Regex::new(r"(\[*L[^\s,{};]+;)").expect("static class reference regex");
+        static CLASSES: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(\[*L[^\s,{};]+;)").expect("static class reference regex")
+        });
+        let classes = &*CLASSES;
         for reference in classes
             .captures_iter(text)
             .filter_map(|capture| capture.get(1).map(|value| value.as_str().to_string()))
         {
-            self.add_reference_matches("classes", reference, None, &mut targets, &mut seen)?;
+            let reference = reference.trim_start_matches('[').to_string();
+            self.add_reference_matches(
+                "classes",
+                reference.clone(),
+                Some(reference),
+                &mut targets,
+                &mut seen,
+            )?;
         }
         if text.trim_start().starts_with("const-string") {
             let strings =
@@ -1979,7 +2161,14 @@ impl RustBackend {
             "strings" => find_strings(&regex, &analysis.files),
             _ => Vec::new(),
         };
-        for evidence in found.into_iter().take(100) {
+        for evidence in found {
+            let object = object_from_evidence(&evidence)?;
+            if expected
+                .as_ref()
+                .is_some_and(|expected| object_label(&object) != *expected)
+            {
+                continue;
+            }
             let result = self.result_from_evidence(evidence)?;
             if expected.as_ref().is_some_and(|expected| {
                 result.get("label").and_then(Value::as_str) != Some(expected)
@@ -1990,6 +2179,9 @@ impl RustBackend {
             let label = value_string(&result, "label");
             if seen.insert((actual_kind, label)) {
                 targets.push(result);
+                if targets.len() >= 100 {
+                    break;
+                }
             }
         }
         Ok(())
@@ -2028,19 +2220,30 @@ impl RustBackend {
     }
 
     fn cross_references(&mut self, id: String) -> BackendResult {
-        let evidence = self.entry(&id)?.evidence.clone();
-        let Some(evidence) = evidence else {
+        let entry = self.entry(&id)?;
+        let context = match &entry.object {
+            NativeObject::Method(method) => Some(Context::DexMethod(
+                method.method.clone(),
+                method.file.clone(),
+            )),
+            NativeObject::Class(class) => {
+                Some(Context::DexClass(class.class.clone(), class.file.clone()))
+            }
+            NativeObject::Field(field) => {
+                Some(Context::DexField(field.field.clone(), field.file.clone()))
+            }
+            _ => entry.evidence.as_ref().and_then(|evidence| {
+                if matches!(evidence, Evidence::CrossReference(_)) {
+                    evidence.get_place_context().cloned()
+                } else {
+                    evidence.get_context().cloned()
+                }
+            }),
+        };
+        let Some(context) = context else {
             return Ok(json!({"results": [], "count": 0}));
         };
-        let Some(context) = (if matches!(evidence, Evidence::CrossReference(_)) {
-            evidence.get_place_context()
-        } else {
-            evidence.get_context()
-        }) else {
-            return Ok(json!({"results": [], "count": 0}));
-        };
-        let found =
-            analysis::dex::find_cross_reference_array(&[context.clone()], &self.analysis()?.files);
+        let found = analysis::dex::find_cross_reference_array(&[context], &self.analysis()?.files);
         let count = found.len();
         let results = found
             .into_iter()
@@ -2864,16 +3067,11 @@ impl RustBackend {
             return Err(format!("keystore already exists: {}", path.display()));
         }
         let alias = value_string(request, "alias");
-        let store_password = value_string(request, "store_password");
         if alias.trim().is_empty() {
             return Err("keystore alias must not be empty".to_string());
         }
-        if store_password.is_empty() {
-            return Err("keystore password must not be empty".to_string());
-        }
-        let key_password = optional_string(request, "key_password")
-            .map(str::to_string)
-            .unwrap_or_else(|| store_password.clone());
+        let store_password = generate_debug_keystore_password()?;
+        let key_password = store_password.clone();
         let output = Command::new(if cfg!(windows) {
             "keytool.exe"
         } else {
@@ -2905,7 +3103,9 @@ impl RustBackend {
             let _ = fs::remove_file(&path);
             return Err(format!("keytool failed: {}", output_text(&output)));
         }
-        Ok(json!({"path": path, "alias": alias}))
+        Ok(
+            json!({"path": path, "alias": alias, "store_password": store_password, "key_password": key_password}),
+        )
     }
 
     fn set_note(&mut self, request: &Value) -> BackendResult {
@@ -4263,6 +4463,13 @@ fn script_instruction(factory: &str, arguments: &Value) -> Option<String> {
     })
 }
 
+fn generate_debug_keystore_password() -> Result<String, String> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|error| format!("could not generate keystore password: {error}"))?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn object_from_evidence(evidence: &Evidence) -> Result<NativeObject, String> {
     if let Evidence::Instructions(instructions) = evidence {
         if let Context::DexField(field, file) = &instructions.context {
@@ -5075,6 +5282,206 @@ fn write_zip_entry<W: Write + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "manual APK performance measurement"]
+    fn benchmark_apk_navigation() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/cross-references/test-noproguard.apk");
+        let mut backend = RustBackend::new();
+        backend.load(path.to_string_lossy().into_owned()).unwrap();
+        let class = backend.analysis().unwrap().files.multi_dex.iter()
+            .flat_map(|multi| std::iter::once(&multi.primary).chain(multi.secondary.iter()))
+            .flat_map(|file| file.classes.iter().map(move |class| (file, class)))
+            .find(|(_, class)| class.class_name.contains("MainActivity"))
+            .map(|(file, class)| ClassObject { class: class.clone(), file: file.clone() }).unwrap();
+        let class_id = value_string(&backend.navigation_target(NativeObject::Class(class.clone())), "id");
+        let method = class.class.codes.iter().max_by_key(|method| method.code.as_ref().map_or(0, |code| code.insns.len())).unwrap();
+        let method = method_object(&class.file, &method.method).unwrap();
+        let method_id = value_string(&backend.navigation_target(NativeObject::Method(method.clone())), "id");
+        for (name, id) in [("class", class_id), ("method", method_id.clone())] {
+            for run in 0..2 {
+                let start = std::time::Instant::now();
+                let description = backend.describe(id.clone()).unwrap();
+                eprintln!("BENCH {name} run={run} elapsed={:?} lines={} objects={}", start.elapsed(), description["code"].as_str().unwrap().lines().count(), backend.objects.len());
+            }
+        }
+        for run in 0..2 {
+            let start = std::time::Instant::now();
+            let result = backend.cross_references(method_id.clone()).unwrap();
+            eprintln!("BENCH xrefs run={run} elapsed={:?} count={}", start.elapsed(), result["count"]);
+        }
+        let offset = method.instructions()[0].offset;
+        let options = backend.edit_options(&json!({"id": method_id, "offset": offset})).unwrap();
+        let option = options["options"].as_array().unwrap().iter().find(|option| option["label"] == "Replace with NOP").unwrap();
+        let start = std::time::Instant::now();
+        backend.apply_edit(&json!({"id": option["id"], "arguments": {}})).unwrap();
+        eprintln!("BENCH apply_edit elapsed={:?}", start.elapsed());
+        let start = std::time::Instant::now();
+        let _snapshot = backend.snapshot();
+        eprintln!("BENCH snapshot elapsed={:?}", start.elapsed());
+    }
+
+    fn example_backend() -> RustBackend {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/runtime-functions/classes.dex");
+        let mut backend = RustBackend::new();
+        backend.session = Some(Session::Single(
+            NativeAnalysis::new(path.to_str().unwrap()).expect("example DEX should load"),
+        ));
+        backend
+    }
+
+    #[test]
+    fn listing_resolves_a_reference_to_its_definition_in_another_dex() {
+        let mut backend = example_backend();
+        let multi_dex = &mut backend.analysis_mut().unwrap().files.multi_dex[0];
+        let mut definition = multi_dex.primary.as_ref().clone();
+        definition.file_name = "classes2.dex".to_string();
+        let definition = Arc::new(definition);
+        let original = definition
+            .classes
+            .iter()
+            .flat_map(|class| &class.codes)
+            .find(|data| data.method.method_name == "doPrint")
+            .expect("fixture has doPrint")
+            .clone();
+        let mut reference = definition.as_ref().clone();
+        reference.identifier = "reference-dex".to_string();
+        reference.file_name = "classes.dex".to_string();
+        reference.classes.clear();
+        let reference = Arc::new(reference);
+        multi_dex.primary = reference.clone();
+        multi_dex.secondary = vec![definition];
+        let method = method_object(&reference, &original.method).unwrap();
+        assert!(
+            method.code().is_empty(),
+            "pool reference has no implementation"
+        );
+        let id = backend.store(ObjectEntry {
+            object: NativeObject::Method(method),
+            evidence: None,
+        });
+
+        let described = backend.describe(id.clone()).unwrap();
+        assert!(!described["instructions"].as_array().unwrap().is_empty());
+        assert_eq!(
+            object_dex_name(&backend.entry(&id).unwrap().object).as_deref(),
+            Some("classes2.dex")
+        );
+        assert!(described.get("code_reason").is_none());
+        let class_id = value_string(&described["class_target"], "id");
+        let class = backend.describe(class_id).unwrap();
+        let lines = class["code"].as_str().unwrap().lines().collect::<Vec<_>>();
+        let targets = class["line_targets"].as_array().unwrap();
+        assert_eq!(targets.len(), lines.len());
+        assert_eq!(
+            class["line_method_ids"].as_array().unwrap().len(),
+            lines.len()
+        );
+        for (index, line) in lines.iter().enumerate() {
+            if line.starts_with(".method ") {
+                assert!(class["line_method_ids"][index].is_string());
+                assert!(targets[index]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|target| target["kind"] == "method"));
+            }
+        }
+
+        // Editing reparses a DEX and replaces its Arc. A second describe must
+        // read that replacement rather than retain the first method wrapper.
+        let multi_dex = &mut backend.analysis_mut().unwrap().files.multi_dex[0];
+        let mut edited = multi_dex.secondary[0].as_ref().clone();
+        let class = edited
+            .classes
+            .iter_mut()
+            .find(|class| {
+                class
+                    .codes
+                    .iter()
+                    .any(|data| data.method.method_name == "doPrint")
+            })
+            .unwrap();
+        let class = Arc::make_mut(class);
+        let method = class
+            .codes
+            .iter_mut()
+            .find(|data| data.method.method_name == "doPrint")
+            .unwrap();
+        Arc::make_mut(method).code.as_mut().unwrap().register_size += 1;
+        multi_dex.secondary[0] = Arc::new(edited);
+        let reloaded = backend.describe(id).unwrap();
+        assert_ne!(reloaded["code"], described["code"]);
+    }
+
+    #[test]
+    fn declaration_targets_find_xrefs_without_search_evidence() {
+        let mut backend = example_backend();
+        let file = backend.analysis().unwrap().files.multi_dex[0]
+            .primary
+            .clone();
+        let called = file
+            .methods
+            .iter()
+            .find(|method| method.method_name == "print")
+            .unwrap();
+        let target =
+            backend.navigation_target(NativeObject::Method(method_object(&file, called).unwrap()));
+        let id = value_string(&target, "id");
+        assert!(backend.entry(&id).unwrap().evidence.is_none());
+        let references = backend.cross_references(id.clone()).unwrap();
+        assert!(references["count"].as_u64().unwrap() > 0);
+        let description = backend.describe(id).unwrap();
+        assert!(description["code_reason"]
+            .as_str()
+            .unwrap()
+            .contains("No implementation"));
+    }
+
+    #[test]
+    fn debug_keystore_passwords_have_random_entropy_and_keytool_safe_characters() {
+        let first = generate_debug_keystore_password().unwrap();
+        let second = generate_debug_keystore_password().unwrap();
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    #[ignore = "requires a Java installation with keytool"]
+    fn generated_keystore_opens_store_and_private_key_with_returned_password() {
+        let directory = temporary_directory("debug-keystore-test").unwrap();
+        let backend = RustBackend::new();
+        let request = json!({"directory": directory, "alias": "androiddebugkey"});
+        let generated = backend.generate_keystore(&request).unwrap();
+        let store_password = value_string(&generated, "store_password");
+        assert_eq!(store_password, value_string(&generated, "key_password"));
+        let output = Command::new(if cfg!(windows) {
+            "keytool.exe"
+        } else {
+            "keytool"
+        })
+        .args(["-certreq", "-alias", "androiddebugkey", "-keystore"])
+        .arg(value_string(&generated, "path"))
+        .args([
+            "-storepass",
+            &store_password,
+            "-keypass",
+            &store_password,
+            "-file",
+        ])
+        .arg(directory.join("request.csr"))
+        .output()
+        .unwrap();
+        assert!(output.status.success(), "{}", output_text(&output));
+        assert!(backend
+            .generate_keystore(&request)
+            .unwrap_err()
+            .contains("already exists"));
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn native_handle_accepts_parallel_read_commands() {

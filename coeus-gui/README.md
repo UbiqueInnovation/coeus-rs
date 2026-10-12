@@ -52,24 +52,40 @@ support exporting that script separately. Reopening an archive does not
 require the source APKs to remain available.
 The project/search sidebar, code pane, instruction pane, graph canvas, and
 source panes can be resized; the project and instruction panes can also be
-collapsed. The Code / Edit tab gives the smali source and replacement-node
-pane the full available work area, with replacement nodes attached to the
-left side of the code view.
+collapsed. The Code / Edit tab separates **Disassembly** from **Edit instructions**.
+Browsing a class or method uses the full code area; the method editor attaches
+replacement nodes on the left. Right-click a function in a class listing and
+choose **Edit method**, or select a method and choose **Edit instructions**.
 
 ## Workspace controls
 
 The workspace uses a consistent dark theme, with navigation across the top
-and operation status along the bottom. The welcome screen opens APKs, split
-sets, saved projects, or the device browser. **Paths & output** in the sidebar
+and operation status along the bottom. The persistent **Start** tab opens APKs,
+split sets, saved projects, or the device browser. After loading, it offers
+package-name copying, shortcuts to the launcher activity and Application class,
+and a list of all manifest activities and aliases. Activity aliases open their
+target class. **Paths & output** in the sidebar
 exposes direct path loading and the edited APK destination.
 
 - **Cmd/Ctrl+O** opens an APK; **Cmd/Ctrl+S** saves a project.
-- **Cmd/Ctrl+F** expands the sidebar and focuses search. Press Enter to search.
+- **Cmd/Ctrl+F** opens the Search tab and focuses its query. Press Enter to search.
 - Search accepts regular expressions, validates syntax before submitting, and
   explains empty results. The Search tab offers entry-point, cryptography, and
   URL searches to get started.
 - Results show the member name above its class. Hover for the full identifier;
   click to inspect, or right-click for cross-references and notes.
+- **Cross-references** has its own tab with the target, results, refresh action,
+  and an explicit empty state. Click a function declaration name or use its
+  context menu to find references.
+- Disassembly shows readable types (such as `Boolean`, `Int`, and `String`
+  class names), spacing between members, and collapsible functions. Code search
+  automatically expands a function containing the selected match.
+- Click a class name to open that class, or a referenced method name to open the
+  method. These links work in both class and method disassemblies.
+- **Reload code** clears cached disassembly and resolves the current definition
+  again. Method references resolve to implementations across DEX files; missing,
+  abstract, and native implementations have an explanation instead of a blank
+  listing.
 - Failed backend operations stay visible until dismissed, with a control to
   copy details. Pending manifest edits are visible in the status bar; click
   the indicator to return to the editor.
@@ -98,7 +114,10 @@ certificates.
 
 The Sign / Install tab can generate `debug.keystore` beside the loaded APK or
 project. It uses `keytool`, fills the generated path into the signing form,
-and refuses to overwrite an existing keystore.
+and refuses to overwrite an existing keystore. Generation creates a random
+password and uses it for both the store and key. Both signing forms are filled
+automatically and reveal the generated password; **Show passwords** and
+**Copy password** let you inspect or save it during the current session.
 
 When a method is open in Code / Edit, **Emulate** opens an argument form and
 runs the method in Coeus's embedded DexVm. Primitive values and strings can be
@@ -129,7 +148,7 @@ syntax-highlighted inspection view.
 Selecting a string result opens a string-pool editor. Its replacement is sent
 to `AnalyzeObject.replace_string`, preserving the string index so existing DEX
 references use the new value. Code instructions expose typed method, class,
-field, and string targets for command-click and context-menu navigation. The
+field, and string targets for direct-click and context-menu navigation. The
 Back and Forward controls follow completed object navigations, including
 cross-reference results; opening a new object from the middle of the stack
 starts a new branch. They also accept Command-Tab for forward and

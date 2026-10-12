@@ -8,6 +8,7 @@ existing Python API as the single source of truth for analysis and debugging.
 
 import queue
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -101,10 +102,14 @@ class Backend:
         """Refresh a method wrapper after Coeus reparses an edited DEX."""
         entry = self._entry(object_id)
         signature = entry["object"].signature()
-        found = self.ao.find_methods(re.escape(signature))
+        method_name = signature.split("->", 1)[-1].split("(", 1)[0]
+        found = self.ao.find_methods(re.escape(method_name))
         for evidence in found:
             try:
-                entry["object"] = evidence.as_method()
+                candidate = evidence.as_method()
+                if candidate.signature() != signature or not candidate.code():
+                    continue
+                entry["object"] = candidate
                 entry["evidence"] = evidence
                 entry["kind"] = "method"
                 return entry["object"]
@@ -738,7 +743,7 @@ class Backend:
         return {"path": path}
 
     def generate_keystore(
-        self, directory, alias, store_password, key_password=None, filename="debug.keystore"
+        self, directory, alias, store_password=None, key_password=None, filename="debug.keystore"
     ):
         directory = Path(str(directory)).expanduser()
         if not directory.is_dir():
@@ -750,12 +755,10 @@ class Backend:
         if path.exists():
             raise RuntimeError("keystore already exists: {}".format(path))
         alias = str(alias).strip()
-        store_password = str(store_password)
         if not alias:
             raise RuntimeError("keystore alias must not be empty")
-        if not store_password:
-            raise RuntimeError("keystore password must not be empty")
-        key_password = str(key_password) if key_password else store_password
+        store_password = secrets.token_hex(16)
+        key_password = store_password
         executable = shutil.which("keytool") or "keytool"
         completed = subprocess.run(
             [
@@ -791,7 +794,10 @@ class Backend:
                     (completed.stderr or completed.stdout).strip()
                 )
             )
-        return {"path": str(path), "alias": alias}
+        return {
+            "path": str(path), "alias": alias,
+            "store_password": store_password, "key_password": key_password,
+        }
 
     def set_manifest_xml(self, xml):
         if self.ao is None:
@@ -1087,18 +1093,25 @@ class Backend:
         except KeyError:
             raise RuntimeError("unknown object: {}".format(object_id))
 
-    def _instruction_targets(self, instruction):
+    def _instruction_targets(self, instruction, cache=None):
         """Resolve typed navigation targets embedded in one smali instruction."""
-        text = str(instruction)
+        text = re.sub(r" #0x[0-9a-fA-F]+$", "", str(instruction).strip())
+        if cache is not None and text in cache:
+            return list(cache[text])
         targets = []
         seen = set()
 
         def add_matches(finder, query, expected=None):
             if not query:
                 return
-            for evidence in finder(re.escape(query))[:100]:
+            for evidence in finder(re.escape(query)):
                 result = self._result(evidence, evidence=evidence)
-                if expected is not None and result["label"] != expected:
+                actual = result["label"]
+                if expected is not None and actual != expected:
+                    # Older wheels omit the type from field identities.
+                    if result["kind"] != "field" or actual != expected.split(":", 1)[0]:
+                        continue
+                if len(targets) >= 100:
                     continue
                 key = (result["kind"], result["label"])
                 if key not in seen:
@@ -1120,6 +1133,7 @@ class Backend:
             add_matches(self.ao.find_fields, field_name, reference)
 
         for reference in re.findall(r"(\[*L[^\s,{};]+;)", text):
+            reference = reference.lstrip("[")
             add_matches(self.ao.find_classes, reference, reference)
 
         if text.lstrip().startswith("const-string"):
@@ -1127,9 +1141,11 @@ class Backend:
                 value = re.sub(r"\\(.)", r"\1", value)
                 add_matches(self.ao.find_strings, value, value)
 
+        if cache is not None:
+            cache[text] = list(targets)
         return targets
 
-    def _instructions(self, method):
+    def _instructions(self, method, cache=None):
         instructions = []
         for instruction in method.get_instructions():
             instructions.append(
@@ -1138,14 +1154,39 @@ class Backend:
                     "size": instruction.get_size(),
                     "mnemonic": instruction.mnemonic(),
                     "text": str(instruction),
-                    "targets": self._instruction_targets(instruction),
+                    "targets": self._instruction_targets(instruction, cache),
                 }
             )
         return instructions
 
+    def _listing_object(self, kind, obj):
+        """Use the definition DEX, including after an edit reparses that DEX."""
+        if kind == "method":
+            signature = obj.signature()
+            lookup = signature.split("->", 1)[-1].split("(", 1)[0]
+            for evidence in self.ao.find_methods(re.escape(lookup)):
+                try:
+                    candidate = evidence.as_method()
+                    if candidate.signature() == signature and candidate.code():
+                        return candidate
+                except Exception:
+                    continue
+        elif kind == "class":
+            name = obj.name()
+            for evidence in self.ao.find_classes(re.escape(name)):
+                try:
+                    candidate = evidence.as_class()
+                    if candidate.name() == name and candidate.get_methods():
+                        return candidate
+                except Exception:
+                    continue
+        return obj
+
     def describe(self, object_id):
         entry = self._entry(object_id)
-        kind, obj = entry["kind"], entry["object"]
+        kind = entry["kind"]
+        obj = self._listing_object(kind, entry["object"])
+        entry["object"] = obj
         data = {
             "id": object_id,
             "kind": kind,
@@ -1155,19 +1196,38 @@ class Backend:
         if annotation_key:
             data["note_key"] = annotation_key
         if kind == "method":
+            code = obj.code()
+            target_cache = {}
+            instructions = self._instructions(obj, target_cache)
+            line_targets = [self._instruction_targets(line, target_cache) for line in code.splitlines()]
+            if line_targets:
+                line_targets[0].append({"id": object_id, "kind": "method", "label": obj.signature()})
             data.update(
                 {
-                    "code": obj.code(),
-                    "instructions": self._instructions(obj),
+                    "code": code,
+                    "instructions": instructions,
                     "class": obj.get_class().name(),
                     "method_key": obj.signature(),
+                    "line_targets": line_targets,
+                    "class_target": self._result(self._listing_object("class", obj.get_class()), kind="class"),
                 }
             )
+            if not code:
+                data["code_reason"] = "No implementation was found in the loaded DEX files. This may be an external or inherited method."
+            elif not data["instructions"]:
+                data["code_reason"] = "This method declaration has no DEX instructions (for example, an abstract or native method)."
         elif kind == "class":
             code = obj.code(self.ao)
             line_method_ids = [None] * len(code.splitlines())
             line_method_keys = [None] * len(code.splitlines())
             source_lines = code.splitlines()
+            target_cache = {}
+            line_targets = [self._instruction_targets(line, target_cache) for line in source_lines]
+            for index, line in enumerate(source_lines):
+                if line.strip().startswith(".field "):
+                    field = next((part for part in line.split() if ":" in part), None)
+                    if field:
+                        line_targets[index].extend(self._instruction_targets("{}->{}".format(obj.name(), field)))
             search_from = 0
             for method in obj.get_methods():
                 method_lines = method.code().splitlines()
@@ -1181,6 +1241,7 @@ class Backend:
                 if start is None:
                     continue
                 method_id = self._id(method, kind="method")
+                line_targets[start].append({"id": method_id, "kind": "method", "label": method.signature()})
                 for index in range(start, start + len(method_lines)):
                     line_method_ids[index] = method_id
                     line_method_keys[index] = method.signature()
@@ -1191,8 +1252,11 @@ class Backend:
                     "class": obj.name(),
                     "line_method_ids": line_method_ids,
                     "line_method_keys": line_method_keys,
+                    "line_targets": line_targets,
                 }
             )
+            if not code or code == "NO CLASS DEF FOUND":
+                data["code_reason"] = "No class definition was found in the loaded DEX files."
         elif kind == "field_access":
             function = obj.get_function()
             method_id = self._id(function, kind="method")
@@ -1958,10 +2022,10 @@ class Backend:
             raise RuntimeError("load an APK first")
         entry = self._entry(object_id)
         obj = entry["object"]
-        if entry["evidence"] is not None:
-            found = entry["evidence"].cross_references(self.ao)
-        elif hasattr(obj, "cross_references"):
+        if hasattr(obj, "cross_references"):
             found = obj.cross_references(self.ao)
+        elif entry["evidence"] is not None:
+            found = entry["evidence"].cross_references(self.ao)
         else:
             found = []
         return {
@@ -2608,7 +2672,7 @@ class Backend:
             return self.generate_keystore(
                 request["directory"],
                 request["alias"],
-                request["store_password"],
+                request.get("store_password"),
                 request.get("key_password"),
                 request.get("filename", "debug.keystore"),
             )
