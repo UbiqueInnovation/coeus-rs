@@ -44,6 +44,12 @@ use ux::u4;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+#[path = "native_lookup.rs"]
+mod lookup;
+
+use lookup::LookupIndex;
+use crate::edit_arguments;
+
 type BackendResult = Result<Value, String>;
 
 const MAX_RESULTS: usize = 1000;
@@ -152,7 +158,9 @@ impl SupergraphBuildOptions {
 
 #[derive(Clone)]
 struct NativeAnalysis {
-    files: Files,
+    // Read workers share APK bytes; a mutation copies them only while a worker
+    // still holds the old snapshot.
+    files: Arc<Files>,
     supergraph: Option<Arc<coeus::coeus_parse::dex::graph::Supergraph>>,
     history: Vec<String>,
 }
@@ -162,7 +170,7 @@ impl NativeAnalysis {
         let files = coeus::coeus_parse::extraction::load_file(path, false, -1)
             .map_err(|error| format!("could not load {path}: {error}"))?;
         Ok(Self {
-            files,
+            files: Arc::new(files),
             supergraph: None,
             history: Vec::new(),
         })
@@ -184,14 +192,14 @@ impl NativeAnalysis {
     }
 
     fn set_manifest_xml(&mut self, xml: &str) -> Result<(), String> {
-        apk::set_manifest_xml(&mut self.files, xml)?;
+        apk::set_manifest_xml(Arc::make_mut(&mut self.files), xml)?;
         self.history.push("set_manifest_xml".to_string());
         Ok(())
     }
 
     fn set_debuggable(&mut self, enabled: bool) -> Result<(), String> {
         apk::set_manifest_attribute(
-            &mut self.files,
+            Arc::make_mut(&mut self.files),
             "application",
             "debuggable",
             if enabled { "true" } else { "false" },
@@ -201,7 +209,7 @@ impl NativeAnalysis {
     }
 
     fn allow_plaintext_and_user_certificates(&mut self) -> Result<(), String> {
-        apk::allow_plaintext_and_user_certificates(&mut self.files)?;
+        apk::allow_plaintext_and_user_certificates(Arc::make_mut(&mut self.files))?;
         self.history
             .push("allow_plaintext_and_user_certificates".to_string());
         Ok(())
@@ -212,7 +220,8 @@ impl NativeAnalysis {
     }
 
     fn replace_loaded_dex(&mut self, dex_name: &str, bytes: Vec<u8>) -> Result<(), String> {
-        for multi_dex in &mut self.files.multi_dex {
+        let files = Arc::make_mut(&mut self.files);
+        for multi_dex in &mut files.multi_dex {
             if multi_dex.primary.get_dex_name() == dex_name
                 || multi_dex.primary.file_name == dex_name
             {
@@ -221,7 +230,7 @@ impl NativeAnalysis {
                 let parsed = parse_dex_buf(&file_name, &ArrayView::new(&bytes), false)
                     .ok_or_else(|| "could not reparse edited DEX".to_string())?;
                 multi_dex.primary = Arc::new(parsed);
-                self.files.set_file(archive_name, bytes)?;
+                files.set_file(archive_name, bytes)?;
                 self.supergraph = None;
                 return Ok(());
             }
@@ -235,7 +244,7 @@ impl NativeAnalysis {
                 let parsed = parse_dex_buf(&file_name, &ArrayView::new(&bytes), false)
                     .ok_or_else(|| "could not reparse edited DEX".to_string())?;
                 multi_dex.secondary[index] = Arc::new(parsed);
-                self.files.set_file(archive_name, bytes)?;
+                files.set_file(archive_name, bytes)?;
                 self.supergraph = None;
                 return Ok(());
             }
@@ -325,12 +334,10 @@ impl NativeAnalysis {
             factory
         };
         let editable = if factory == "switch" {
-            let register = typed_arguments
-                .get("register")
-                .and_then(Value::as_str)
-                .unwrap_or("0")
-                .parse::<u8>()
-                .map_err(|_| "register must be an integer".to_string())?;
+            let register = edit_arguments::register_number(
+                typed_arguments.get("register").and_then(Value::as_str).unwrap_or("0"),
+                u8::MAX as u32,
+            )? as u8;
             let case_value = typed_arguments
                 .get("case_value")
                 .and_then(Value::as_str)
@@ -384,6 +391,8 @@ impl NativeAnalysis {
     }
 
     fn method_by_identity(&self, signature: &str, dex_name: &str) -> Option<MethodObject> {
+        let (class_name, member) = signature.split_once("->")?;
+        let (method_name, prototype) = member.split_once('(')?;
         self.files
             .multi_dex
             .iter()
@@ -391,13 +400,19 @@ impl NativeAnalysis {
                 std::iter::once(&multi_dex.primary).chain(multi_dex.secondary.iter())
             })
             .filter(|dex| dex.get_dex_name() == dex_name || dex.file_name == dex_name)
-            .flat_map(|dex| {
-                dex.methods
-                    .iter()
-                    .map(|method| (dex.clone(), method.clone()))
+            .find_map(|file| {
+                let class = file.classes.iter().find(|class| class.class_name == class_name)?;
+                let data = class.codes.iter().find(|data| {
+                    data.method.method_name == method_name
+                        && data.method.proto_name.strip_prefix('(') == Some(prototype)
+                })?;
+                Some(MethodObject {
+                    method: data.method.clone(),
+                    data: Some(data.clone()),
+                    file: file.clone(),
+                    class: class.clone(),
+                })
             })
-            .filter_map(|(file, method)| method_object(&file, &method))
-            .find(|method| method.signature() == signature)
     }
 
     fn build_supergraph(&mut self, options: &SupergraphBuildOptions) -> Result<String, String> {
@@ -671,6 +686,8 @@ struct ObjectEntry {
 pub struct RustBackend {
     session: Option<Session>,
     analysis_revision: u64,
+    lookup_index: Option<Arc<LookupIndex>>,
+    navigation_ids: HashMap<String, String>,
     objects: HashMap<String, ObjectEntry>,
     // Method copies used only by the emulator. These are deliberately kept
     // outside `Session`, so APK writes can never include an emulation edit.
@@ -721,7 +738,7 @@ impl RustBackendHandle {
                     .state
                     .lock()
                     .map_err(|_| "native backend state lock was poisoned".to_string())?;
-                (state.snapshot(), state.analysis_revision)
+                (state.snapshot(&request), state.analysis_revision)
             };
             let result = worker.call(request);
             if result.is_ok() {
@@ -758,6 +775,8 @@ impl RustBackend {
         Self {
             session: None,
             analysis_revision: 0,
+            lookup_index: None,
+            navigation_ids: HashMap::new(),
             objects: HashMap::new(),
             emulation_overlays: HashMap::new(),
             next_object_id: Arc::new(AtomicUsize::new(1)),
@@ -777,11 +796,21 @@ impl RustBackend {
         }
     }
 
-    fn snapshot(&self) -> Self {
+    fn snapshot(&self, request: &Value) -> Self {
+        // Workers only need the requested objects. Copying every previously
+        // visited symbol and edit node made inspection progressively slower.
+        let mut objects = HashMap::new();
+        for key in ["id", "method_id"] {
+            if let Some(id) = request.get(key).and_then(Value::as_str) {
+                if let Some(entry) = self.objects.get(id) { objects.insert(id.to_string(), entry.clone()); }
+            }
+        }
         Self {
             session: self.session.clone(),
             analysis_revision: self.analysis_revision,
-            objects: self.objects.clone(),
+            lookup_index: self.lookup_index.clone(),
+            navigation_ids: HashMap::new(),
+            objects,
             emulation_overlays: self.emulation_overlays.clone(),
             next_object_id: self.next_object_id.clone(),
             notes: self.notes.clone(),
@@ -801,6 +830,7 @@ impl RustBackend {
     }
 
     fn merge_parallel(&mut self, worker: Self) {
+        if self.lookup_index.is_none() { self.lookup_index = worker.lookup_index; }
         self.objects.extend(worker.objects);
         match (&mut self.session, worker.session) {
             (Some(Session::Single(current)), Some(Session::Single(worker))) => {
@@ -827,6 +857,10 @@ impl RustBackend {
             .get("op")
             .and_then(Value::as_str)
             .ok_or_else(|| "request has no operation".to_string())?;
+        if matches!(operation, "load" | "load_split" | "load_split_from_adb" | "load_project" | "apply_edit" | "replace_string") {
+            self.lookup_index = None;
+        }
+        self.navigation_ids.clear();
         match operation {
             "load" => self.load(value_string(&request, "path")),
             "load_split" => self.load_split(&request),
@@ -1497,15 +1531,26 @@ impl RustBackend {
         object.clone()
     }
 
+    fn lookup_index(&mut self) -> Result<Arc<LookupIndex>, String> {
+        if let Some(index) = &self.lookup_index {
+            if index.matches(&self.analysis()?.files) { return Ok(index.clone()); }
+        }
+        let index = Arc::new(LookupIndex::new(&self.analysis()?.files));
+        self.lookup_index = Some(index.clone());
+        Ok(index)
+    }
+
     fn navigation_target(&mut self, object: NativeObject) -> Value {
         let kind = object_kind(&object);
         let label = object_label(&object);
         let index = object_index(&object);
         let dex = object_dex_name(&object);
-        let id = self.store(ObjectEntry {
-            object,
-            evidence: None,
-        });
+        let key = format!("{kind}:{dex:?}:{index:?}:{label}");
+        let id = if let Some(id) = self.navigation_ids.get(&key) { id.clone() } else {
+            let id = self.store(ObjectEntry { object, evidence: None });
+            self.navigation_ids.insert(key, id.clone());
+            id
+        };
         json!({"id": id, "kind": kind, "label": label, "index": index, "dex": dex})
     }
 
@@ -2152,37 +2197,10 @@ impl RustBackend {
         targets: &mut Vec<Value>,
         seen: &mut std::collections::HashSet<(String, String)>,
     ) -> Result<(), String> {
-        let analysis = self.analysis()?;
-        let regex = Regex::new(&regex::escape(&query)).map_err(|error| error.to_string())?;
-        let found = match kind {
-            "methods" => find_methods(&regex, &analysis.files),
-            "classes" => find_classes(&regex, &analysis.files),
-            "fields" => find_fields(&regex, &analysis.files),
-            "strings" => find_strings(&regex, &analysis.files),
-            _ => Vec::new(),
-        };
-        for evidence in found {
-            let object = object_from_evidence(&evidence)?;
-            if expected
-                .as_ref()
-                .is_some_and(|expected| object_label(&object) != *expected)
-            {
-                continue;
-            }
-            let result = self.result_from_evidence(evidence)?;
-            if expected.as_ref().is_some_and(|expected| {
-                result.get("label").and_then(Value::as_str) != Some(expected)
-            }) {
-                continue;
-            }
-            let actual_kind = value_string(&result, "kind");
-            let label = value_string(&result, "label");
-            if seen.insert((actual_kind, label)) {
-                targets.push(result);
-                if targets.len() >= 100 {
-                    break;
-                }
-            }
+        let label = expected.as_deref().unwrap_or(&query);
+        if let Some(object) = self.lookup_index()?.find(kind, label) {
+            let key = (object_kind(&object), object_label(&object));
+            if seen.insert(key) { targets.push(self.navigation_target(object)); }
         }
         Ok(())
     }
@@ -2220,6 +2238,12 @@ impl RustBackend {
     }
 
     fn cross_references(&mut self, id: String) -> BackendResult {
+        if let NativeObject::Method(method) = self.listing_object(&self.entry(&id)?.object) {
+            let callers = self.lookup_index()?.callers(&method);
+            let count = callers.len();
+            let results = callers.into_iter().take(MAX_RESULTS).map(|object| self.navigation_target(object)).collect::<Vec<_>>();
+            return Ok(json!({"results": results, "count": count}));
+        }
         let entry = self.entry(&id)?;
         let context = match &entry.object {
             NativeObject::Method(method) => Some(Context::DexMethod(
@@ -2414,20 +2438,13 @@ impl RustBackend {
         } else {
             registers.len() as u32
         };
-        let mut method_index = 0;
-        let mut field_index = 0;
-        for target in self.instruction_targets(&target_text)? {
-            match value_string(&target, "kind").as_str() {
-                "method" => {
-                    method_index = target.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
-                    break;
-                }
-                "field" => {
-                    field_index = target.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
-                }
-                _ => {}
-            }
-        }
+        // Pool indexes belong to the selected instruction's DEX, even when
+        // its target is defined in a different DEX.
+        let method_index = invoke_method_index(&target.instruction).unwrap_or(0) as u32;
+        let field_index = field_instruction_index(&target.instruction).unwrap_or(0) as u32;
+        let destination = edit_arguments::destination_register(
+            target_text.split_whitespace().next().unwrap_or_default(), &target_text,
+        );
         let integer = |name: &str, label: &str, value: u32| json!({"name": name, "label": label, "kind": "integer", "value": value.to_string()});
         let text = |name: &str, label: &str, value: &str| json!({"name": name, "label": label, "kind": "text", "value": value});
         let picker = |name: &str, label: &str, value: u32, kind: &str| json!({"name": name, "label": label, "kind": "integer", "value": value.to_string(), "picker": kind});
@@ -2692,7 +2709,23 @@ impl RustBackend {
             ],
         ));
         let mut options = Vec::new();
-        for (factory, label, action, arguments) in candidates {
+        for (factory, label, action, mut arguments) in candidates {
+            for argument in &mut arguments {
+                let name = value_string(argument, "name");
+                if edit_arguments::is_register(&name) {
+                    argument["kind"] = json!("register");
+                    let is_destination = value_string(argument, "label") == "Destination register"
+                        || (factory.starts_with("static_get") && name == "register")
+                        || (factory == "check_cast" && name == "register");
+                    let value = if action == "replace" && is_destination {
+                        argument["label"] = json!("Destination register");
+                        destination.unwrap_or(0)
+                    } else {
+                        value_string(argument, "value").parse::<u32>().unwrap_or(0)
+                    };
+                    argument["value"] = json!(format!("v{value}"));
+                }
+            }
             let spec = EditSpec {
                 method_id: method_id.clone(),
                 offset,
@@ -4116,9 +4149,30 @@ fn copy_debug_string_type(
     }
 }
 
+fn field_instruction_index(instruction: &Instruction) -> Option<u16> {
+    match instruction {
+        Instruction::InstanceGet(_, _, index) | Instruction::InstanceGetWide(_, _, index)
+        | Instruction::InstanceGetObject(_, _, index) | Instruction::InstanceGetBoolean(_, _, index)
+        | Instruction::InstanceGetByte(_, _, index) | Instruction::InstanceGetChar(_, _, index)
+        | Instruction::InstanceGetShort(_, _, index) | Instruction::InstancePut(_, _, index)
+        | Instruction::InstancePutWide(_, _, index) | Instruction::InstancePutObject(_, _, index)
+        | Instruction::InstancePutBoolean(_, _, index) | Instruction::InstancePutByte(_, _, index)
+        | Instruction::InstancePutChar(_, _, index) | Instruction::InstancePutShort(_, _, index)
+        | Instruction::StaticGet(_, index) | Instruction::StaticGetWide(_, index)
+        | Instruction::StaticGetObject(_, index) | Instruction::StaticGetBoolean(_, index)
+        | Instruction::StaticGetByte(_, index) | Instruction::StaticGetChar(_, index)
+        | Instruction::StaticGetShort(_, index) | Instruction::StaticPut(_, index)
+        | Instruction::StaticPutWide(_, index) | Instruction::StaticPutObject(_, index)
+        | Instruction::StaticPutBoolean(_, index) | Instruction::StaticPutByte(_, index)
+        | Instruction::StaticPutChar(_, index) | Instruction::StaticPutShort(_, index) => Some(*index),
+        _ => None,
+    }
+}
+
 fn invoke_method_index(instruction: &Instruction) -> Option<u16> {
     match instruction {
-        Instruction::InvokeVirtual(_, method_idx, _)
+        Instruction::Invoke(method_idx)
+        | Instruction::InvokeVirtual(_, method_idx, _)
         | Instruction::InvokeSuper(_, method_idx, _)
         | Instruction::InvokeDirect(_, method_idx, _)
         | Instruction::InvokeStatic(_, method_idx, _)
@@ -4324,14 +4378,15 @@ fn python_literal(value: &Value) -> String {
 }
 
 fn script_integer(arguments: &Value, name: &str, default: &str) -> String {
-    let value = arguments
-        .get(name)
-        .and_then(Value::as_str)
-        .unwrap_or(default);
-    format!(
-        "int({}, 0)",
-        python_literal(&Value::String(value.to_string()))
-    )
+    let value = arguments.get(name).and_then(Value::as_str).unwrap_or(default);
+    if edit_arguments::is_register(name) {
+        // Successful edits already validated the operand. Emit decimal so v3
+        // and leading-zero forms replay identically in Python.
+        if let Ok(register) = edit_arguments::register_number(value, u16::MAX as u32) {
+            return register.to_string();
+        }
+    }
+    format!("int({}, 0)", python_literal(&Value::String(value.to_string())))
 }
 
 fn script_text(arguments: &Value, name: &str, default: &str) -> String {
@@ -4351,11 +4406,11 @@ fn script_instruction(factory: &str, arguments: &Value) -> Option<String> {
             .split(|character: char| character == ',' || character.is_whitespace())
             .filter(|value| !value.trim().is_empty())
             .map(|value| {
-                let value = value.trim().strip_prefix('v').unwrap_or(value.trim());
-                format!(
-                    "int({}, 0)",
-                    python_literal(&Value::String(value.to_string()))
-                )
+                let raw = value.trim().trim_matches(['{', '}']);
+                match edit_arguments::register_number(raw, 15) {
+                    Ok(register) => register.to_string(),
+                    Err(_) => format!("int({}, 0)", python_literal(&Value::String(raw.to_string()))),
+                }
             })
             .collect::<Vec<_>>()
             .join(", ")
@@ -4740,11 +4795,17 @@ fn build_instruction(
         } else {
             raw
         };
+        if edit_arguments::is_register(name) {
+            return edit_arguments::register_number(raw, u16::MAX as u32)
+                .map_err(|error| format!("{name}: {error}"));
+        }
         raw.trim()
             .parse::<u32>()
             .map_err(|_| format!("{name} must be an integer"))
     };
-    let register = |name: &str| integer(name, 0).map(|value| value as u8);
+    let register = |name: &str| -> Result<u8, String> {
+        u8::try_from(integer(name, 0)?).map_err(|_| format!("{name} must be between v0 and v255"))
+    };
     let u4_value = |name: &str| {
         let value = register(name)?;
         if value > 15 {
@@ -4761,10 +4822,8 @@ fn build_instruction(
             .filter(|part| !part.trim().is_empty())
             .map(|part| {
                 let part = part.trim().trim_matches(['{', '}']);
-                let digits = part.strip_prefix('v').unwrap_or(part);
-                digits
-                    .parse::<u8>()
-                    .map_err(|_| format!("invalid invoke register {part:?}"))
+                edit_arguments::register_number(part, 15).map(|register| register as u8)
+                    .map_err(|error| format!("invalid invoke register {part:?}: {error}"))
             })
             .collect()
     };
@@ -5284,6 +5343,38 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "manual workflow timing using an APK fixture"]
+    fn gui_workflow_timings() {
+        let path = std::env::var("COEUS_BENCH_APK").unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/debugger_test/app-debug.apk").display().to_string());
+        let backend = RustBackendHandle::new();
+        backend.call(json!({"op":"load", "path":path})).unwrap();
+        let results = backend.call(json!({"op":"search", "kind":"methods", "query":"onCreate"})).unwrap();
+        let methods = results["results"].as_array().unwrap();
+        let method = methods.iter().find(|method| value_string(method, "label").contains("MainActivity;")).unwrap_or(&methods[0]);
+        let id = value_string(method, "id");
+        let started = std::time::Instant::now();
+        let code = backend.call(json!({"op":"describe", "id":id})).unwrap();
+        eprintln!("method describe: {:?}; {} lines", started.elapsed(), value_string(&code, "code").lines().count());
+        let started = std::time::Instant::now();
+        let class_id = value_string(&code["class_target"], "id");
+        let class = backend.call(json!({"op":"describe", "id":class_id})).unwrap();
+        eprintln!("class describe: {:?}; {} lines", started.elapsed(), value_string(&class, "code").lines().count());
+        let started = std::time::Instant::now();
+        let xrefs = backend.call(json!({"op":"xrefs", "id":id})).unwrap();
+        eprintln!("xrefs: {:?}; {} references", started.elapsed(), xrefs["count"]);
+        if let Some(offset) = code["instructions"].as_array().unwrap().first().and_then(|i| i["offset"].as_u64()) {
+            let started = std::time::Instant::now();
+            let options = backend.call(json!({"op":"edit_options", "id":id, "offset":offset})).unwrap();
+            eprintln!("edit options: {:?}", started.elapsed());
+            let nop = options["options"].as_array().unwrap().iter().find(|o| o["label"] == "Replace with NOP").unwrap();
+            let started = std::time::Instant::now();
+            backend.call(json!({"op":"apply_edit", "id":nop["id"], "arguments":{}})).unwrap();
+            eprintln!("apply edit: {:?}", started.elapsed());
+        }
+        eprintln!("retained objects: {}", backend.state.lock().unwrap().objects.len());
+    }
+
+    #[test]
     #[ignore = "manual APK performance measurement"]
     fn benchmark_apk_navigation() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -5312,13 +5403,25 @@ mod tests {
             eprintln!("BENCH xrefs run={run} elapsed={:?} count={}", start.elapsed(), result["count"]);
         }
         let offset = method.instructions()[0].offset;
+        let start = std::time::Instant::now();
+        backend.analysis().unwrap().method_by_identity(&method.signature(), method.file.get_dex_name()).unwrap();
+        eprintln!("BENCH method_by_identity elapsed={:?}", start.elapsed());
+        let start = std::time::Instant::now();
+        let edited_bytes = rewrite_method_code(&method.file, method.method.method_idx as u32, &[MethodEdit {
+            anchor: offset, position: EditPosition::Replace,
+            instructions: vec![EditableInstruction::Concrete(Instruction::Nop)],
+        }]).unwrap();
+        eprintln!("BENCH rewrite elapsed={:?}", start.elapsed());
+        let start = std::time::Instant::now();
+        let _parsed = parse_dex_buf(method.file.get_dex_name(), &ArrayView::new(&edited_bytes), false).unwrap();
+        eprintln!("BENCH reparse elapsed={:?}", start.elapsed());
         let options = backend.edit_options(&json!({"id": method_id, "offset": offset})).unwrap();
         let option = options["options"].as_array().unwrap().iter().find(|option| option["label"] == "Replace with NOP").unwrap();
         let start = std::time::Instant::now();
         backend.apply_edit(&json!({"id": option["id"], "arguments": {}})).unwrap();
         eprintln!("BENCH apply_edit elapsed={:?}", start.elapsed());
         let start = std::time::Instant::now();
-        let _snapshot = backend.snapshot();
+        let _snapshot = backend.snapshot(&json!({"id": method_id}));
         eprintln!("BENCH snapshot elapsed={:?}", start.elapsed());
     }
 
@@ -5333,9 +5436,30 @@ mod tests {
     }
 
     #[test]
+    fn read_snapshot_shares_apk_bytes_and_preserves_original_code_during_edits() {
+        let mut backend = example_backend();
+        let snapshot = backend.snapshot(&json!({"op": "history"}));
+        assert!(Arc::ptr_eq(&backend.analysis().unwrap().files, &snapshot.analysis().unwrap().files));
+        let file = backend.analysis().unwrap().files.multi_dex[0].primary.clone();
+        let method_data = file.classes.iter().flat_map(|class| &class.codes)
+            .find(|data| data.method.method_name == "doPrint").unwrap();
+        let method = method_object(&file, &method_data.method).unwrap();
+        let offset = method.instructions()[0].offset;
+        let before = method.code();
+        let edited = backend.analysis_mut().unwrap()
+            .edit_method(&method, offset, "insert_before", "insert_nop", &json!({})).unwrap();
+        assert_ne!(edited.code(), before);
+        let original = snapshot.analysis().unwrap()
+            .method_by_identity(&method.signature(), file.get_dex_name()).unwrap();
+        assert_eq!(original.code(), before);
+        assert!(!Arc::ptr_eq(&backend.analysis().unwrap().files, &snapshot.analysis().unwrap().files));
+        assert!(backend.analysis().unwrap().method_by_identity(&method.signature(), "absent.dex").is_none());
+    }
+
+    #[test]
     fn listing_resolves_a_reference_to_its_definition_in_another_dex() {
         let mut backend = example_backend();
-        let multi_dex = &mut backend.analysis_mut().unwrap().files.multi_dex[0];
+        let multi_dex = &mut Arc::make_mut(&mut backend.analysis_mut().unwrap().files).multi_dex[0];
         let mut definition = multi_dex.primary.as_ref().clone();
         definition.file_name = "classes2.dex".to_string();
         let definition = Arc::new(definition);
@@ -5392,7 +5516,7 @@ mod tests {
 
         // Editing reparses a DEX and replaces its Arc. A second describe must
         // read that replacement rather than retain the first method wrapper.
-        let multi_dex = &mut backend.analysis_mut().unwrap().files.multi_dex[0];
+        let multi_dex = &mut Arc::make_mut(&mut backend.analysis_mut().unwrap().files).multi_dex[0];
         let mut edited = multi_dex.secondary[0].as_ref().clone();
         let class = edited
             .classes

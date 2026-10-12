@@ -16,6 +16,8 @@ use serde_json::{json, Value};
 
 mod disassembly;
 mod documentation;
+mod edit_arguments;
+mod edit_ui;
 mod native_backend;
 mod search_ui;
 mod start_page;
@@ -5468,7 +5470,7 @@ impl CoeusApp {
                 .collect::<serde_json::Map<_, _>>();
             self.request(
                 "apply_edit",
-                json!({"op":"apply_edit", "id":option.id, "arguments":arguments}),
+                json!({"op":"apply_edit", "id":option.id, "arguments":arguments, "emulation":emulation_active, "method_id":self.emulation_editor.as_ref().map(|editor| editor.method_id.clone())}),
             );
         }
     }
@@ -5977,7 +5979,7 @@ impl CoeusApp {
         &mut self,
         ui: &mut egui::Ui,
         chosen_edit: &mut Option<EditRequest>,
-        emulation: bool,
+        _emulation: bool,
     ) {
         ui.vertical(|ui| {
             theme::eyebrow(ui, "SELECTED INSTRUCTION");
@@ -6023,7 +6025,6 @@ impl CoeusApp {
                                 groups.push((group, vec![option]));
                             }
                         }
-                        let mut open_picker: Option<(String, String, SearchKind, String)> = None;
                         egui::ScrollArea::vertical()
                             .id_salt(("instruction-edit-options", offset))
                             .auto_shrink([false, false])
@@ -6066,69 +6067,8 @@ impl CoeusApp {
                                         },
                                     );
                                 }
-                                if let Some(mut form) = self.code.edit_form.clone() {
-                                    ui.separator();
-                                    ui.label(
-                                        RichText::new(format!("Configure {}", form.label))
-                                            .strong(),
-                                    );
-                                    ui.label(
-                                        RichText::new(
-                                            "Arguments are passed to the typed instruction factory; no raw smali is evaluated.",
-                                        )
-                                        .small()
-                                        .color(theme::MUTED),
-                                    );
-                                    for argument in &mut form.arguments {
-                                        ui.horizontal(|ui| {
-                                            ui.label(&argument.label);
-                                            let desired_width = if argument.kind == "text" {
-                                                260.0
-                                            } else {
-                                                150.0
-                                            };
-                                            ui.add(
-                                                egui::TextEdit::singleline(&mut argument.value).min_size(Vec2::new(0.0, 30.0)).margin(Vec2::new(8.0, 6.0))
-                                                    .desired_width(desired_width),
-                                            );
-                            if let Some(kind) = argument.picker {
-                                if ui.button("Choose…").clicked() {
-                                    open_picker = Some((
-                                        argument.name.clone(),
-                                        argument.label.clone(),
-                                        kind,
-                                        self.code.edit_dex_name.clone(),
-                                    ));
-                                }
-                                            }
-                                        });
-                                    }
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Apply configured edit").clicked() {
-                                            *chosen_edit = Some(EditRequest {
-                                                id: form.id.clone(),
-                                                arguments: form.arguments.clone(),
-                                            });
-                                            self.code.edit_form = None;
-                                        }
-                                        if ui.button("Cancel").clicked() {
-                                            self.code.edit_form = None;
-                                        }
-                                    });
-                                    if chosen_edit.is_none() && self.code.edit_form.is_some() {
-                                        self.code.edit_form = Some(form);
-                                    }
-                                }
                             });
-                        if let Some((argument_name, argument_label, kind, dex_name)) = open_picker {
-                            self.edit_picker = Some(EditPicker::new(
-                                argument_name,
-                                argument_label,
-                                kind,
-                                dex_name,
-                                emulation,
-                            ));
-                        }
+
                     }
                 }
             }
@@ -6145,7 +6085,7 @@ impl CoeusApp {
         };
         let mut request_search = !picker.searched;
         picker.searched = true;
-        let mut close = false;
+        let mut close = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape));
         let mut chosen = None;
         egui::Window::new(format!("Choose {}", picker.argument_label))
             .id(egui::Id::new("edit-pool-picker"))
@@ -8914,6 +8854,7 @@ impl eframe::App for CoeusApp {
                     Tab::Code => unreachable!("Code is rendered with its attached panels"),
                 });
         }
+        self.show_edit_configuration(ctx);
         self.show_edit_picker(ctx);
         self.show_note_editor(ctx);
         self.show_note_popup(ctx);

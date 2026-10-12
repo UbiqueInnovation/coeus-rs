@@ -434,8 +434,9 @@ class Backend:
         arguments = arguments or {}
 
         def integer(name, default=0):
-            value = str(arguments.get(name, default))
-            return "int({}, 0)".format(json.dumps(value))
+            if name in {"register", "source_register", "first_register", "object_register", "left_register", "right_register"}:
+                return str(Backend._edit_register(arguments, name, default, maximum=65535))
+            return str(Backend._edit_int(arguments, name, default))
 
         def text(name, default=""):
             return json.dumps(str(arguments.get(name, default)))
@@ -479,11 +480,7 @@ class Backend:
             "invoke_static",
             "invoke_interface",
         }:
-            registers = [
-                int(value.strip().lstrip("v"), 0)
-                for value in re.split(r"[\s,]+", str(arguments.get("registers", "")).strip())
-                if value.strip()
-            ]
+            registers = Backend._edit_register_list(arguments)
             return "DexInstruction.{}({}, {}, {})".format(
                 factory,
                 integer("register_count"),
@@ -491,11 +488,7 @@ class Backend:
                 repr(registers),
             )
         if factory == "invoke_custom":
-            registers = [
-                int(value.strip().lstrip("v"), 0)
-                for value in re.split(r"[\s,]+", str(arguments.get("registers", "")).strip())
-                if value.strip()
-            ]
+            registers = Backend._edit_register_list(arguments)
             return "DexInstruction.invoke_custom({}, {}, {})".format(
                 integer("register_count"),
                 integer("call_site_index"),
@@ -1571,11 +1564,61 @@ class Backend:
 
     @staticmethod
     def _edit_int(arguments, name, default):
-        raw = arguments.get(name, default)
+        raw = str(arguments.get(name, default)).strip()
         try:
-            return int(str(raw).strip(), 0)
+            # Decimal input may have leading zeroes; retain hexadecimal support
+            # for indices and literals without accepting register notation here.
+            return int(raw, 10 if re.fullmatch(r"[+-]?[0-9]+", raw) else 0)
         except (TypeError, ValueError):
             raise RuntimeError("{} must be an integer".format(name))
+
+    @staticmethod
+    def _edit_register(arguments, name, default=0, maximum=255):
+        raw = str(arguments.get(name, default)).strip()
+        if raw.startswith("v"):
+            if not re.fullmatch(r"v[0-9]+", raw):
+                raise RuntimeError("{} must be an integer or a register such as v3".format(name))
+            value = int(raw[1:], 10)
+        else:
+            value = Backend._edit_int(arguments, name, default)
+        if not 0 <= value <= maximum:
+            raise RuntimeError("{} must be between 0 and {}".format(name, maximum))
+        return value
+
+    @staticmethod
+    def _edit_register_list(arguments):
+        raw = str(arguments.get("registers", "")).strip()
+        if raw.startswith("{") and raw.endswith("}"):
+            raw = raw[1:-1]
+        return [
+            Backend._edit_register({"registers": value}, "registers", maximum=15)
+            for value in re.split(r"[\s,]+", raw)
+            if value
+        ]
+
+    @staticmethod
+    def _edit_register_count(arguments, maximum=255):
+        count = Backend._edit_int(arguments, "register_count", 0)
+        if not 0 <= count <= maximum:
+            raise RuntimeError("register_count must be between 0 and {}".format(maximum))
+        return count
+
+    @staticmethod
+    def _edit_destination_register(instruction_text):
+        """Return only a written register, never an invoke/return/store operand."""
+        match = re.match(r"\s*([^\s]+)\s+v([0-9]+)(?=[,\s]|$)", instruction_text)
+        if match is None:
+            return None
+        mnemonic, register = match.groups()
+        family = mnemonic.split("/", 1)[0].split("-", 1)[0]
+        if (family in {
+            "move", "const", "aget", "iget", "sget", "cmp", "cmpl", "cmpg",
+            "add", "sub", "rsub", "mul", "div", "rem", "and", "or", "xor",
+            "shl", "shr", "ushr", "neg", "not",
+        } or mnemonic in {"new-instance", "new-array", "array-length", "instance-of"}
+                or re.fullmatch(r"(?:int|long|float|double)-to-(?:byte|char|short|int|long|float|double)", mnemonic)):
+            return int(register)
+        return None
 
     @staticmethod
     def _edit_group(factory, action):
@@ -1606,47 +1649,47 @@ class Backend:
         if factory == "return_void":
             return DexInstruction.return_void()
         if factory == "return_value":
-            return DexInstruction.return_value(self._edit_int(arguments, "register", 0))
+            return DexInstruction.return_value(self._edit_register(arguments, "register"))
         if factory == "throw":
-            return DexInstruction.throw(self._edit_int(arguments, "register", 0))
+            return DexInstruction.throw(self._edit_register(arguments, "register"))
         if factory == "const_string_value":
             return DexInstruction.const_string_value(
-                self._edit_int(arguments, "register", 0),
+                self._edit_register(arguments, "register"),
                 str(arguments.get("value", "")),
             )
         if factory == "const_string":
             return DexInstruction.const_string(
-                self._edit_int(arguments, "register", 0),
+                self._edit_register(arguments, "register"),
                 self._edit_int(arguments, "string_index", 0),
             )
         if factory == "const_string_jumbo":
             return DexInstruction.const_string_jumbo(
-                self._edit_int(arguments, "register", 0),
+                self._edit_register(arguments, "register"),
                 self._edit_int(arguments, "string_index", 0),
             )
         if factory == "const_lit32":
             return DexInstruction.const_lit32(
-                self._edit_int(arguments, "register", 0),
+                self._edit_register(arguments, "register"),
                 self._edit_int(arguments, "value", 0),
             )
         if factory == "move_from16":
             return DexInstruction.move_from16(
-                self._edit_int(arguments, "register", 0),
-                self._edit_int(arguments, "source_register", 0),
+                self._edit_register(arguments, "register"),
+                self._edit_register(arguments, "source_register", maximum=65535),
             )
         if factory == "move_object_from16":
             return DexInstruction.move_object_from16(
-                self._edit_int(arguments, "register", 0),
-                self._edit_int(arguments, "source_register", 0),
+                self._edit_register(arguments, "register"),
+                self._edit_register(arguments, "source_register", maximum=65535),
             )
         if factory == "new_instance":
             return DexInstruction.new_instance(
-                self._edit_int(arguments, "register", 0),
+                self._edit_register(arguments, "register"),
                 self._edit_int(arguments, "type_index", 0),
             )
         if factory == "check_cast":
             return DexInstruction.check_cast(
-                self._edit_int(arguments, "register", 0),
+                self._edit_register(arguments, "register"),
                 self._edit_int(arguments, "type_index", 0),
             )
         if factory in {
@@ -1656,24 +1699,22 @@ class Backend:
             "invoke_static",
             "invoke_interface",
         }:
-            registers = [
-                int(value.strip().lstrip("v"), 0)
-                for value in re.split(r"[\s,]+", str(arguments.get("registers", "")).strip())
-                if value.strip()
-            ]
+            registers = self._edit_register_list(arguments)
+            count = self._edit_register_count(arguments, maximum=5)
+            if count != len(registers):
+                raise RuntimeError("register_count must match the number of invoke registers")
             return getattr(DexInstruction, factory)(
-                self._edit_int(arguments, "register_count", 0),
+                count,
                 self._edit_int(arguments, "method_index", 0),
                 registers,
             )
         if factory == "invoke_custom":
-            registers = [
-                int(value.strip().lstrip("v"), 0)
-                for value in re.split(r"[\s,]+", str(arguments.get("registers", "")).strip())
-                if value.strip()
-            ]
+            registers = self._edit_register_list(arguments)
+            count = self._edit_register_count(arguments, maximum=5)
+            if count != len(registers):
+                raise RuntimeError("register_count must match the number of invoke registers")
             return DexInstruction.invoke_custom(
-                self._edit_int(arguments, "register_count", 0),
+                count,
                 self._edit_int(arguments, "call_site_index", 0),
                 registers,
             )
@@ -1684,20 +1725,24 @@ class Backend:
             "invoke_static_range",
             "invoke_interface_range",
         }:
+            count = self._edit_register_count(arguments)
+            first_register = self._edit_register(arguments, "first_register", maximum=65535)
+            if first_register + max(0, count - 1) > 65535:
+                raise RuntimeError("invoke register range must end at or before v65535")
             return getattr(DexInstruction, factory)(
-                self._edit_int(arguments, "register_count", 0),
+                count,
                 self._edit_int(arguments, "method_index", 0),
-                self._edit_int(arguments, "first_register", 0),
+                first_register,
             )
         if factory.startswith("instance_"):
             return getattr(DexInstruction, factory)(
-                self._edit_int(arguments, "register", 0),
-                self._edit_int(arguments, "object_register", 0),
+                self._edit_register(arguments, "register", maximum=15),
+                self._edit_register(arguments, "object_register", maximum=15),
                 self._edit_int(arguments, "field_index", 0),
             )
         if factory.startswith("static_"):
             return getattr(DexInstruction, factory)(
-                self._edit_int(arguments, "register", 0),
+                self._edit_register(arguments, "register"),
                 self._edit_int(arguments, "field_index", 0),
             )
         if factory in {
@@ -1709,20 +1754,20 @@ class Backend:
             "if_ge",
         }:
             return getattr(DexInstruction, factory)(
-                self._edit_int(arguments, "left_register", 0),
-                self._edit_int(arguments, "right_register", 0),
+                self._edit_register(arguments, "left_register", maximum=15),
+                self._edit_register(arguments, "right_register", maximum=15),
                 after_selected,
             )
         if factory in {"if_eqz", "if_nez", "if_ltz", "if_lez", "if_gtz", "if_gez"}:
             return getattr(DexInstruction, factory)(
-                self._edit_int(arguments, "register", 0),
+                self._edit_register(arguments, "register"),
                 after_selected,
             )
         if factory == "goto":
             return DexInstruction.goto(after_selected)
         if factory == "switch":
             return DexInstruction.switch(
-                self._edit_int(arguments, "register", 0),
+                self._edit_register(arguments, "register"),
                 [(self._edit_int(arguments, "case_value", 0), after_selected)],
             )
         raise RuntimeError("unknown typed edit factory: {}".format(factory))
@@ -1752,6 +1797,7 @@ class Backend:
         target_text = str(target)
         registers = [int(value) for value in re.findall(r"\bv(\d+)\b", target_text)]
         first_register = registers[0] if registers else 0
+        destination_register = self._edit_destination_register(target_text)
         register_count = len(registers)
         if ".." in target_text and len(registers) >= 2:
             register_count = max(1, registers[-1] - registers[0] + 1)
@@ -1774,19 +1820,21 @@ class Backend:
         register_list = ", ".join("v{}".format(value) for value in registers)
 
         integer = lambda name, label, value: self._edit_argument(name, label, value)
+        register = lambda name, label, value: self._edit_argument(name, label, "v{}".format(value), "register")
+        destination = lambda: register("register", "Destination register", destination_register or 0)
         candidates = [
             {"factory": "nop", "label": "Replace with NOP", "action": "replace", "arguments": []},
             {"factory": "return_void", "label": "Return void", "action": "replace", "arguments": []},
-            {"factory": "return_value", "label": "Return register", "action": "replace", "arguments": [integer("register", "Return register", 0)]},
-            {"factory": "throw", "label": "Throw register", "action": "replace", "arguments": [integer("register", "Throw register", 0)]},
-            {"factory": "const_string_value", "label": "const-string value", "action": "replace", "arguments": [integer("register", "Destination register", 0), self._edit_argument("value", "String value", "", "text")]},
-            {"factory": "const_string", "label": "const-string index", "action": "replace", "arguments": [integer("register", "Destination register", 0), self._edit_argument("string_index", "String pool entry", 0, picker="strings")]},
-            {"factory": "const_string_jumbo", "label": "const-string/jumbo index", "action": "replace", "arguments": [integer("register", "Destination register", 0), self._edit_argument("string_index", "String pool entry", 0, picker="strings")]},
-            {"factory": "const_lit32", "label": "const literal", "action": "replace", "arguments": [integer("register", "Destination register", 0), integer("value", "Literal value", 0)]},
-            {"factory": "move_from16", "label": "move/from16", "action": "replace", "arguments": [integer("register", "Destination register", 0), integer("source_register", "Source register", 0)]},
-            {"factory": "move_object_from16", "label": "move-object/from16", "action": "replace", "arguments": [integer("register", "Destination register", 0), integer("source_register", "Source register", 0)]},
-            {"factory": "new_instance", "label": "new-instance", "action": "replace", "arguments": [integer("register", "Destination register", 0), self._edit_argument("type_index", "Class/type entry", 0, picker="classes")]},
-            {"factory": "check_cast", "label": "check-cast", "action": "replace", "arguments": [integer("register", "Register", 0), self._edit_argument("type_index", "Class/type entry", 0, picker="classes")]},
+            {"factory": "return_value", "label": "Return register", "action": "replace", "arguments": [register("register", "Return register", 0)]},
+            {"factory": "throw", "label": "Throw register", "action": "replace", "arguments": [register("register", "Throw register", 0)]},
+            {"factory": "const_string_value", "label": "const-string value", "action": "replace", "arguments": [destination(), self._edit_argument("value", "String value", "", "text")]},
+            {"factory": "const_string", "label": "const-string index", "action": "replace", "arguments": [destination(), self._edit_argument("string_index", "String pool entry", 0, picker="strings")]},
+            {"factory": "const_string_jumbo", "label": "const-string/jumbo index", "action": "replace", "arguments": [destination(), self._edit_argument("string_index", "String pool entry", 0, picker="strings")]},
+            {"factory": "const_lit32", "label": "const literal", "action": "replace", "arguments": [destination(), integer("value", "Literal value", 0)]},
+            {"factory": "move_from16", "label": "move/from16", "action": "replace", "arguments": [destination(), register("source_register", "Source register", 0)]},
+            {"factory": "move_object_from16", "label": "move-object/from16", "action": "replace", "arguments": [destination(), register("source_register", "Source register", 0)]},
+            {"factory": "new_instance", "label": "new-instance", "action": "replace", "arguments": [destination(), self._edit_argument("type_index", "Class/type entry", 0, picker="classes")]},
+            {"factory": "check_cast", "label": "check-cast", "action": "replace", "arguments": [register("register", "Register", 0), self._edit_argument("type_index", "Class/type entry", 0, picker="classes")]},
             {"factory": "insert_nop", "label": "Insert NOP before", "action": "insert_before", "arguments": []},
             {"factory": "insert_nop", "label": "Insert NOP after", "action": "insert_after", "arguments": []},
             {"factory": "prepend_nop", "label": "Prepend NOP at method entry", "action": "prepend", "arguments": []},
@@ -1822,7 +1870,7 @@ class Backend:
                 "arguments": [
                     integer("register_count", "Argument register count", register_count),
                     self._edit_argument("method_index", "Target method", method_index, picker="methods"),
-                    integer("first_register", "First argument register", first_register),
+                    register("first_register", "First argument register", first_register),
                 ],
             })
         candidates.append({
@@ -1849,8 +1897,8 @@ class Backend:
                 "label": label,
                 "action": "replace",
                 "arguments": [
-                    integer("register", "Destination register", first_register),
-                    integer("object_register", "Object register", 0),
+                    destination(),
+                    register("object_register", "Object register", 0),
                     self._edit_argument("field_index", "Target field", field_index, picker="fields"),
                 ],
             })
@@ -1868,8 +1916,8 @@ class Backend:
                 "label": label,
                 "action": "replace",
                 "arguments": [
-                    integer("register", "Source register", first_register),
-                    integer("object_register", "Object register", 0),
+                    register("register", "Source register", first_register),
+                    register("object_register", "Object register", 0),
                     self._edit_argument("field_index", "Target field", field_index, picker="fields"),
                 ],
             })
@@ -1894,7 +1942,7 @@ class Backend:
                 "label": label,
                 "action": "replace",
                 "arguments": [
-                    integer("register", "Register", first_register),
+                    destination() if factory.startswith("static_get") else register("register", "Source register", first_register),
                     self._edit_argument("field_index", "Target field", field_index, picker="fields"),
                 ],
             })
@@ -1907,7 +1955,7 @@ class Backend:
                 "factory": factory,
                 "label": label + " → after selected",
                 "action": "insert_before",
-                "arguments": [integer("left_register", "Left register", 0), integer("right_register", "Right register", 0)],
+                "arguments": [register("left_register", "Left register", 0), register("right_register", "Right register", 0)],
             })
         for factory, label in [
             ("if_eqz", "Insert if-eqz"), ("if_nez", "Insert if-nez"),
@@ -1918,11 +1966,11 @@ class Backend:
                 "factory": factory,
                 "label": label + " → after selected",
                 "action": "insert_before",
-                "arguments": [integer("register", "Register", 0)],
+                "arguments": [register("register", "Register", 0)],
             })
         candidates.extend([
             {"factory": "goto", "label": "Insert goto → after selected", "action": "insert_before", "arguments": []},
-            {"factory": "switch", "label": "Insert switch case → after selected", "action": "insert_before", "arguments": [integer("register", "Switch register", 0), integer("case_value", "Case value", 0)]},
+            {"factory": "switch", "label": "Insert switch case → after selected", "action": "insert_before", "arguments": [register("register", "Switch register", 0), integer("case_value", "Case value", 0)]},
         ])
 
         options = []
@@ -1938,8 +1986,10 @@ class Backend:
                 replacement = self._build_edit_instruction(
                     factory, default_arguments, after_selected
                 )
-            except Exception:
-                continue
+            except (RuntimeError, OverflowError, ValueError):
+                # A prefilled operand may exceed this candidate's encoding.
+                # Keep it available so the popup can correct the register.
+                replacement = None
             option_id = self._id(replacement, kind="edit")
             self.objects[option_id].update(
                 {
@@ -1958,7 +2008,7 @@ class Backend:
                     "id": option_id,
                     "label": candidate["label"],
                     "action": candidate["action"],
-                    "width": replacement.get_size(),
+                    "width": replacement.get_size() if replacement is not None else 0,
                     "arguments": candidate["arguments"],
                 }
             )
