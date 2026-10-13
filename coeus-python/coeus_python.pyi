@@ -264,6 +264,8 @@ class DexInstruction:
         """Return the instruction offset in 16-bit code units."""
     def get_size(self) -> int:
         """Return the instruction width in 16-bit code units."""
+    def get_destination_register(self) -> int | None:
+        """Return the written register, or None for calls, stores and branches."""
     def mnemonic(self) -> str:
         """Return the DEX mnemonic."""
     def to_code_units(self) -> list[int]:

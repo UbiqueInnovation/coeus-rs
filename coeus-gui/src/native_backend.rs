@@ -860,7 +860,7 @@ impl RustBackend {
         // Workers only need the requested objects. Copying every previously
         // visited symbol and edit node made inspection progressively slower.
         let mut objects = HashMap::new();
-        for key in ["id", "method_id"] {
+        for key in ["id", "method_id", "source_id"] {
             if let Some(id) = request.get(key).and_then(Value::as_str) {
                 if let Some(entry) = self.objects.get(id) {
                     objects.insert(id.to_string(), entry.clone());

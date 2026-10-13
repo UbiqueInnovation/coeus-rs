@@ -385,3 +385,29 @@ fn parameter_edit_is_saved_and_replayed_as_the_physical_register() {
         .session_script()
         .contains(&format!("DexInstruction.const_lit32({base},")));
 }
+
+#[test]
+fn inspection_snapshot_keeps_the_callsite_for_argument_inference() {
+    let mut backend = fixture();
+    let method = fixture_method(&backend);
+    let target = backend.store(ObjectEntry {
+        object: NativeObject::Method(method.clone()),
+        evidence: None,
+    });
+    let source = backend.store(ObjectEntry {
+        object: NativeObject::Method(method.clone()),
+        evidence: None,
+    });
+    let unrelated = backend.store(ObjectEntry {
+        object: NativeObject::Method(method),
+        evidence: None,
+    });
+    let request = json!({"op":"emulation_options","id":target,"source_id":source});
+    let worker = backend.snapshot(&request);
+    assert!(worker.entry(&target).is_ok());
+    assert!(worker.entry(&source).is_ok());
+    assert!(worker.entry(&unrelated).is_err());
+    let handle = RustBackendHandle::new();
+    *handle.state.lock().unwrap() = backend;
+    assert!(handle.call(request).is_ok());
+}
